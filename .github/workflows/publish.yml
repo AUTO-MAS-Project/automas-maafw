@@ -1,0 +1,134 @@
+name: Publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: Package to publish
+        required: true
+        type: choice
+        options:
+          - automas-maafw-interface
+          - automas-maafw-agent-env
+          - automas-maafw-controller-adb
+          - automas-maafw-controller-win32
+          - automas-maafw-project-update
+          - automas-maafw-runner
+          - automas-script-maafw
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish-interface:
+    name: Publish automas-maafw-interface
+    if: inputs.package == 'automas-maafw-interface'
+    runs-on: ubuntu-latest
+    environment: pypi-interface
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade build
+      - run: python -m build packages/automas_maafw_interface --outdir dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+
+  publish-agent-env:
+    name: Publish automas-maafw-agent-env
+    if: inputs.package == 'automas-maafw-agent-env'
+    runs-on: ubuntu-latest
+    environment: pypi-agent-env
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade build
+      - run: python -m build packages/automas_maafw_agent_env --outdir dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+
+  publish-controller-adb:
+    name: Publish automas-maafw-controller-adb
+    if: inputs.package == 'automas-maafw-controller-adb'
+    runs-on: ubuntu-latest
+    environment: pypi-controller-adb
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade build
+      - run: python -m build packages/automas_maafw_controller_adb --outdir dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+
+  publish-controller-win32:
+    name: Publish automas-maafw-controller-win32
+    if: inputs.package == 'automas-maafw-controller-win32'
+    runs-on: ubuntu-latest
+    environment: pypi-controller-win32
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade build
+      - run: python -m build packages/automas_maafw_controller_win32 --outdir dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+
+  publish-project-update:
+    name: Publish automas-maafw-project-update
+    if: inputs.package == 'automas-maafw-project-update'
+    runs-on: ubuntu-latest
+    environment: pypi-project-update
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade build
+      - run: python -m build packages/automas_maafw_project_update --outdir dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+
+  publish-runner:
+    name: Publish automas-maafw-runner
+    if: inputs.package == 'automas-maafw-runner'
+    runs-on: ubuntu-latest
+    environment: pypi-runner
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade build
+      - run: python -m build packages/automas_maafw_runner --outdir dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+
+  publish-script-maafw:
+    name: Publish automas-script-maafw
+    if: inputs.package == 'automas-script-maafw'
+    runs-on: ubuntu-latest
+    environment: pypi-script-maafw
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade build
+      - run: python -m build packages/automas_script_maafw --outdir dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
