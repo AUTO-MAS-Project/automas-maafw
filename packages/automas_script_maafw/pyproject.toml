@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "automas-script-maafw"
-version = "0.1.1"
+version = "0.1.2"
 description = "MaaFW script adapter plugin for AUTO-MAS"
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.10"
 dependencies = [
     "automas-maafw-agent-env>=0.1.0",
     "automas-maafw-controller-adb>=0.1.0",
-    "automas-maafw-controller-win32>=0.1.0",
+    "automas-maafw-controller-win32>=0.1.1",
     "automas-maafw-interface>=0.1.1",
     "automas-maafw-project-update>=0.1.0",
     "automas-maafw-runner>=0.1.1",
