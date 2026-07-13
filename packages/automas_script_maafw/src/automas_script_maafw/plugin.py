@@ -54,6 +54,7 @@ class Plugin(ScriptAdapterPlugin):
                 related_bindings={"EmulatorConfig": "EmulatorConfig"},
                 supported_modes=("AutoProxy",),
                 icon="MaaFW",
+                icon_path="automas_script_maafw:assets/maafw.png",
                 editor_kind="plugin:automas_script_maafw",
                 legacy_config_class_name="MaaFWConfig",
                 legacy_user_config_class_name="MaaFWUserConfig",
@@ -61,6 +62,7 @@ class Plugin(ScriptAdapterPlugin):
                 metadata={
                     "framework": "maafw",
                     "source": "automas_script_maafw",
+                    "create_group": "general",
                     "m9a_standalone": False,
                 },
             )

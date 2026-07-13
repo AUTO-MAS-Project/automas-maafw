@@ -165,8 +165,6 @@ USER_GROUPS = (
             PluginField.string("Notes", "备注", "无", rows=3, size="large"),
             PluginField.string("Account", "账号", ""),
             PluginField.string("Password", "密码", "", sensitive=True),
-            PluginField.string("Controller", "Controller", ""),
-            PluginField.string("Resource", "Resource", ""),
         ],
     ),
     PluginField.group(
@@ -175,16 +173,6 @@ USER_GROUPS = (
         [
             PluginField.string("SelectedPreset", "Preset", ""),
             PluginField.json("TaskSnapshot", "任务快照", "{}", json_type="object"),
-        ],
-    ),
-    PluginField.group(
-        "Device",
-        "控制器覆盖",
-        [
-            PluginField.string("AdbAddress", "ADB 地址", ""),
-            PluginField.number("HWnd", "Win32 窗口句柄", 0, min=0, max=999999999999, step=1),
-            PluginField.string("PlayCoverAddress", "PlayCover 地址", ""),
-            PluginField.string("PlayCoverUuid", "PlayCover UUID", ""),
         ],
     ),
     PluginField.group(

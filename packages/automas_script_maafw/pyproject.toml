@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "automas-script-maafw"
-version = "0.1.2"
+version = "0.1.4"
 description = "MaaFW script adapter plugin for AUTO-MAS"
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.10"
@@ -25,4 +25,4 @@ automas_script_maafw = "automas_script_maafw.plugin:Plugin"
 where = ["src"]
 
 [tool.setuptools.package-data]
-automas_script_maafw = ["py.typed"]
+automas_script_maafw = ["py.typed", "assets/*.png"]

@@ -347,11 +347,7 @@ class MaaFWPluginAutoProxyTask(TaskExecuteBase):
             raise MaaFWRunPlanError(str(exc)) from exc
 
     def _select_controller_name(self, interface_model: MaaFWInterface) -> str | None:
-        configured_controller = str(
-            self.cur_user_config.get("Info", "Controller")
-            or self.script_config.get("Info", "Controller")
-            or ""
-        ).strip()
+        configured_controller = str(self.script_config.get("Info", "Controller") or "").strip()
 
         wants_adb = self.script_config.get("Emulator", "Id") != "-"
         if wants_adb:
@@ -374,11 +370,7 @@ class MaaFWPluginAutoProxyTask(TaskExecuteBase):
         interface_model: MaaFWInterface,
         controller_name: str | None,
     ) -> str | None:
-        configured_resource = str(
-            self.cur_user_config.get("Info", "Resource")
-            or self.script_config.get("Info", "Resource")
-            or ""
-        ).strip()
+        configured_resource = str(self.script_config.get("Info", "Resource") or "").strip()
         if configured_resource:
             return configured_resource
         if controller_name is None:
@@ -645,10 +637,7 @@ class MaaFWPluginAutoProxyTask(TaskExecuteBase):
         }
 
     def _resolve_window_handle(self, controller: MaaFWController) -> int:
-        configured_hwnd = (
-            self.cur_user_config.get("Device", "HWnd")
-            or self.script_config.get("Device", "HWnd")
-        )
+        configured_hwnd = self.script_config.get("Device", "HWnd")
         parsed_hwnd = _optional_int(configured_hwnd)
         if parsed_hwnd:
             return parsed_hwnd
@@ -1018,10 +1007,7 @@ class MaaFWPluginAutoProxyTask(TaskExecuteBase):
         if self.run_plan is None or self.interface_model is None:
             raise RuntimeError("MaaFW 运行计划未完成初始化")
 
-        configured_hwnd = (
-            self.cur_user_config.get("Device", "HWnd")
-            or self.script_config.get("Device", "HWnd")
-        )
+        configured_hwnd = self.script_config.get("Device", "HWnd")
         explicit_hwnd = _optional_int(configured_hwnd)
         controller = _find_controller(self.interface_model, self.run_plan.controllerName)
 
