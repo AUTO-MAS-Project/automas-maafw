@@ -3,7 +3,7 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main, dev]
+    branches: [main, dev, "release/**"]
 
 jobs:
   test:
@@ -29,4 +29,3 @@ jobs:
         with:
           name: distributions
           path: dist/**/*
-
