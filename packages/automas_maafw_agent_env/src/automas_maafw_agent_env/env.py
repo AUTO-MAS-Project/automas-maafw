@@ -18,6 +18,9 @@ AGENT_ENV_MANIFEST_NAME = ".auto_mas_agent_env.json"
 AGENT_COMPAT_SHIM_DIR_NAME = ".auto_mas_shims"
 PIP_HEALTH_CHECK_TIMEOUT = 15
 PIP_INSTALL_TIMEOUT = 120
+VENV_PROBE_TIMEOUT = 30
+# uv 兜底可能需要下载 managed Python,给足余量
+UV_VENV_TIMEOUT = 300
 
 
 def prepare_agent_envs(
@@ -200,30 +203,69 @@ def _ensure_isolated_venv(
         _reset_isolated_venv(venv_path, log)
 
     venv_path.parent.mkdir(parents=True, exist_ok=True)
-    python = bootstrap_python or _venv_bootstrap_python()
-    log(f"[Python环境] 创建隔离 venv: {venv_path} (引导 Python: {python})")
+    python = bootstrap_python if bootstrap_python else _venv_bootstrap_python()
+    if python is not None and bootstrap_python and not _python_supports_venv(python):
+        # 调用方指定的引导解释器（如便携 embeddable Python）缺 venv，回退到自动挑选
+        log(f"[Python环境] 指定引导 Python 缺少 venv 模块，改为自动挑选: {python}")
+        python = _venv_bootstrap_python()
+
+    if python is None:
+        _create_venv_with_uv(venv_path, log)
+    else:
+        log(f"[Python环境] 创建隔离 venv: {venv_path} (引导 Python: {python})")
+        try:
+            result = subprocess.run(
+                [python, "-m", "venv", str(venv_path)],
+                capture_output=True,
+                timeout=PIP_INSTALL_TIMEOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise MaaFWAgentEnvError(
+                f"创建隔离 venv 超时 ({PIP_INSTALL_TIMEOUT}s): {venv_path}"
+            ) from exc
+
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()
+            raise MaaFWAgentEnvError(
+                f"创建隔离 venv 失败 (exit={result.returncode}): {detail[:500]}"
+            )
+    if not _is_valid_venv_path(venv_path):
+        raise MaaFWAgentEnvError(f"创建隔离 venv 后结构不完整: {venv_path}")
+    log(f"[Python环境] 隔离 venv 创建成功: {venv_path}")
+
+
+def _create_venv_with_uv(venv_path: Path, log: Callable[[str], None]) -> None:
+    """所有候选解释器都缺 venv 时的兜底：用 uv 建环境（必要时自取 managed Python）。"""
+    uv_exe = _find_uv_executable()
+    if uv_exe is None:
+        raise MaaFWAgentEnvError(
+            "创建隔离 venv 失败：可用的 Python 均不含 venv 模块（便携版通常为 "
+            "embeddable 发行版），且未找到 uv 兜底。请安装完整 Python 或提供 uv。"
+        )
+
+    log(f"[Python环境] 引导 Python 均缺少 venv 模块，改用 uv 创建: {venv_path}")
     try:
         result = subprocess.run(
-            [python, "-m", "venv", str(venv_path)],
+            [uv_exe, "venv", "--seed", str(venv_path)],
             capture_output=True,
-            timeout=PIP_INSTALL_TIMEOUT,
+            timeout=UV_VENV_TIMEOUT,
             text=True,
             encoding="utf-8",
             errors="replace",
         )
     except subprocess.TimeoutExpired as exc:
         raise MaaFWAgentEnvError(
-            f"创建隔离 venv 超时 ({PIP_INSTALL_TIMEOUT}s): {venv_path}"
+            f"uv 创建隔离 venv 超时 ({UV_VENV_TIMEOUT}s): {venv_path}"
         ) from exc
 
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()
         raise MaaFWAgentEnvError(
-            f"创建隔离 venv 失败 (exit={result.returncode}): {detail[:500]}"
+            f"uv 创建隔离 venv 失败 (exit={result.returncode}): {detail[:500]}"
         )
-    if not _is_valid_venv_path(venv_path):
-        raise MaaFWAgentEnvError(f"创建隔离 venv 后结构不完整: {venv_path}")
-    log(f"[Python环境] 隔离 venv 创建成功: {venv_path}")
 
 
 def _should_rebuild_isolated_venv(
@@ -454,11 +496,45 @@ def _pip_install(
     return False
 
 
-def _venv_bootstrap_python() -> str:
+def _python_supports_venv(python: str) -> bool:
+    """探测解释器是否带 venv/ensurepip 标准库。
+
+    便携目录常见 embeddable 发行版（python3xx._pth），不带 venv 模块，
+    直接 `-m venv` 会报 "No module named venv"，必须先探测再用作引导。
+    """
+    try:
+        result = subprocess.run(
+            [python, "-c", "import venv, ensurepip"],
+            capture_output=True,
+            timeout=VENV_PROBE_TIMEOUT,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+def _find_uv_executable() -> str | None:
+    portable_uv = Path.cwd() / "environment" / "python" / "Scripts" / "uv.exe"
+    if portable_uv.is_file():
+        return str(portable_uv)
+    return shutil.which("uv")
+
+
+def _venv_bootstrap_python() -> str | None:
+    """返回第一个带 venv 模块的引导 Python；全部不可用时返回 None（改走 uv 兜底）。"""
+    candidates: list[str] = []
     portable_python = Path.cwd() / "environment" / "python" / "python.exe"
     if portable_python.is_file():
-        return str(portable_python)
-    return sys.executable
+        candidates.append(str(portable_python))
+    candidates.append(sys.executable)
+    path_python = shutil.which("python")
+    if path_python:
+        candidates.append(path_python)
+    for candidate in candidates:
+        if _python_supports_venv(candidate):
+            return candidate
+    return None
 
 
 def _safe_resolve_python(path: str) -> str:
