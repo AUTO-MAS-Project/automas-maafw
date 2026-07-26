@@ -7,4 +7,6 @@ dist/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
+_alpha_build/
+initial_state.txt
 

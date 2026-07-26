@@ -13,9 +13,12 @@ members = [
     "packages/automas_maafw_controller_adb",
     "packages/automas_maafw_controller_win32",
     "packages/automas_maafw_interface",
+    "packages/automas_maafw_project_store",
     "packages/automas_maafw_project_update",
+    "packages/automas_maafw_runtime_pool",
     "packages/automas_maafw_runner",
     "packages/automas_script_maafw",
+    "packages/automas_script_maafw_managed",
 ]
 
 [tool.uv.sources]
@@ -23,7 +26,9 @@ members = [
 "automas-maafw-controller-adb" = { workspace = true }
 "automas-maafw-controller-win32" = { workspace = true }
 "automas-maafw-interface" = { workspace = true }
+"automas-maafw-project-store" = { workspace = true }
 "automas-maafw-project-update" = { workspace = true }
+"automas-maafw-runtime-pool" = { workspace = true }
 "automas-maafw-runner" = { workspace = true }
 "automas-script-maafw" = { workspace = true }
-
+"automas-script-maafw-managed" = { workspace = true }

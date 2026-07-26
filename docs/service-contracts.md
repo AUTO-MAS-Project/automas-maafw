@@ -53,13 +53,16 @@ class Plugin:
 
 | PyPI 包 | 当前版本 | 服务名 | 主要职责 |
 |---|---:|---|---|
-| `automas-maafw-interface` | 0.1.1 | `maafw.interface.v1` | PI 加载、校验、预览、任务快照和 option 归一化 |
-| `automas-maafw-project-update` | 0.1.0 | `maafw.project_update.v1` | MirrorChyan/GitHub Release 检查与更新 |
-| `automas-maafw-agent-env` | 0.1.0 | `maafw.agent_env.v1` | agent 运行方式识别、命令规划和 Python 环境准备 |
+| `automas-maafw-interface` | 0.2.0 | `maafw.interface.v1` | PI 加载、校验、预览、任务快照和 option 归一化 |
+| `automas-maafw-project-update` | 0.1.1 | `maafw.project_update.v1` | MirrorChyan/GitHub Release 检查与更新 |
+| `automas-maafw-agent-env` | 0.1.1 | `maafw.agent_env.v1` | agent 运行方式识别、命令规划和 Python 环境准备 |
 | `automas-maafw-controller-adb` | 0.1.0 | `maafw.controller.adb` | ADB provider 与设备参数构建 |
-| `automas-maafw-controller-win32` | 0.1.0 | `maafw.controller.win32` | Win32 provider、窗口扫描与设备参数构建 |
-| `automas-maafw-runner` | 0.1.1 | `maafw.runner.v1` | 运行计划、worker job、环境和结果模型 |
-| `automas-script-maafw` | 0.1.1 | `maafw.registry.v1` | MaaFW 脚本适配与 controller/project pack 注册表 |
+| `automas-maafw-controller-win32` | 0.1.1 | `maafw.controller.win32` | Win32 provider、窗口扫描与设备参数构建 |
+| `automas-maafw-project-store` | 0.1.0 | `maafw.project_store.v1` | 纯资源项目版本、引用、切换、删除和 GC |
+| `automas-maafw-runtime-pool` | 0.1.0 | `maafw.runtime_pool.v1` | 按规范化 requirement selector 共享多版本 MaaFW 环境 |
+| `automas-maafw-runner` | 0.3.0 | `maafw.runner.v1` | 运行计划、worker job、runtime 路由和结果模型 |
+| `automas-script-maafw` | 0.1.6 | `maafw.registry.v1` | MaaFW 脚本适配与 controller/project pack 注册表 |
+| `automas-script-maafw-managed` | 0.1.1 | 无 | 声明式 `MaaFWManaged` 脚本类型与托管动作 |
 | `automas-script-maafw-pack-m9a` | 0.1.0 | `maafw.pack.m9a.v1` | M9A 默认约定、通知翻译和旧配置迁移草稿 |
 | `automas-m9a` | 0.1.0 | 无 | 聚合安装上述 MaaFW/M9A 插件 |
 
@@ -1073,9 +1076,9 @@ python -m pip install automas-m9a
 当前 pretask 支持相关的最低版本应为：
 
 ```text
-automas-maafw-interface >= 0.1.1
-automas-maafw-runner >= 0.1.1
-automas-script-maafw >= 0.1.1
+automas-maafw-interface >= 0.2.0
+automas-maafw-runner >= 0.3.0
+automas-script-maafw >= 0.1.6
 ```
 
 ## 14. 完整调用示例
@@ -1154,7 +1157,137 @@ async def run_maafw_project() -> None:
         raise RuntimeError(result.errorMessage or "MaaFW 运行失败")
 ```
 
-## 15. 变更规则
+## 15. `maafw.project_store.v1`
+
+项目存储只接受本地目录或已解压发行包。下载与远程更新由
+`maafw.project_update.v1` 完成，随后把结果重新导入为新不可变版本。
+
+```python
+import_project(
+    source_path,
+    project_id,
+    version,
+    *,
+    runtime_constraint=None,
+    runtime_binding=None,
+    reference=None,
+    pinned=False,
+    activate=True,
+) -> dict
+
+update_project(source_path, project_id, version, **kwargs) -> dict
+resolve_project(project_id, version=None, *, touch=True) -> dict
+list_projects() -> list[dict]
+list_versions(project_id) -> list[dict]
+switch_version(project_id, version) -> dict
+bind_runtime(project_id, version=None, *, binding=None, reference=None, pinned=None) -> dict
+release_runtime(project_id, version=None, *, reference=None, clear_binding=False) -> dict
+set_references(project_id, version, references) -> dict
+acquire_lease(project_id, version=None, *, owner, ttl_seconds=300, lease_id=None) -> dict
+release_lease(project_id, version=None, *, lease_id) -> dict
+delete_version(project_id, version) -> dict
+collect_garbage(*, project_id=None, dry_run=True, grace_seconds=86400, keep_latest=1) -> dict
+```
+
+`resolve_project()` 至少返回：
+
+```text
+projectId
+version
+dataPath
+runtimeConstraint
+manifest
+```
+
+`dataPath` 内含根级 `interface.json[c]` 与私有
+`.auto_mas_maafw_project.json`。Project Store 不会覆盖已提交的投影 payload；
+私有 manifest 的引用、固定、runtime binding 和最后使用时间可以原子更新。
+Runner 运行时仍会在 `dataPath` 下创建 `debug/`、`logs/`、`temp/`，并更新
+`config/maa_option.json`；这些运行产物不参与版本内容身份。
+
+删除操作只处理 Project Store 自己的根目录，并拒绝当前版本、固定版本和有引用
+版本。`collect_garbage()` 默认 dry-run。
+
+## 16. `maafw.runtime_pool.v1`
+
+```python
+list_runtimes() -> list[dict]
+resolve_runtime(request) -> dict | None
+ensure_runtime(request) -> dict
+touch(runtime_id) -> dict
+pin(runtime_id, pinned=True) -> dict
+set_references(runtime_id, references) -> dict
+acquire_lease(runtime_id, lease_id, *, owner="", ttl_seconds=None) -> dict
+release_lease(runtime_id, lease_id) -> dict
+delete(runtime_id) -> dict
+collect_garbage(*, dry_run=True, grace_seconds=604800, keep_latest=1) -> dict
+```
+
+`request` 可以是 MaaFW requirement 字符串，或包含 `requirements`/`packages`
+完整依赖集合的字典。结果至少包含：
+
+```text
+runtimeId
+pythonExecutable
+venvPath
+packages
+selectorRequirements
+resolvedRequirements
+maafwRequirement
+maafwVersion
+identity
+references
+leases
+```
+
+runtime identity 由规范化 requirement selector 集合、Python ABI、操作系统和架构
+组成，不含项目路径。`resolvedRequirements` 是安装后的 `pip freeze --all` 审计
+快照，不参与 identity；因此范围 selector 对应的 runtime 删除后重建时，可能解析
+到范围内更新的依赖版本。包含本地路径、editable 或递归 requirements 的依赖不能
+安全跨项目共享，服务会拒绝创建共享 identity。删除与 GC 会保护固定、引用和活动
+lease。
+
+## 17. Runner 0.2 路由补充
+
+`prepare_environment()` 新增可选参数：
+
+```python
+runtime_pool_root=None
+runtime_requirement=None
+runtime_id=None
+lease_owner="automas-maafw-runner"
+lease_ttl_seconds=86400
+```
+
+托管项目未显式传参时，Runner 会读取项目根
+`.auto_mas_maafw_project.json` 的 `runtime.constraint` 和
+`runtime.binding.runtimeId`。binding 必须与当前 selector identity 一致；托管项目
+既无 binding 又无版本约束时会拒绝运行，不会静默安装 `latest`。已绑定 runtime
+丢失但 binding 记录了 `maafwVersion` 时，Managed gateway 会按精确
+`maafw==<version>` 重建环境并持久化新 binding。
+
+`prepare_environment()` 返回的 `MaaFWRunnerEnvironment` 带 `runtime_id`、
+`runtime_pool_root` 和 `lease_id`。调用方必须在 worker 退出的 `finally` 中调用
+`release_environment(environment)`；超时 lease 只用于进程异常退出后的兜底回收。
+`MaaFWManaged` 的项目与 runtime lease 至少为 24 小时，若脚本运行时限更长则按
+“时限 + 10 分钟”延长；首版没有 heartbeat，超长无上限任务应显式配置运行时限。
+
+`MaaFWRunPlan.nativePluginPaths` 描述项目原生插件目录。worker 在创建 Resource、
+Controller 与 Tasker 前加载这些目录；任一路径越出项目根、缺失或加载失败都会
+阻断运行。
+
+托管项目中原本指向被剥离 `python/` 的 Python Agent，只有在私有 manifest 明确
+设置 `runtime.sharedAgentDependenciesComplete: true` 时才会复用 worker 当前的
+`sys.executable`。该标志要求根 requirements 能完整、平面地表达 Agent 依赖；
+否则继续使用隔离环境。项目二进制 Agent、显式外部解释器和非托管项目保持原行为。
+
+`MaaFWManaged` 在实际 GC 前从全部脚本配置对账 `maafw-script:*` 项目引用，并从
+现存项目 binding 对账 `maafw-project:*` runtime 引用。dry-run 不删除任何目录，
+但也会修正项目引用 manifest。当前项目版本始终受保护；应先切换到其他版本，再
+删除旧版本。声明式动作同时提供项目版本和 runtime 列表，便于在通用 SchemaForm
+内完成选择、切换与删除。
+
+## 18. 变更规则
 
 以下改动可以保留当前服务版本：
 
