@@ -68,8 +68,10 @@ class Plugin(ScriptAdapterPlugin):
                 icon="MaaFW",
                 icon_path="automas_script_maafw:assets/maafw.png",
                 editor_kind="schema",
-                legacy_config_class_name="MaaFWConfig",
-                legacy_user_config_class_name="MaaFWUserConfig",
+                # MaaFWManaged 是 v6 新增类型，没有 r6 遗留配置需要兼容。
+                # 声明 legacy MaaFWConfig/MaaFWUserConfig 会与 automas_script_maafw
+                # 抢占宿主注册表里同一个 legacy 键：后注册者静默覆盖先注册者，
+                # 且停用其中一个会把另一个仍在使用的 legacy 映射一起 pop 掉。
                 is_builtin=False,
                 metadata={
                     "framework": "maafw",

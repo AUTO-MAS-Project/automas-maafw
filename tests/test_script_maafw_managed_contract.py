@@ -431,10 +431,71 @@ class ScriptMaaFWManagedContractTest(unittest.TestCase):
         self.assertIn('result.get("deleted") is not True', services_source)
         self.assertIn("_persist_runtime_delete", plugin_source)
 
+    def test_managed_adapter_does_not_squat_the_legacy_maafw_config_names(
+        self,
+    ) -> None:
+        """MaaFWManaged 不得与 MaaFW 共用 legacy 配置类名。
+
+        宿主 script_types.register 会无条件把 legacy_config_class_name 映射到
+        provider（后注册者静默覆盖先注册者），而 unregister 只按 legacy 名 pop，
+        因此停用其中一个插件会打断另一个仍在加载的插件。MaaFWManaged 是 v6 新增
+        类型，没有 r6 遗留配置需要兼容，不应声明 legacy 名。
+        """
+
+        managed = self._adapter_definition(MODULE_ROOT / "plugin.py", "MaaFWManaged")
+        base = self._adapter_definition(BASE_MODULE_ROOT / "plugin.py", "MaaFW")
+
+        self.assertEqual(
+            self._keyword_literal(base, "legacy_config_class_name"),
+            "MaaFWConfig",
+        )
+        self.assertEqual(
+            self._keyword_literal(base, "legacy_user_config_class_name"),
+            "MaaFWUserConfig",
+        )
+        for name in ("legacy_config_class_name", "legacy_user_config_class_name"):
+            with self.subTest(keyword=name):
+                self.assertIsNone(
+                    next(
+                        (item for item in managed.keywords if item.arg == name),
+                        None,
+                    ),
+                    f"MaaFWManaged 不应声明 {name}",
+                )
+        # 显式类名仍在，宿主 _class_names() 不会回落到 legacy 名。
+        self.assertEqual(
+            self._keyword_literal(managed, "script_class_name"),
+            "MaaFWManagedPluginConfig",
+        )
+        self.assertEqual(
+            self._keyword_literal(managed, "user_class_name"),
+            "MaaFWManagedPluginUserConfig",
+        )
+
     def test_all_modules_are_parseable_without_importing_the_host(self) -> None:
         for path in MODULE_ROOT.glob("*.py"):
             with self.subTest(path=path.name):
                 ast.parse(path.read_text(encoding="utf-8"))
+
+    @staticmethod
+    def _adapter_definition(plugin_path: Path, type_key: str) -> ast.Call:
+        tree = ast.parse(plugin_path.read_text(encoding="utf-8"))
+        return next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "ScriptAdapterDefinition"
+            and next(
+                (
+                    ast.literal_eval(item.value)
+                    for item in node.keywords
+                    if item.arg == "type_key"
+                ),
+                None,
+            )
+            == type_key
+        )
 
     @staticmethod
     def _keyword(call: ast.Call, name: str) -> ast.keyword:

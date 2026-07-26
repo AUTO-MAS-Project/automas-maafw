@@ -19,6 +19,12 @@
 - MaaFW Runner 0.3.0 会在构建 pipeline override 时，按当前 Win32/ADB
   controller 将人类可读快捷键转换为对应虚拟键码；缺失修饰键、歧义 controller
   或无法映射的按键会显式失败，不再静默输出无效占位符。
+- MaaFW Runtime Pool 0.1.1 在创建共享 runtime 前探测引导解释器是否带 venv
+  模块；便携包的 embeddable Python 不合格时改用 uv 兜底，并在写 manifest 前
+  用新环境实测 ABI/Python 版本与 pool identity 对账。
+- 托管 MaaFW 网关 0.1.4 把同步服务方法放到线程池执行，不再在宿主事件循环上
+  内联跑 venv 创建、pip install 与整树哈希；`MaaFWManaged` 不再声明与
+  `MaaFW` 相同的 legacy 配置类名。
 
 ## Current package versions
 
@@ -28,7 +34,7 @@
 - `automas-maafw-controller-win32`: 0.1.1
 - `automas-maafw-project-update`: 0.1.1
 - `automas-maafw-project-store`: 0.1.0
-- `automas-maafw-runtime-pool`: 0.1.0
-- `automas-maafw-runner`: 0.3.0
-- `automas-script-maafw`: 0.1.6
-- `automas-script-maafw-managed`: 0.1.1
+- `automas-maafw-runtime-pool`: 0.1.1
+- `automas-maafw-runner`: 0.3.1
+- `automas-script-maafw`: 0.1.7
+- `automas-script-maafw-managed`: 0.1.4

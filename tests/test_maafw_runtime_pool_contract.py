@@ -609,7 +609,7 @@ class MaaFWRuntimePoolStaticContractTest(unittest.TestCase):
         entry_points = project["entry-points"]["auto_mas.plugins"]
 
         self.assertEqual(project["name"], "automas-maafw-runtime-pool")
-        self.assertEqual(project["version"], "0.1.0")
+        self.assertEqual(project["version"], "0.1.1")
         self.assertEqual(
             entry_points["automas_maafw_runtime_pool"],
             "automas_maafw_runtime_pool.plugin:Plugin",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import inspect
 import shutil
 import tempfile
@@ -1239,14 +1240,35 @@ async def _call_variants(
     raise ManagedServiceError(f"{operation}失败：服务方法签名不兼容")
 
 
+def _is_async_callable(method: Any) -> bool:
+    target = method
+    while isinstance(target, functools.partial):
+        target = target.func
+    if inspect.iscoroutinefunction(target):
+        return True
+    call = getattr(target, "__call__", None)
+    return call is not None and inspect.iscoroutinefunction(call)
+
+
 async def _invoke(
     method: Any,
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
     operation: str,
 ) -> Any:
+    """在事件循环外执行同步服务方法。
+
+    project_store / runtime_pool 的服务方法都是同步 def，内部会做 venv 创建、
+    pip install（各 300s 超时）、整树 sha256+copytree、runtime 目录遍历。
+    托管适配器与 11 个托管 HTTP 动作全部在宿主事件循环上调用它们，
+    直接内联执行会把整个后端卡死数十秒到十分钟，所以同步方法一律走线程池。
+    """
+
     try:
-        value = method(*args, **kwargs)
+        if _is_async_callable(method):
+            value = method(*args, **kwargs)
+        else:
+            value = await asyncio.to_thread(method, *args, **kwargs)
         if inspect.isawaitable(value):
             value = await value
         return value

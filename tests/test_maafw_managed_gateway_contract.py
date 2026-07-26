@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from typing import Any
@@ -306,6 +307,119 @@ class MaaFWManagedGatewayContractTest(unittest.TestCase):
         refreshed_binding = refreshed["manifest"]["runtime"]["binding"]
         self.assertEqual(refreshed_binding["runtimeId"], recovered_runtime_id)
         self.assertEqual(refreshed_binding.get("maafwVersion"), "4.3.0")
+
+
+class MaaFWManagedGatewayEventLoopContractTest(unittest.TestCase):
+    """同步服务方法不得在宿主事件循环线程上内联执行。
+
+    project_store / runtime_pool 的服务方法都是同步 def，内部会做 venv 创建、
+    pip install（各 300s 超时）、整树 sha256+copytree、runtime 目录遍历。
+    托管适配器与托管 HTTP 动作全部在事件循环上调用它们，内联执行会把整个
+    后端卡死数十秒到十分钟。
+    """
+
+    def test_synchronous_service_methods_run_off_the_event_loop(self) -> None:
+        observed: dict[str, int] = {}
+
+        class BlockingService:
+            def resolve_runtime(self, request: dict[str, Any]) -> dict[str, Any]:
+                observed["worker"] = threading.get_ident()
+                return {"runtimeId": request["runtimeId"], "pythonExecutable": "py"}
+
+        async def scenario() -> None:
+            observed["loop"] = threading.get_ident()
+            gateway = ManagedServiceGateway(
+                project_store=object(),
+                runtime_pool=BlockingService(),
+            )
+            value = await gateway.resolve_runtime({"runtimeId": "maafw-runtime-x"})
+            self.assertEqual(value["runtimeId"], "maafw-runtime-x")
+
+        asyncio.run(scenario())
+
+        self.assertIn("worker", observed)
+        self.assertNotEqual(
+            observed["worker"],
+            observed["loop"],
+            "同步服务方法仍在事件循环线程上执行，会阻塞整个后端",
+        )
+
+    def test_the_event_loop_stays_responsive_while_a_service_call_blocks(self) -> None:
+        heartbeat_seen = threading.Event()
+        observed: dict[str, bool] = {}
+
+        class BlockingService:
+            def resolve_runtime(self, request: dict[str, Any]) -> dict[str, Any]:
+                # 模拟 venv 创建 / pip install 这类长时间同步 subprocess。
+                # 事件循环若被阻塞，heartbeat 无法在本方法返回前跑起来。
+                observed["heartbeat_before_return"] = heartbeat_seen.wait(timeout=5)
+                return {"runtimeId": request["runtimeId"], "pythonExecutable": "py"}
+
+        async def scenario() -> None:
+            gateway = ManagedServiceGateway(
+                project_store=object(),
+                runtime_pool=BlockingService(),
+            )
+
+            async def heartbeat() -> None:
+                await asyncio.sleep(0.05)
+                heartbeat_seen.set()
+
+            await asyncio.wait_for(
+                asyncio.gather(
+                    gateway.resolve_runtime({"runtimeId": "maafw-runtime-y"}),
+                    heartbeat(),
+                ),
+                timeout=15,
+            )
+
+        try:
+            asyncio.run(scenario())
+        finally:
+            heartbeat_seen.set()
+
+        self.assertTrue(
+            observed.get("heartbeat_before_return"),
+            "同步服务方法执行期间事件循环无法调度其它协程，后端会整体假死",
+        )
+
+    def test_coroutine_service_methods_are_still_awaited_directly(self) -> None:
+        observed: dict[str, int] = {}
+
+        class AsyncService:
+            async def resolve_runtime(self, request: dict[str, Any]) -> dict[str, Any]:
+                observed["worker"] = threading.get_ident()
+                return {"runtimeId": request["runtimeId"], "pythonExecutable": "py"}
+
+        async def scenario() -> None:
+            observed["loop"] = threading.get_ident()
+            gateway = ManagedServiceGateway(
+                project_store=object(),
+                runtime_pool=AsyncService(),
+            )
+            value = await gateway.resolve_runtime({"runtimeId": "maafw-runtime-z"})
+            self.assertEqual(value["runtimeId"], "maafw-runtime-z")
+
+        asyncio.run(scenario())
+
+        self.assertEqual(observed["worker"], observed["loop"])
+
+    def test_service_failures_are_still_reported_as_managed_errors(self) -> None:
+        class FailingService:
+            def resolve_runtime(self, request: dict[str, Any]) -> dict[str, Any]:
+                del request
+                raise ValueError("boom")
+
+        async def scenario() -> None:
+            gateway = ManagedServiceGateway(
+                project_store=object(),
+                runtime_pool=FailingService(),
+            )
+            with self.assertRaises(ManagedServiceError) as raised:
+                await gateway.resolve_runtime({"runtimeId": "maafw-runtime-w"})
+            self.assertIn("boom", str(raised.exception))
+
+        asyncio.run(scenario())
 
 
 if __name__ == "__main__":
