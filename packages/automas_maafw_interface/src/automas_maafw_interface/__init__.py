@@ -8,10 +8,12 @@ from .loader import (
 )
 from .models import (
     MaaFWController,
+    MaaFWHotkeyCase,
     MaaFWInterface,
     MaaFWOption,
     MaaFWPreset,
     MaaFWResource,
+    MaaFWSetting,
     MaaFWTask,
 )
 from .service import MaaFWInterfaceService
@@ -27,12 +29,14 @@ from .task_config import (
 
 __all__ = [
     "MaaFWController",
+    "MaaFWHotkeyCase",
     "MaaFWInterface",
     "MaaFWInterfaceLoadError",
     "MaaFWInterfaceService",
     "MaaFWOption",
     "MaaFWPreset",
     "MaaFWResource",
+    "MaaFWSetting",
     "MaaFWTask",
     "MaaFWTaskConfig",
     "MaaFWTaskPresetSnapshot",

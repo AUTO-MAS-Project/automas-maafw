@@ -91,6 +91,7 @@ def _build_agent_command_plan(
     executable = _resolve_executable(
         base_dir,
         agent_config.child_exec,
+        child_args=child_args,
         managed_env_root=managed_env_root,
     )
     if (
@@ -131,6 +132,7 @@ def _resolve_executable(
     base_dir: Path,
     child_exec: str,
     *,
+    child_args: list[str],
     managed_env_root: str | Path | None,
 ) -> dict[str, Any]:
     replaced = _replace_project_dir(child_exec, base_dir)
@@ -153,7 +155,7 @@ def _resolve_executable(
             "isolated_venv_path": None,
         }
 
-    if _is_bundled_python_pattern(child_exec, base_dir):
+    if _is_bundled_python_pattern(child_exec, child_args, base_dir):
         venv_path = compute_isolated_venv_path(
             base_dir,
             managed_env_root=managed_env_root,
@@ -196,11 +198,34 @@ def _classify_existing_project_executable(resolved_path: Path) -> str:
     return "project_binary"
 
 
-def _is_bundled_python_pattern(child_exec: str, base_dir: Path) -> bool:
+def _is_bundled_python_pattern(
+    child_exec: str,
+    child_args: list[str],
+    base_dir: Path,
+) -> bool:
     normalized = child_exec.replace("\\", "/").lower()
     if not normalized.endswith("python/python.exe"):
         return False
-    return (base_dir / "agent" / "main.py").exists()
+
+    python_entries = [
+        str(arg)
+        for arg in child_args
+        if str(arg).lower().endswith(".py")
+    ]
+    if python_entries:
+        return any(
+            _is_safe_existing_python_entry(base_dir, entry)
+            for entry in python_entries
+        )
+    return (base_dir / "agent" / "main.py").is_file()
+
+
+def _is_safe_existing_python_entry(base_dir: Path, raw_path: str) -> bool:
+    try:
+        resolved_path = _resolve_project_path(base_dir, raw_path)
+    except MaaFWAgentEnvError:
+        return False
+    return resolved_path.is_file() and resolved_path.suffix.lower() == ".py"
 
 
 def _replace_project_dir(value: str, base_dir: Path) -> str:

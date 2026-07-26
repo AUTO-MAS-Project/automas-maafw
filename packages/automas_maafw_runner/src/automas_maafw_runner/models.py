@@ -59,6 +59,7 @@ class MaaFWRunPlan(BaseModel):
     controllerType: str
     resourceName: str
     resource: MaaFWResourceBundlePlan
+    nativePluginPaths: list[MaaFWResolvedPath] = Field(default_factory=list)
     agents: list[MaaFWAgentCommandPlan] = Field(default_factory=list)
     pretasks: list[MaaFWPretaskRunPlan] = Field(default_factory=list)
     piEnv: dict[str, str] = Field(default_factory=dict)

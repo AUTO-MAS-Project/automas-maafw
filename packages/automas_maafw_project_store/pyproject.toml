@@ -3,21 +3,20 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "automas-maafw-agent-env"
-version = "0.1.1"
-description = "MaaFW agent command plan and environment preparation plugin for AUTO-MAS"
+name = "automas-maafw-project-store"
+version = "0.1.0"
+description = "Versioned, resource-only MaaFW project store for AUTO-MAS"
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.10"
 dependencies = [
-    "automas-maafw-interface>=0.1.0",
-    "pydantic>=2",
+    "json5>=0.9",
 ]
 
 [project.entry-points."auto_mas.plugins"]
-automas_maafw_agent_env = "automas_maafw_agent_env.plugin:Plugin"
+automas_maafw_project_store = "automas_maafw_project_store.plugin:Plugin"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-automas_maafw_agent_env = ["py.typed"]
+automas_maafw_project_store = ["py.typed"]

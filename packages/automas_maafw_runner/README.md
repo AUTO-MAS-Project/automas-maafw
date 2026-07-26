@@ -8,3 +8,24 @@ and runs MaaFW through a worker subprocess so importing the service does not loa
 
 The wheel includes the MaaFW runtime worker code. `maa` is imported only by the
 worker subprocess entrypoint, not by `MaaFWRunnerService`.
+
+Runner environments are now selected from `maafw.runtime_pool.v1` by a
+canonical requirement selector rather than by project path. The returned
+environment holds a lease for the worker lifetime; callers must invoke
+`MaaFWRunnerService.release_environment()` in their worker cleanup path.
+
+Managed projects may declare `runtime.constraint`, `runtime.binding`, and
+`nativePluginPaths` in `.auto_mas_maafw_project.json`. An isolated Python Agent
+reuses the worker interpreter only when the manifest explicitly sets
+`runtime.sharedAgentDependenciesComplete` to `true`. Legacy, incomplete,
+binary, and external Agents keep their previous routing behavior.
+
+Runner 0.3.0 also implements ProjectInterface v2.8 hotkey substitution for
+AUTO-MAS Direct:
+
+- saved values stay readable (`E`, `Ctrl+A`, `Ctrl+Shift+A`);
+- `{Name}` and `{Name}.primary` become one integer virtual key code;
+- `{Name}.modifier1` and `{Name}.modifier2` follow the saved modifier order;
+- Win32 uses Windows Virtual-Key codes and Adb uses Android `KeyEvent` codes;
+- unsupported controller types, unknown keys and missing referenced modifiers
+  fail the run-plan build with an actionable error.

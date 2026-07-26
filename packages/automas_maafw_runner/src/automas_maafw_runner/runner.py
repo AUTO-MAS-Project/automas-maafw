@@ -28,6 +28,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -60,12 +61,20 @@ try:
         MaaFWTaskRunPlan,
         build_maafw_agent_command_plans,
     )
+    from .shared_agent import (
+        SHARED_RUNTIME_KIND,
+        route_managed_python_agents_to_shared_runtime,
+    )
 except ImportError:
     from run_plan import (  # type: ignore[no-redef]
         MaaFWResourceBundlePlan,
         MaaFWRunPlan,
         MaaFWTaskRunPlan,
         build_maafw_agent_command_plans,
+    )
+    from shared_agent import (  # type: ignore[no-redef]
+        SHARED_RUNTIME_KIND,
+        route_managed_python_agents_to_shared_runtime,
     )
 
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
@@ -294,25 +303,37 @@ def _agent_compat_shim_dir(venv_path: Path) -> Path:
 def _write_agent_compat_shims(venv_path: Path) -> Path:
     shim_dir = _agent_compat_shim_dir(venv_path)
     shim_dir.mkdir(parents=True, exist_ok=True)
-    (shim_dir / "sitecustomize.py").write_text(
-        "\n".join(
-            [
-                "def _patch_legacy_maafw_resource():",
-                "    try:",
-                "        import maa.resource as maa_resource_module",
-                "        if hasattr(maa_resource_module, 'resource'):",
-                "            return",
-                "        from maa.agent.agent_server import AgentServer",
-                "        maa_resource_module.resource = AgentServer",
-                "    except Exception:",
-                "        pass",
-                "",
-                "_patch_legacy_maafw_resource()",
-                "",
-            ]
-        ),
-        encoding="utf-8",
+    shim_path = shim_dir / "sitecustomize.py"
+    content = "\n".join(
+        [
+            "def _patch_legacy_maafw_resource():",
+            "    try:",
+            "        import maa.resource as maa_resource_module",
+            "        if hasattr(maa_resource_module, 'resource'):",
+            "            return",
+            "        from maa.agent.agent_server import AgentServer",
+            "        maa_resource_module.resource = AgentServer",
+            "    except Exception:",
+            "        pass",
+            "",
+            "_patch_legacy_maafw_resource()",
+            "",
+        ]
     )
+    try:
+        if shim_path.read_text(encoding="utf-8") == content:
+            return shim_dir
+    except (FileNotFoundError, OSError, UnicodeError):
+        pass
+
+    temporary_path = shim_path.with_name(
+        f"{shim_path.name}.tmp-{uuid.uuid4().hex}"
+    )
+    try:
+        temporary_path.write_text(content, encoding="utf-8")
+        temporary_path.replace(shim_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
     return shim_dir
 
 
@@ -396,6 +417,7 @@ class MaaFWRunner:
             return
 
         _ensure_maafw_global_init(Path(self.plan.path))
+        self._load_native_plugins()
         self.resource = Resource()
         self.tasker = Tasker()
         self._install_resource_sink()
@@ -403,6 +425,19 @@ class MaaFWRunner:
         self._connect_device(device_config)
         self._start_agents()
         self._initialized = True
+
+    def _load_native_plugins(self) -> None:
+        for path_info in self.plan.nativePluginPaths:
+            if not path_info.exists or not path_info.isDir:
+                raise RuntimeError(
+                    f"MaaFW native plugin 目录不存在: {path_info.resolved}"
+                )
+            loaded = Tasker.load_plugin(path_info.resolved)
+            if loaded is False:
+                raise RuntimeError(
+                    f"MaaFW native plugin 加载失败: {path_info.resolved}"
+                )
+            self.send_log(f"已加载 MaaFW native plugin: {path_info.resolved}")
 
     def run(self, device_config: MaaFWDeviceConfig) -> MaaFWRunResult:
         self._stop_requested.clear()
@@ -843,6 +878,18 @@ class MaaFWRunner:
         if not process_agents:
             self.send_log("[Python环境] 所有 Agent 均为 embedded，跳过子进程 Python 环境准备")
             return
+
+        shared_agents = route_managed_python_agents_to_shared_runtime(
+            self.plan.path,
+            process_agents,
+            python_executable=sys.executable,
+        )
+        if shared_agents:
+            shim_dir = _write_agent_compat_shims(Path(sys.prefix))
+            self.send_log(
+                "[Python环境] 托管 Python Agent 复用当前共享 runtime: "
+                f"{sys.executable} (agents={len(shared_agents)}, shim={shim_dir})"
+            )
 
         self.send_log(f"[Python环境] 开始准备 {len(process_agents)} 个 Agent 环境")
         from automas_maafw_agent_env.env import prepare_agent_envs
@@ -1343,6 +1390,15 @@ class MaaFWRunner:
                     )
                 except Exception as exc:
                     self.send_log(f"[Python环境] 写入 Agent 兼容层失败: {exc}")
+        elif getattr(agent_plan, "runtimeKind", None) == SHARED_RUNTIME_KIND:
+            try:
+                python_path_items.append(
+                    str(_write_agent_compat_shims(Path(sys.prefix)))
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"写入共享 runtime Agent 兼容层失败: {exc}"
+                ) from exc
         python_path_items.append(str(project_path))
         env["PYTHONPATH"] = os.pathsep.join(python_path_items)
         env["PYTHONIOENCODING"] = "utf-8"

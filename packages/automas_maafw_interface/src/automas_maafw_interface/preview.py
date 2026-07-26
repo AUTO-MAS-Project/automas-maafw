@@ -67,6 +67,7 @@ class MaaFWInterfacePreviewData(BaseModel):
     controllers: list[dict[str, Any]] = Field(default_factory=list)
     resources: list[dict[str, Any]] = Field(default_factory=list)
     groups: list[dict[str, Any]] = Field(default_factory=list)
+    settings: list[dict[str, Any]] = Field(default_factory=list)
     tasks: list[dict[str, Any]] = Field(default_factory=list)
     options: list[dict[str, Any]] = Field(default_factory=list)
     presets: list[dict[str, Any]] = Field(default_factory=list)
@@ -178,6 +179,17 @@ def build_interface_preview_data(
             }
             for group in interface.group or []
         ],
+        settings=[
+            {
+                "name": setting.name,
+                "label": tr_text(setting.label) or setting.name,
+                "description": tr_description(setting.description),
+                "icon": setting.icon,
+                "option": filter_option_names(setting.option),
+                "defaultExpand": bool(setting.default_expand),
+            }
+            for setting in interface.setting or []
+        ],
         tasks=[
             *[
                 {
@@ -242,6 +254,15 @@ def build_interface_preview_data(
                         "patternMsg": input_item.pattern_msg,
                     }
                     for input_item in option.inputs or []
+                ],
+                "hotkeys": [
+                    {
+                        "name": hotkey_item.name,
+                        "label": tr_text(hotkey_item.label),
+                        "description": tr_description(hotkey_item.description),
+                        "default": hotkey_item.default,
+                    }
+                    for hotkey_item in option.hotkeys or []
                 ],
                 "defaultCase": option.default_case,
             }

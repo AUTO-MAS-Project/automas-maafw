@@ -1,16 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-import copy
-import json
-import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any
 
 from app.core import Config
-from app.models.ConfigBase import ConfigBase, JSONValidator, MultipleConfig
-from app.models.config import MaaFWConfig, MaaFWUserConfig
 from app.models.task import ScriptItem, TaskExecuteBase, UserItem
 from app.plugins import ScriptAdapterHooks, ScriptAdapterRuntime
 from app.utils import get_logger
@@ -20,9 +15,6 @@ from automas_maafw_project_update.service import MaaFWProjectUpdateService
 
 from .runner_task import MaaFWPluginAutoProxyTask
 from .schema import build_source_config
-
-
-LegacyConfigT = TypeVar("LegacyConfigT", bound=ConfigBase)
 
 
 logger = get_logger("MaaFW 插件适配")
@@ -35,8 +27,7 @@ class MaaFWAdapterHooks(ScriptAdapterHooks):
         if runtime.mode != "AutoProxy":
             return "MaaFW 插件当前仅支持 AutoProxy 模式"
 
-        script_data = await runtime.storage.read_script_data()
-        script_config = await _load_legacy_script_config(script_data)
+        script_config = await runtime.build_script_model()
         raw_project_path = str(script_config.get("Info", "Path") or "").strip()
         if not raw_project_path:
             return "请设置 MaaFW 项目路径"
@@ -66,9 +57,8 @@ class MaaFWAdapterHooks(ScriptAdapterHooks):
     async def prepare(self, runtime: ScriptAdapterRuntime) -> None:
         await runtime.storage.lock()
 
-        script_data = await runtime.storage.read_script_data()
-        script_config = await _load_legacy_script_config(script_data)
-        user_config = await _load_legacy_user_config(runtime)
+        script_config = await runtime.build_script_model()
+        user_config = await runtime.storage.load_user_collection()
 
         runtime.script_config = script_config
         runtime.user_config = user_config
@@ -142,7 +132,7 @@ class MaaFWAdapterHooks(ScriptAdapterHooks):
     async def _update_project_before_run(
         self,
         runtime: ScriptAdapterRuntime,
-        script_config: MaaFWConfig,
+        script_config: Any,
     ) -> None:
         if not script_config.get("Update", "IfAutoUpdate"):
             self._emit_log(runtime, "MaaFW 项目运行前自动更新已关闭")
@@ -205,53 +195,6 @@ class MaaFWAdapterHooks(ScriptAdapterHooks):
         if isinstance(logs, list):
             logs.extend(_format_update_log_lines(message))
             runtime.script_info.log = "".join(logs[-80:])
-
-
-async def _load_legacy_script_config(payload: dict[str, Any]) -> MaaFWConfig:
-    return await _load_legacy_config(MaaFWConfig(), payload)
-
-
-async def _load_legacy_user_config(
-    runtime: ScriptAdapterRuntime,
-) -> MultipleConfig[MaaFWUserConfig]:
-    collection = MultipleConfig([MaaFWUserConfig])
-    source: dict[str, Any] = {"instances": []}
-    for user_id, payload in await runtime.storage.read_user_data_pairs():
-        uid = str(uuid.UUID(user_id))
-        source["instances"].append({"uid": uid, "type": "MaaFWUserConfig"})
-        source[uid] = _normalize_legacy_json_fields(MaaFWUserConfig(), payload)
-    await collection.load(source)
-    return collection
-
-
-async def _load_legacy_config(
-    config: LegacyConfigT,
-    payload: dict[str, Any],
-) -> LegacyConfigT:
-    await config.load(_normalize_legacy_json_fields(config, payload))
-    return config
-
-
-def _normalize_legacy_json_fields(
-    config: ConfigBase,
-    payload: dict[str, Any],
-) -> dict[str, Any]:
-    """Convert plugin form JSON values back to legacy ConfigBase strings."""
-
-    normalized = copy.deepcopy(payload)
-    for group, items in config._config_item_index.items():
-        group_data = normalized.get(group)
-        if not isinstance(group_data, dict):
-            continue
-        for name, item in items.items():
-            validator = item.validator
-            value = group_data.get(name)
-            if isinstance(validator, JSONValidator) and isinstance(
-                value,
-                validator.type,
-            ):
-                group_data[name] = json.dumps(value, ensure_ascii=False)
-    return normalized
 
 
 def _format_update_log_lines(message: str) -> list[str]:

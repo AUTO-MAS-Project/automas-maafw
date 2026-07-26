@@ -3,26 +3,25 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "automas-script-maafw"
-version = "0.1.7"
-description = "MaaFW script adapter plugin for AUTO-MAS"
+name = "automas-script-maafw-managed"
+version = "0.1.3"
+description = "Declarative managed-project MaaFW script adapter for AUTO-MAS"
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.10"
 dependencies = [
-    "automas-maafw-agent-env>=0.1.0",
-    "automas-maafw-controller-adb>=0.1.0",
-    "automas-maafw-controller-win32>=0.1.1",
+    "automas-script-maafw>=0.1.7",
+    "automas-maafw-runner>=0.3.0",
     "automas-maafw-interface>=0.2.0",
     "automas-maafw-project-update>=0.1.0",
-    "automas-maafw-runner>=0.3.1",
-    "pydantic>=2",
+    "automas-maafw-project-store>=0.1.0",
+    "automas-maafw-runtime-pool>=0.1.0",
 ]
 
 [project.entry-points."auto_mas.plugins"]
-automas_script_maafw = "automas_script_maafw.plugin:Plugin"
+automas_script_maafw_managed = "automas_script_maafw_managed.plugin:Plugin"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-automas_script_maafw = ["py.typed", "assets/*.png"]
+automas_script_maafw_managed = ["py.typed"]

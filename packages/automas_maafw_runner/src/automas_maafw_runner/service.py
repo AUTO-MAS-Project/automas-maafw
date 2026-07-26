@@ -8,14 +8,40 @@ from pathlib import Path
 from typing import Any, Callable
 
 from automas_maafw_interface.models import MaaFWInterface
+from automas_maafw_runtime_pool import MaaFWRuntimePool, RuntimeInstaller
 
-from .environment import MaaFWRunnerEnvironment, prepare_runner_environment
+from .environment import (
+    DEFAULT_RUNTIME_LEASE_TTL_SECONDS,
+    MaaFWRunnerEnvironment,
+    prepare_runner_environment,
+    release_runner_environment,
+)
 from .models import MaaFWDeviceConfig, MaaFWRunnerJobPayload, MaaFWRunPlan, MaaFWRunResult
 from .run_plan import build_maafw_run_plan
+from .worker_registry import (
+    GLOBAL_MAAFW_WORKER_REGISTRY,
+    MaaFWWorkerRegistry,
+    MaaFWWorkerShutdownReport,
+)
 
 
 class MaaFWRunnerService:
     """maafw.runner.v1 service."""
+
+    def __init__(self, *, worker_registry: MaaFWWorkerRegistry | None = None) -> None:
+        self._worker_registry = worker_registry or GLOBAL_MAAFW_WORKER_REGISTRY
+
+    def reopen_worker_registry(self) -> None:
+        self._worker_registry.reopen()
+
+    def register_worker(self, worker: Any) -> str | None:
+        return self._worker_registry.register(worker)
+
+    def unregister_worker(self, worker_id: str | None) -> None:
+        self._worker_registry.unregister(worker_id)
+
+    async def shutdown_workers(self) -> MaaFWWorkerShutdownReport:
+        return await self._worker_registry.shutdown_all()
 
     def build_plan(
         self,
@@ -61,14 +87,39 @@ class MaaFWRunnerService:
         project_path: str | Path,
         *,
         managed_env_root: str | Path | None = None,
+        runtime_pool_root: str | Path | None = None,
+        runtime_pool: MaaFWRuntimePool | None = None,
+        runtime_installer: RuntimeInstaller | None = None,
+        runtime_requirement: str | None = None,
+        runtime_id: str | None = None,
+        lease_owner: str = "automas-maafw-runner",
+        lease_ttl_seconds: float | None = DEFAULT_RUNTIME_LEASE_TTL_SECONDS,
         import_paths: list[str | Path] | None = None,
         send_log: Callable[[str], None] | None = None,
     ) -> MaaFWRunnerEnvironment:
         return prepare_runner_environment(
             project_path,
             managed_env_root=managed_env_root,
+            runtime_pool_root=runtime_pool_root,
+            runtime_pool=runtime_pool,
+            runtime_installer=runtime_installer,
+            runtime_requirement=runtime_requirement,
+            runtime_id=runtime_id,
+            lease_owner=lease_owner,
+            lease_ttl_seconds=lease_ttl_seconds,
             import_paths=import_paths or [],
             send_log=send_log,
+        )
+
+    def release_environment(
+        self,
+        environment: MaaFWRunnerEnvironment,
+        *,
+        runtime_pool: MaaFWRuntimePool | None = None,
+    ) -> dict[str, Any] | None:
+        return release_runner_environment(
+            environment,
+            runtime_pool=runtime_pool,
         )
 
     def write_job_file(
@@ -108,6 +159,7 @@ class MaaFWRunnerService:
             encoding="utf-8",
             errors="replace",
         )
+        worker_id = self.register_worker(process)
         result_payload: dict[str, Any] | None = None
         try:
             assert process.stdout is not None
@@ -131,6 +183,7 @@ class MaaFWRunnerService:
         finally:
             if process.poll() is None:
                 process.terminate()
+            self.unregister_worker(worker_id)
 
         if result_payload is not None:
             return MaaFWRunResult.model_validate(result_payload)

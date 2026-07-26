@@ -42,6 +42,7 @@ from .pipeline_override import MaaFWPipelineOverrideBuilder
 PI_INTERFACE_VERSION = "v2.8.1"
 PI_CLIENT_LANGUAGE = "zh_cn"
 PI_CLIENT_NAME = "AUTO-MAS"
+PROJECT_RUNTIME_MANIFEST_NAME = ".auto_mas_maafw_project.json"
 MAAFW_DIRECT_CONTROLLER_TYPES = {"Adb", "Win32"}
 SENSITIVE_CONFIG_KEYWORDS = (
     "account",
@@ -162,6 +163,7 @@ def build_maafw_run_plan(
         controllerType=controller.type,
         resourceName=resource.name,
         resource=_build_resource_bundle_plan(resolved_base_dir, resource, controller),
+        nativePluginPaths=_build_native_plugin_paths(resolved_base_dir),
         agents=build_maafw_agent_command_plans(
             resolved_base_dir,
             interface.agent,
@@ -527,6 +529,39 @@ def _build_resource_bundle_plan(
             for item in controller.attach_resource_path or []
         ],
     )
+
+
+def _build_native_plugin_paths(base_dir: Path) -> list[MaaFWResolvedPath]:
+    manifest_path = base_dir / PROJECT_RUNTIME_MANIFEST_NAME
+    declared_paths: list[str] | None = None
+    if manifest_path.is_file():
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise MaaFWRunPlanError(
+                f"解析 MaaFW project manifest 失败: {manifest_path}: {exc}"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise MaaFWRunPlanError(
+                f"MaaFW project manifest 必须是 JSON 对象: {manifest_path}"
+            )
+        raw_paths = payload.get("nativePluginPaths")
+        runtime_payload = payload.get("runtime")
+        if raw_paths is None and isinstance(runtime_payload, dict):
+            raw_paths = runtime_payload.get("nativePluginPaths")
+        if raw_paths is not None:
+            if not isinstance(raw_paths, list) or not all(
+                isinstance(item, str) and item.strip() for item in raw_paths
+            ):
+                raise MaaFWRunPlanError(
+                    "nativePluginPaths 必须是字符串数组，且每项不能为空"
+                )
+            declared_paths = list(dict.fromkeys(item.strip() for item in raw_paths))
+
+    if declared_paths is None:
+        default_path = base_dir / "plugins"
+        declared_paths = ["plugins"] if default_path.is_dir() else []
+    return [_resolve_project_path(base_dir, item) for item in declared_paths]
 
 
 def _resolve_project_path(base_dir: Path, raw_path: str) -> MaaFWResolvedPath:

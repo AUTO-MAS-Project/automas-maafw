@@ -10,13 +10,11 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import psutil
 
 from app.core import Config
-from app.models.ConfigBase import MultipleConfig
-from app.models.config import MaaFWConfig, MaaFWUserConfig
 from app.models.emulator import DeviceBase, DeviceInfo
 from app.models.task import LogRecord, ScriptItem, TaskExecuteBase
 from app.plugins.pypi_site import get_plugin_import_paths
@@ -95,8 +93,8 @@ class MaaFWPluginAutoProxyTask(TaskExecuteBase):
     def __init__(
         self,
         script_info: ScriptItem,
-        script_config: MaaFWConfig,
-        user_config: MultipleConfig[MaaFWUserConfig],
+        script_config: Any,
+        user_config: Mapping[uuid.UUID, Any],
         emulator_manager: DeviceBase | None,
         project_update_logs: list[str] | None = None,
     ):
@@ -678,29 +676,46 @@ class MaaFWPluginAutoProxyTask(TaskExecuteBase):
         runner_environment = await asyncio.to_thread(
             service.prepare_environment,
             self.project_path,
-            managed_env_root=Path.cwd() / "config" / "maafw_runner_venvs",
+            runtime_pool_root=Path.cwd() / "config" / "maafw_runtime_pool",
+            lease_owner=f"automas-script-maafw:{self.script_info.script_id}",
+            lease_ttl_seconds=max(
+                600,
+                int(self.script_config.get("Run", "RunTimeLimit") or 30) * 60 + 600,
+            ),
             import_paths=get_plugin_import_paths(),
             send_log=send_runner_log,
         )
-        runner_plan = self.run_plan
-        if runner_environment.maafw_version:
-            runner_plan = self.run_plan.model_copy(deep=True)
-            runner_plan.piEnv["PI_CLIENT_MAAFW_VERSION"] = (
-                f"v{runner_environment.maafw_version.lstrip('v')}"
+        job_path: Path | None = None
+        worker_id: str | None = None
+        try:
+            runner_plan = self.run_plan
+            if runner_environment.maafw_version:
+                runner_plan = self.run_plan.model_copy(deep=True)
+                runner_plan.piEnv["PI_CLIENT_MAAFW_VERSION"] = (
+                    f"v{runner_environment.maafw_version.lstrip('v')}"
+                )
+            payload = service.create_job_payload(runner_plan, device_config)
+            work_dir = Path.cwd() / "runtime" / "maafw_runner_jobs"
+            job_path = await asyncio.to_thread(service.write_job_file, payload, work_dir)
+            process = await asyncio.create_subprocess_exec(
+                str(runner_environment.python_executable),
+                "-m",
+                "automas_maafw_runner.worker",
+                str(job_path),
+                cwd=str(Path.cwd()),
+                env=runner_environment.env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
-        payload = service.create_job_payload(runner_plan, device_config)
-        work_dir = Path.cwd() / "runtime" / "maafw_runner_jobs"
-        job_path = await asyncio.to_thread(service.write_job_file, payload, work_dir)
-        process = await asyncio.create_subprocess_exec(
-            str(runner_environment.python_executable),
-            "-m",
-            "automas_maafw_runner.worker",
-            str(job_path),
-            cwd=str(Path.cwd()),
-            env=runner_environment.env,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+            worker_id = service.register_worker(process)
+        except BaseException:
+            if job_path is not None:
+                with suppress(Exception):
+                    job_path.unlink()
+            with suppress(Exception):
+                await asyncio.to_thread(service.release_environment, runner_environment)
+            service.unregister_worker(worker_id)
+            raise
         self.runner_process = process
         result_payload: dict[str, Any] | None = None
         stderr_lines: list[str] = []
@@ -754,6 +769,9 @@ class MaaFWPluginAutoProxyTask(TaskExecuteBase):
             await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
             with suppress(Exception):
                 job_path.unlink()
+            with suppress(Exception):
+                await asyncio.to_thread(service.release_environment, runner_environment)
+            service.unregister_worker(worker_id)
 
         if result_payload is not None:
             return MaaFWRunResult.model_validate(result_payload)
