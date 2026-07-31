@@ -3,9 +3,8 @@ from __future__ import annotations
 import asyncio
 import functools
 import inspect
-import shutil
-import tempfile
-from collections.abc import Mapping, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
@@ -18,8 +17,6 @@ from automas_maafw_runner.environment import (
 
 PROJECT_STORE_SERVICE = "maafw.project_store.v1"
 RUNTIME_POOL_SERVICE = "maafw.runtime_pool.v1"
-PROJECT_UPDATE_SERVICE = "maafw.project_update.v1"
-INTERFACE_SERVICE = "maafw.interface.v1"
 
 
 class ManagedServiceError(RuntimeError):
@@ -33,8 +30,6 @@ class ManagedServiceGateway:
         self,
         project_store: Any,
         runtime_pool: Any,
-        project_update: Any = None,
-        interface_service: Any = None,
     ) -> None:
         if project_store is None:
             raise ManagedServiceError(f"缺少服务 {PROJECT_STORE_SERVICE}")
@@ -42,8 +37,27 @@ class ManagedServiceGateway:
             raise ManagedServiceError(f"缺少服务 {RUNTIME_POOL_SERVICE}")
         self.project_store = project_store
         self.runtime_pool = runtime_pool
-        self.project_update = project_update
-        self.interface_service = interface_service
+
+    @asynccontextmanager
+    async def resource_transaction(self) -> AsyncIterator[None]:
+        """Serialize project reference reconciliation and destructive GC."""
+
+        transaction = getattr(
+            self.project_store,
+            "resource_lifecycle_transaction",
+            None,
+        )
+        if not callable(transaction):
+            raise ManagedServiceError(
+                "maafw.project_store.v1 未提供资源生命周期事务"
+            )
+        try:
+            async with transaction():
+                yield
+        except ManagedServiceError:
+            raise
+        except Exception as exc:
+            raise ManagedServiceError(f"MaaFW 资源事务失败：{exc}") from exc
 
     async def resolve_execution(self, request: Mapping[str, Any]) -> dict[str, Any]:
         project_id = _required_text(request, "projectId", "项目 ID")
@@ -238,6 +252,15 @@ class ManagedServiceGateway:
         )
         return _as_dict_list(value, "project_store list versions")
 
+    async def list_projects(self) -> list[dict[str, Any]]:
+        value = await _call_variants(
+            self.project_store,
+            ("list_projects", "list"),
+            (((), {}),),
+            operation="列出 MaaFW 托管资源",
+        )
+        return _as_dict_list(value, "project_store list projects")
+
     async def delete_runtime(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         runtime_id = _required_text(payload, "runtimeId", "运行时 ID")
         if _optional_text(payload.get("confirmation")) != runtime_id:
@@ -263,18 +286,21 @@ class ManagedServiceGateway:
         return result
 
     async def import_project(self, payload: Mapping[str, Any]) -> dict[str, Any]:
-        source_path = _required_text(payload, "sourcePath", "导入目录")
+        source_path = _local_source_path(payload)
         project_id = _required_text(payload, "projectId", "项目 ID")
-        version = _required_text(payload, "version", "版本")
+        version = _optional_text(payload.get("version"))
         runtime_constraint = _optional_text(payload.get("runtimeConstraint"))
+        project_reference = _project_script_reference(
+            _optional_text(payload.get("projectReference"))
+        )
         request = {
             "sourcePath": source_path,
             "projectId": project_id,
             "version": version,
             "runtimeConstraint": runtime_constraint,
-            "channel": _optional_text(payload.get("channel")),
             "activate": True,
             "pinned": False,
+            "reference": project_reference,
         }
         value = await _call_variants(
             self.project_store,
@@ -286,6 +312,7 @@ class ManagedServiceGateway:
                         "runtime_constraint": runtime_constraint,
                         "activate": True,
                         "pinned": False,
+                        "reference": project_reference,
                     },
                 ),
                 ((request,), {}),
@@ -294,167 +321,139 @@ class ManagedServiceGateway:
         )
         return _as_dict(value, "project_store import")
 
-    async def check_update(self, payload: Mapping[str, Any]) -> dict[str, Any]:
-        project, interface, current_version = await self._update_context(payload)
-        candidate = await self._check_update_candidate(
-            interface,
-            current_version=current_version,
-            source_config=_update_source_config(payload),
+    async def upgrade_project(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Import a caller-supplied folder/ZIP as a new immutable version.
+
+        Managed resources deliberately do not download releases.  The caller
+        selects a local artifact.  The imported version remains inactive until
+        the host has generated and explicitly applied every script/user
+        configuration plan.
+        """
+
+        source_path = _local_source_path(payload)
+        project_id = _required_text(payload, "projectId", "项目 ID")
+        version = _optional_text(payload.get("version"))
+        current = await self.resolve_project(
+            project_id,
+            _optional_text(payload.get("currentVersion")),
         )
+        current_version = _optional_text(current.get("version"))
+        runtime_constraint = (
+            _optional_text(payload.get("runtimeConstraint"))
+            or _optional_text(current.get("runtimeConstraint"))
+            or _manifest_runtime_constraint(current.get("manifest"))
+        )
+        project_reference = _project_script_reference(
+            _optional_text(payload.get("projectReference"))
+        )
+        request = {
+            "sourcePath": source_path,
+            "projectId": project_id,
+            "version": version,
+            "runtimeConstraint": runtime_constraint,
+            "activate": False,
+            "pinned": False,
+            "reference": project_reference,
+        }
+        imported = await _call_variants(
+            self.project_store,
+            ("update_project", "import_project"),
+            (
+                (
+                    (source_path, project_id, version),
+                    {
+                        "runtime_constraint": runtime_constraint,
+                        "activate": False,
+                        "pinned": False,
+                        "reference": project_reference,
+                    },
+                ),
+                ((request,), {}),
+            ),
+            operation="从本地文件夹或 ZIP 导入 MaaFW 新资源版本",
+        )
+        project = _as_dict(imported, "project_store local upgrade")
+        imported_version = _required_text(project, "version", "导入后的资源版本")
+        if current_version and imported_version == current_version:
+            raise ManagedServiceError(
+                "本地升级必须导入不同于当前版本的新资源；"
+                f"当前版本与导入版本均为 {current_version}"
+            )
         return {
-            "checked": True,
-            "updateAvailable": candidate is not None,
+            "updated": True,
+            "activated": False,
             "currentVersion": current_version,
-            "candidate": _json_value(candidate),
+            "latestVersion": imported_version,
+            "sourcePath": source_path,
+            "previousProject": current,
             "project": project,
         }
 
-    async def update_project(self, payload: Mapping[str, Any]) -> dict[str, Any]:
-        project_id = _required_text(payload, "projectId", "项目 ID")
-        project, interface, current_version = await self._update_context(payload)
-        candidate = await self._check_update_candidate(
-            interface,
-            current_version=current_version,
-            source_config=_update_source_config(payload),
-        )
-        if candidate is None:
-            return {
-                "checked": True,
-                "updated": False,
-                "currentVersion": current_version,
-                "latestVersion": current_version,
-                "project": project,
-            }
-
-        candidate_data = _as_dict(candidate, "project_update candidate")
-        candidate_version = _required_text(candidate_data, "version", "候选版本")
-        project_path = Path(_project_path(project)).resolve()
-        runtime_constraint = (
-            _optional_text(payload.get("runtimeConstraint"))
-            or _optional_text(project.get("runtimeConstraint"))
-            or _manifest_runtime_constraint(project.get("manifest"))
-        )
-
-        with tempfile.TemporaryDirectory(prefix="auto-mas-maafw-update-") as temp_root:
-            staged_project = Path(temp_root) / "project"
-            await asyncio.to_thread(shutil.copytree, project_path, staged_project)
-            await _call_variants(
-                self._require_update_service(),
-                ("apply_update",),
-                (
-                    ((staged_project, candidate), {}),
-                    (
-                        (
-                            {
-                                "projectPath": str(staged_project),
-                                "candidate": candidate_data,
-                            },
-                        ),
-                        {},
-                    ),
-                ),
-                operation="应用 MaaFW 项目更新到临时副本",
-            )
-            imported = await _call_variants(
-                self.project_store,
-                ("update_project", "import_project"),
-                (
-                    (
-                        (str(staged_project), project_id, candidate_version),
-                        {
-                            "runtime_constraint": runtime_constraint,
-                            "activate": True,
-                            "pinned": False,
-                        },
-                    ),
-                    (
-                        (
-                            {
-                                "sourcePath": str(staged_project),
-                                "projectId": project_id,
-                                "version": candidate_version,
-                                "runtimeConstraint": runtime_constraint,
-                                "activate": True,
-                                "pinned": False,
-                            },
-                        ),
-                        {},
-                    ),
-                ),
-                operation="导入更新后的 MaaFW 不可变资源版本",
-            )
-        return {
-            "checked": True,
-            "updated": True,
-            "currentVersion": current_version,
-            "latestVersion": candidate_version,
-            "candidate": candidate_data,
-            "project": _as_dict(imported, "project_store update"),
-        }
-
-    async def _update_context(
+    async def release_project_reference(
         self,
-        payload: Mapping[str, Any],
-    ) -> tuple[dict[str, Any], Any, str]:
-        project_id = _required_text(payload, "projectId", "项目 ID")
-        version = _optional_text(payload.get("version"))
-        project = await self.resolve_project(project_id, version)
-        current_version = str(project.get("version") or version or "").strip()
-        if not current_version:
-            raise ManagedServiceError("项目存储服务未返回当前版本")
-        interface_service = self._require_interface_service()
-        interface = await _call_variants(
-            interface_service,
-            ("load", "load_interface"),
-            (
-                ((_project_path(project),), {}),
-                (({"path": _project_path(project)},), {}),
-            ),
-            operation="读取 MaaFW ProjectInterface",
-        )
-        return project, interface, current_version
-
-    async def _check_update_candidate(
-        self,
-        interface: Any,
-        *,
-        current_version: str,
-        source_config: Mapping[str, Any],
-    ) -> Any:
-        return await _call_variants(
-            self._require_update_service(),
-            ("check_update", "check_updates"),
+        project_id: str,
+        version: str,
+        reference: str,
+    ) -> dict[str, Any]:
+        value = await _call_variants(
+            self.project_store,
+            ("release_runtime", "release_reference"),
             (
                 (
-                    (interface,),
+                    (project_id, version),
                     {
-                        "current_version": current_version,
-                        "source_config": dict(source_config),
+                        "reference": reference,
+                        "clear_binding": False,
                     },
                 ),
                 (
                     (
                         {
-                            "interface": _json_value(interface),
-                            "currentVersion": current_version,
-                            "sourceConfig": dict(source_config),
+                            "projectId": project_id,
+                            "version": version,
+                            "reference": reference,
+                            "clearBinding": False,
                         },
                     ),
                     {},
                 ),
             ),
-            operation="检查 MaaFW 项目更新",
+            operation=f"释放 MaaFW 项目引用 {project_id}@{version}",
         )
+        return _as_dict(value, "project_store release reference")
 
-    def _require_update_service(self) -> Any:
-        if self.project_update is None:
-            raise ManagedServiceError(f"缺少服务 {PROJECT_UPDATE_SERVICE}")
-        return self.project_update
-
-    def _require_interface_service(self) -> Any:
-        if self.interface_service is None:
-            raise ManagedServiceError(f"缺少服务 {INTERFACE_SERVICE}")
-        return self.interface_service
+    async def add_project_reference(
+        self,
+        project_id: str,
+        version: str,
+        reference: str,
+    ) -> dict[str, Any]:
+        normalized_reference = _project_script_reference(reference)
+        value = await _call_variants(
+            self.project_store,
+            ("bind_runtime", "add_reference"),
+            (
+                (
+                    (project_id, version),
+                    {
+                        "reference": normalized_reference,
+                        "touch": True,
+                    },
+                ),
+                (
+                    (
+                        {
+                            "projectId": project_id,
+                            "version": version,
+                            "reference": normalized_reference,
+                        },
+                    ),
+                    {},
+                ),
+            ),
+            operation=f"保护 MaaFW 待确认项目版本 {project_id}@{version}",
+        )
+        return _as_dict(value, "project_store add reference")
 
     async def switch_version(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         project_id = _required_text(payload, "projectId", "项目 ID")
@@ -822,13 +821,40 @@ class ManagedServiceGateway:
             config_data = dict(config) if isinstance(config, Mapping) else {}
             managed = config_data.get("Managed")
             managed_data = dict(managed) if isinstance(managed, Mapping) else {}
-            project_id = _optional_text(managed_data.get("ProjectId"))
-            version = _optional_text(managed_data.get("Version"))
+            project_id, version = managed_project_identity(managed_data)
             if not script_id or not project_id or not version:
                 continue
             expected.setdefault((project_id, version), set()).add(
                 f"maafw-script:{script_id}"
             )
+            pending = managed_data.get("PendingUpgrade")
+            pending_data = dict(pending) if isinstance(pending, Mapping) else {}
+            pending_project = pending_data.get("project")
+            pending_project_data = (
+                dict(pending_project)
+                if isinstance(pending_project, Mapping)
+                else {}
+            )
+            pending_version = _optional_text(
+                pending_project_data.get("toVersion")
+            )
+            pending_reference = _optional_text(
+                pending_project_data.get("pendingReference")
+            )
+            pending_project_id = _optional_text(
+                pending_project_data.get("projectId")
+            )
+            if (
+                pending_project_id == project_id
+                and pending_version
+                and pending_reference
+                and pending_reference.startswith(
+                    f"maafw-upgrade:{script_id}:"
+                )
+            ):
+                expected.setdefault((project_id, pending_version), set()).add(
+                    pending_reference
+                )
 
         projects_value = await _call_variants(
             self.project_store,
@@ -864,7 +890,9 @@ class ManagedServiceGateway:
                 external_references = {
                     item
                     for item in current_references
-                    if not item.startswith("maafw-script:")
+                    if not item.startswith(
+                        ("maafw-script:", "maafw-upgrade:")
+                    )
                 }
                 references = sorted(
                     external_references | expected.get((project_id, version), set())
@@ -1046,30 +1074,28 @@ def _project_script_reference(value: str | None) -> str | None:
     reference = _optional_text(value)
     if reference is None:
         return None
-    prefix = "maafw-script:"
-    if not reference.startswith(prefix) or not reference[len(prefix):].strip():
+    prefixes = ("maafw-script:", "maafw-upgrade:")
+    prefix = next(
+        (item for item in prefixes if reference.startswith(item)),
+        None,
+    )
+    if prefix is None or not reference[len(prefix):].strip():
         raise ManagedServiceError(
-            "项目脚本引用必须使用稳定格式 maafw-script:<scriptId>"
+            "项目引用必须使用稳定格式 maafw-script:<scriptId> "
+            "或 maafw-upgrade:<scriptId>"
         )
     return reference
 
 
-def _update_source_config(payload: Mapping[str, Any]) -> dict[str, Any]:
-    raw = payload.get("sourceConfig")
-    source = dict(raw) if isinstance(raw, Mapping) else {}
-    provider = str(source.get("source") or "").strip().casefold()
-    if provider in {"", "auto"}:
-        source.pop("source", None)
-    elif provider == "mirrorchyan":
-        source["source"] = "mirrorchyan"
-    elif provider in {"github", "github_release"}:
-        source["source"] = "github_release"
-    else:
-        raise ManagedServiceError(f"不支持的更新源：{provider}")
-    channel = _optional_text(payload.get("channel"))
-    if channel:
-        source["channel"] = channel
-    return {str(key): _json_value(value) for key, value in source.items() if value not in (None, "")}
+def _local_source_path(payload: Mapping[str, Any]) -> str:
+    """Resolve the selected local artifact without invoking a downloader."""
+
+    archive = _optional_text(payload.get("sourceArchive"))
+    directory = _optional_text(payload.get("sourcePath"))
+    source = archive or directory
+    if source is None:
+        raise ManagedServiceError("请选择待导入的本地 ZIP 或资源目录")
+    return source
 
 
 def _validate_python_abi(
@@ -1323,6 +1349,22 @@ def _json_value(value: Any) -> Any:
             return _json_value(model_dump())
     raise ManagedServiceError(
         f"服务返回了非 JSON/DTO 值：{type(value).__name__}"
+    )
+
+
+def managed_project_identity(managed: Mapping[str, Any]) -> tuple[str, str]:
+    """Return the immutable Project Store identity when a manifest is bound."""
+    manifest_value = managed.get("ProjectManifest")
+    manifest = (
+        dict(manifest_value) if isinstance(manifest_value, Mapping) else {}
+    )
+    manifest_project_id = _optional_text(manifest.get("projectId"))
+    manifest_version = _optional_text(manifest.get("version"))
+    if manifest_project_id and manifest_version:
+        return manifest_project_id, manifest_version
+    return (
+        _optional_text(managed.get("ProjectId")) or "",
+        _optional_text(managed.get("Version")) or "",
     )
 
 

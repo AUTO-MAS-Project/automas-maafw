@@ -14,6 +14,7 @@ from .services import (
     RUNTIME_POOL_SERVICE,
     ManagedServiceError,
     ManagedServiceGateway,
+    managed_project_identity,
 )
 
 
@@ -23,6 +24,12 @@ _LEASE_KEY = "maafw_managed_runtime_lease"
 _PROJECT_LEASE_KEY = "maafw_managed_project_lease"
 _POLICY_KEY = "maafw_managed_gc_policy"
 _MINIMUM_LEASE_TTL_SECONDS = 24 * 60 * 60
+_UPGRADE_BLOCKING_STATES = {
+    "applying",
+    "committing",
+    "recovery_required",
+    "rollback_failed",
+}
 
 
 class MaaFWManagedAdapterHooks(MaaFWAdapterHooks):
@@ -31,19 +38,25 @@ class MaaFWManagedAdapterHooks(MaaFWAdapterHooks):
     async def check(self, runtime: ScriptAdapterRuntime) -> str:
         if runtime.mode != "AutoProxy":
             return await super().check(runtime)
-        try:
-            await self._resolve_and_inject(runtime)
-        except ManagedServiceError as exc:
-            await self._write_failure_status(runtime, str(exc))
-            return f"托管 MaaFW 项目不可用：{exc}"
-        return await super().check(runtime)
+        async with self._gateway(runtime).resource_transaction():
+            async with runtime.storage.write_transaction():
+                try:
+                    await self._resolve_and_inject(runtime)
+                except ManagedServiceError as exc:
+                    await self._write_failure_status(runtime, str(exc))
+                    return f"托管 MaaFW 项目不可用：{exc}"
+                return await super().check(runtime)
 
     async def prepare(self, runtime: ScriptAdapterRuntime) -> None:
-        resolution = await self._resolve_and_inject(runtime)
-        await self._acquire_runtime_lease(runtime, resolution)
-        await self._acquire_project_lease(runtime, resolution)
-        await self._bind_project_runtime(runtime, resolution)
-        await super().prepare(runtime)
+        # 持住宿主写门直到基础 prepare 锁住脚本配置。升级事务只能完整发生在
+        # 本批次之前，或等待到运行锁建立后明确失败，不能插入解析与绑定之间。
+        async with self._gateway(runtime).resource_transaction():
+            async with runtime.storage.write_transaction():
+                resolution = await self._resolve_and_inject(runtime)
+                await self._acquire_runtime_lease(runtime, resolution)
+                await self._acquire_project_lease(runtime, resolution)
+                await self._bind_project_runtime(runtime, resolution)
+                await super().prepare(runtime)
 
         # The legacy MaaFW config intentionally ignores new declarative groups.
         # Attach JSON DTOs explicitly so runner revisions can consume the binding
@@ -84,13 +97,15 @@ class MaaFWManagedAdapterHooks(MaaFWAdapterHooks):
         try:
             await super().finalize(runtime)
         finally:
-            await self._release_project_lease(runtime)
-            await self._release_runtime_lease(runtime)
-            await self._auto_collect_garbage(runtime)
+            async with self._gateway(runtime).resource_transaction():
+                await self._release_project_lease(runtime)
+                await self._release_runtime_lease(runtime)
+                await self._auto_collect_garbage(runtime)
 
     async def on_crash(self, runtime: ScriptAdapterRuntime, error: Exception) -> None:
-        await self._release_project_lease(runtime)
-        await self._release_runtime_lease(runtime)
+        async with self._gateway(runtime).resource_transaction():
+            await self._release_project_lease(runtime)
+            await self._release_runtime_lease(runtime)
         await super().on_crash(runtime, error)
 
     async def _resolve_and_inject(
@@ -99,11 +114,19 @@ class MaaFWManagedAdapterHooks(MaaFWAdapterHooks):
     ) -> dict[str, Any]:
         script_data = await runtime.storage.read_script_data()
         managed = _mapping(script_data.get("Managed"))
+        pending_upgrade = _mapping(managed.get("PendingUpgrade"))
+        upgrade_state = str(pending_upgrade.get("state") or "").strip()
+        if upgrade_state in _UPGRADE_BLOCKING_STATES:
+            raise ManagedServiceError(
+                f"资源升级事务处于 {upgrade_state}，"
+                "恢复完成前拒绝启动新任务"
+            )
         managed_runtime = _mapping(script_data.get("ManagedRuntime"))
         run_config = _mapping(script_data.get("Run"))
+        project_id, version = managed_project_identity(managed)
         request = {
-            "projectId": managed.get("ProjectId"),
-            "version": managed.get("Version"),
+            "projectId": project_id,
+            "version": version,
             "channel": managed.get("Channel"),
             "runtimeConstraint": managed.get("RuntimeConstraint"),
             "projectReference": _script_reference(runtime),
@@ -124,6 +147,7 @@ class MaaFWManagedAdapterHooks(MaaFWAdapterHooks):
                     "ProjectLabel": project_label,
                 },
                 "Managed": {
+                    "ImportProjectId": "",
                     "ProjectId": project_id,
                     "Version": version,
                     "RuntimeConstraint": resolution.get("runtimeConstraint") or "",
@@ -298,14 +322,17 @@ class MaaFWManagedAdapterHooks(MaaFWAdapterHooks):
         if not isinstance(policy, Mapping) or not policy.get("autoGC"):
             return
         try:
-            script_records = await _managed_script_record_dtos()
-            result = await self._gateway(runtime).collect_garbage(
-                dry_run=False,
-                grace_days=_as_int(policy.get("graceDays"), 30),
-                keep_latest=_as_int(policy.get("keepLatest"), 2),
-                project_id=str(policy.get("projectId") or "") or None,
-                script_records=script_records,
-            )
+            gateway = self._gateway(runtime)
+            async with gateway.resource_transaction():
+                async with Config.script_config_write_scope(None):
+                    script_records = await _managed_script_record_dtos()
+                    result = await gateway.collect_garbage(
+                        dry_run=False,
+                        grace_days=_as_int(policy.get("graceDays"), 30),
+                        keep_latest=_as_int(policy.get("keepLatest"), 2),
+                        project_id=str(policy.get("projectId") or "") or None,
+                        script_records=script_records,
+                    )
             self._emit_log(runtime, f"MaaFW 过期资源回收完成：{result}")
         except ManagedServiceError as exc:
             self._emit_log(runtime, f"MaaFW 过期资源回收失败：{exc}")

@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import ast
+import copy
 import importlib.util
+import json
 import sys
 import tomllib
+import types
 import unittest
+from contextlib import asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,6 +26,7 @@ class ScriptMaaFWManagedContractTest(unittest.TestCase):
             (PACKAGE_ROOT / "pyproject.toml").read_text(encoding="utf-8")
         )
         self.assertEqual(project["project"]["name"], "automas-script-maafw-managed")
+        self.assertEqual(project["project"]["version"], "0.2.0")
         self.assertEqual(
             project["project"]["entry-points"]["auto_mas.plugins"],
             {
@@ -30,12 +36,13 @@ class ScriptMaaFWManagedContractTest(unittest.TestCase):
             },
         )
         dependencies = project["project"]["dependencies"]
-        self.assertIn("automas-script-maafw>=0.1.7", dependencies)
-        self.assertIn("automas-maafw-runner>=0.3.0", dependencies)
-        self.assertIn("automas-maafw-interface>=0.2.0", dependencies)
-        self.assertIn("automas-maafw-project-update>=0.1.0", dependencies)
-        self.assertIn("automas-maafw-project-store>=0.1.0", dependencies)
-        self.assertIn("automas-maafw-runtime-pool>=0.1.0", dependencies)
+        self.assertIn("automas-script-maafw>=0.1.9", dependencies)
+        self.assertIn("automas-maafw-runner>=0.3.3", dependencies)
+        self.assertIn("automas-maafw-project-store>=0.2.0", dependencies)
+        self.assertIn("automas-maafw-runtime-pool>=0.1.4", dependencies)
+        self.assertFalse(
+            any(item.startswith("automas-maafw-project-update") for item in dependencies)
+        )
 
     def test_adapter_registration_is_declarative_and_reuses_icon(self) -> None:
         tree = ast.parse((MODULE_ROOT / "plugin.py").read_text(encoding="utf-8"))
@@ -133,7 +140,7 @@ class ScriptMaaFWManagedContractTest(unittest.TestCase):
         self.assertIn("拒绝创建未约束的 MaaFW 运行时", service_source)
         self.assertIn("add_reference", service_source)
         self.assertIn("reconcile_runtime_references", service_source)
-        self.assertNotIn("clear_binding", service_source)
+        self.assertNotIn("clear_binding", resolve_source)
 
     def test_managed_update_and_reference_lifecycle_are_isolated(self) -> None:
         adapter_source = (MODULE_ROOT / "adapter.py").read_text(encoding="utf-8")
@@ -158,8 +165,9 @@ class ScriptMaaFWManagedContractTest(unittest.TestCase):
         self.assertIn("project_reference: str | None = None", service_source)
         self.assertIn('"reference": stable_project_reference', service_source)
         self.assertIn("reconcile_project_references", service_source)
-        self.assertIn('if not item.startswith("maafw-script:")', service_source)
+        self.assertIn('"maafw-script:", "maafw-upgrade:"', service_source)
         self.assertIn('f"maafw-script:{script_id}"', service_source)
+        self.assertIn('f"maafw-upgrade:{script_id}:"', service_source)
 
         plugin_source = (MODULE_ROOT / "plugin.py").read_text(encoding="utf-8")
         self.assertIn("await Config.get_script_records()", plugin_source)
@@ -327,6 +335,7 @@ class ScriptMaaFWManagedContractTest(unittest.TestCase):
                 self.references = {
                     "1.0": ["maafw-script:deleted", "external:keeper"],
                     "2.0": [],
+                    "3.0": ["maafw-upgrade:active:stale"],
                 }
 
             def list_projects(self):
@@ -353,7 +362,23 @@ class ScriptMaaFWManagedContractTest(unittest.TestCase):
                         "id": "active",
                         "type": "MaaFWManaged",
                         "config": {
-                            "Managed": {"ProjectId": "demo", "Version": "2.0"}
+                            "Managed": {
+                                "ProjectId": "tampered",
+                                "Version": "9.9",
+                                "ProjectManifest": {
+                                    "projectId": "demo",
+                                    "version": "2.0",
+                                },
+                                "PendingUpgrade": {
+                                    "project": {
+                                        "projectId": "demo",
+                                        "toVersion": "3.0",
+                                        "pendingReference": (
+                                            "maafw-upgrade:active:plan-one"
+                                        ),
+                                    }
+                                },
+                            }
                         },
                     },
                     {
@@ -368,19 +393,123 @@ class ScriptMaaFWManagedContractTest(unittest.TestCase):
         )
         self.assertEqual(project_store.references["1.0"], ["external:keeper"])
         self.assertEqual(project_store.references["2.0"], ["maafw-script:active"])
+        self.assertEqual(
+            project_store.references["3.0"],
+            ["maafw-upgrade:active:plan-one"],
+        )
+
+    def test_local_upgrade_uses_the_selected_artifact_and_keeps_constraints(self) -> None:
+        services = self._load_services_module()
+
+        class ProjectStore:
+            def __init__(self) -> None:
+                self.request: dict[str, object] = {}
+
+            def resolve_project(
+                self,
+                project_id: str,
+                version: str | None,
+                *,
+                touch: bool = True,
+            ):
+                del project_id, version, touch
+                return {
+                    "projectId": "demo",
+                    "version": "1.0",
+                    "dataPath": "C:/managed/demo/1.0",
+                    "runtimeConstraint": "==5.10.4",
+                    "manifest": {"runtime": {"constraint": "==5.10.4"}},
+                }
+
+            def update_project(
+                self,
+                source_path: str,
+                project_id: str,
+                version: str | None,
+                *,
+                runtime_constraint: str | None,
+                activate: bool,
+                pinned: bool,
+                reference: str | None,
+            ):
+                self.request = {
+                    "sourcePath": source_path,
+                    "projectId": project_id,
+                    "version": version,
+                    "runtimeConstraint": runtime_constraint,
+                    "activate": activate,
+                    "pinned": pinned,
+                    "reference": reference,
+                }
+                return {
+                    "projectId": project_id,
+                    "version": version,
+                    "dataPath": f"C:/managed/{project_id}/{version}",
+                    "runtimeConstraint": runtime_constraint,
+                    "manifest": {},
+                }
+
+        project_store = ProjectStore()
+        gateway = services.ManagedServiceGateway(project_store, object())
+        result = asyncio.run(
+            gateway.upgrade_project(
+                {
+                    "sourcePath": "C:/ignored-folder",
+                    "sourceArchive": "C:/downloads/m9a.zip",
+                    "projectId": "demo",
+                    "version": "2.0",
+                    "projectReference": "maafw-upgrade:script-one:plan-one",
+                }
+            )
+        )
+
+        self.assertTrue(result["updated"])
+        self.assertFalse(result["activated"])
+        self.assertEqual(result["currentVersion"], "1.0")
+        self.assertEqual(result["latestVersion"], "2.0")
+        self.assertEqual(project_store.request["sourcePath"], "C:/downloads/m9a.zip")
+        self.assertEqual(project_store.request["runtimeConstraint"], "==5.10.4")
+        self.assertFalse(project_store.request["activate"])
+        self.assertEqual(
+            project_store.request["reference"],
+            "maafw-upgrade:script-one:plan-one",
+        )
 
     def test_schema_exposes_managed_lifecycle_without_a_custom_frontend(self) -> None:
         schema_source = (MODULE_ROOT / "schema.py").read_text(encoding="utf-8")
         for field_name in (
+            "ImportProjectId",
             "ProjectId",
             "Version",
+            "ImportVersion",
+            "TargetVersion",
+            "AvailableProjects",
             "AvailableVersions",
-            "Channel",
             "RuntimeConstraint",
+            "SourcePath",
+            "SourceArchive",
+            "ResourceVersion",
+            "InterfaceVersion",
+            "ResourceCount",
+            "TaskCount",
+            "AgentCount",
+            "Agents",
+            "Shells",
+            "Capabilities",
+            "SourceSizeBytes",
+            "ManagedSizeBytes",
+            "UpgradeReady",
+            "PendingPlanId",
+            "UpgradeToken",
+            "PendingUpgrade",
+            "UpgradePlanStatus",
+            "UpgradePlan",
             "Status",
             "ImportProject",
-            "CheckUpdate",
-            "UpdateLatest",
+            "UpgradeLocal",
+            "ApplyUpgrade",
+            "CancelUpgrade",
+            "ListProjects",
             "SwitchVersion",
             "ListVersions",
             "DeleteVersion",
@@ -398,8 +527,10 @@ class ScriptMaaFWManagedContractTest(unittest.TestCase):
             self.assertIn(f'"{field_name}"', schema_source)
         for route in (
             "/plugin/maafw-managed/import",
-            "/plugin/maafw-managed/check-update",
-            "/plugin/maafw-managed/update",
+            "/plugin/maafw-managed/upgrade-local",
+            "/plugin/maafw-managed/upgrade-apply",
+            "/plugin/maafw-managed/upgrade-cancel",
+            "/plugin/maafw-managed/projects/list",
             "/plugin/maafw-managed/switch",
             "/plugin/maafw-managed/versions/list",
             "/plugin/maafw-managed/delete",
@@ -410,24 +541,60 @@ class ScriptMaaFWManagedContractTest(unittest.TestCase):
             "/plugin/maafw-managed/gc",
         ):
             self.assertIn(route, schema_source)
+        self.assertNotIn("/plugin/maafw-managed/check-update", schema_source)
+        self.assertNotIn("/plugin/maafw-managed/update", schema_source)
+        action_nodes = {
+            str(node.args[0].value): ast.unparse(node)
+            for node in ast.walk(ast.parse(schema_source))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "button"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+        }
+        self.assertIn(
+            "formModel.Managed.ImportProjectId",
+            action_nodes["ImportProject"],
+        )
+        self.assertNotIn(
+            "formModel.Managed.ProjectId",
+            action_nodes["ImportProject"],
+        )
+        self.assertIn(
+            "formModel.Managed.ProjectId",
+            action_nodes["UpgradeLocal"],
+        )
+        self.assertNotIn(
+            "formModel.Managed.ImportProjectId",
+            action_nodes["UpgradeLocal"],
+        )
 
         base_schema = (BASE_MODULE_ROOT / "schema.py").read_text(encoding="utf-8")
         self.assertIn('PluginField.json("TaskSnapshot"', base_schema)
-        self.assertIn("USER_GROUPS = tuple(MAAFW_USER_GROUPS)", schema_source)
+        self.assertIn(
+            "USER_GROUPS = (*MAAFW_USER_GROUPS, USER_UPGRADE_GROUP)",
+            schema_source,
+        )
         self.assertFalse(any(PACKAGE_ROOT.rglob("*.vue")))
         self.assertFalse((PACKAGE_ROOT / "package.json").exists())
 
-    def test_update_action_stages_an_immutable_copy_and_persists_results(self) -> None:
+    def test_local_upgrade_imports_an_immutable_version_and_persists_results(self) -> None:
         services_source = (MODULE_ROOT / "services.py").read_text(encoding="utf-8")
-        self.assertIn("TemporaryDirectory", services_source)
-        self.assertIn("shutil.copytree", services_source)
-        self.assertIn('("apply_update",)', services_source)
         self.assertIn('("update_project", "import_project")', services_source)
+        self.assertIn("sourceArchive", services_source)
+        self.assertNotIn("TemporaryDirectory", services_source)
+        self.assertNotIn("PROJECT_UPDATE_SERVICE", services_source)
 
         plugin_source = (MODULE_ROOT / "plugin.py").read_text(encoding="utf-8")
         self.assertIn("Config.update_script", plugin_source)
-        self.assertIn('records[0].type != "MaaFWManaged"', plugin_source)
-        self.assertIn("_persist_update_result", plugin_source)
+        self.assertIn('_record_field(records[0], "type") != "MaaFWManaged"', plugin_source)
+        self.assertIn("_persist_upgrade_result", plugin_source)
+        self.assertIn("plan_resource_upgrade", plugin_source)
+        self.assertIn("await Config.get_user_records(script_id)", plugin_source)
+        self.assertIn("_assert_pending_fresh", plugin_source)
+        self.assertIn("_rollback_pending_upgrade", plugin_source)
+        self.assertIn('definition_data.get("resource_service_key")', plugin_source)
+        self.assertIn("reconcile_project_references", plugin_source)
         self.assertIn('result.get("deleted") is not True', services_source)
         self.assertIn("_persist_runtime_delete", plugin_source)
 
@@ -526,6 +693,780 @@ class ScriptMaaFWManagedContractTest(unittest.TestCase):
         sys.modules[module_name] = module
         spec.loader.exec_module(module)
         return module
+
+
+class ManagedUpgradeStateMachineTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.module = self._load_plugin_module()
+        self.module._JSON_OBJECT_FIELDS = frozenset(
+            {
+                ("Task", "TaskSnapshot"),
+                ("Managed", "PendingUpgrade"),
+                ("Managed", "UpgradePlan"),
+                ("ManagedUpgrade", "PendingPlan"),
+            }
+        )
+        self.script_id = "script-one"
+        self.old_project = self._project("1.0", "old-hash")
+        self.new_project = self._project("2.0", "new-hash")
+
+    def test_runtime_install_request_rejects_stale_binding(self) -> None:
+        config = {
+            "Managed": {
+                "ProjectId": "tampered",
+                "Version": "9.9",
+                "ProjectManifest": {
+                    "projectId": "m9a",
+                    "version": "2.0",
+                },
+                "RuntimeConstraint": "==5.10.4",
+            }
+        }
+        request = self.module._runtime_install_request(
+            config,
+            {
+                "projectId": "m9a",
+                "version": "2.0",
+                "runtimeConstraint": "==5.10.4",
+            },
+        )
+        self.assertEqual(request["version"], "2.0")
+
+        with self.assertRaisesRegex(
+            self.module.ManagedServiceError,
+            "页面中的资源或运行时配置已过期",
+        ):
+            self.module._runtime_install_request(
+                config,
+                {
+                    "projectId": "m9a",
+                    "version": "1.0",
+                    "runtimeConstraint": "==5.10.4",
+                },
+            )
+
+    def test_plans_and_persists_every_user_without_switching(self) -> None:
+        config = self._fake_config(manual_user=True)
+        self.module.Config = config
+        plugin = self.module.Plugin(self._context())
+        plugin._refresh_project_versions_and_references = self._no_refresh
+        plan = asyncio.run(
+            plugin._build_pack_upgrade_plan(
+                self.script_id,
+                {
+                    "previousProject": self.old_project,
+                    "project": self.new_project,
+                },
+                plan_id="plan-one",
+                pending_reference="maafw-upgrade:script-one:plan-one",
+            )
+        )
+        self.assertEqual(plan["state"], "blocked")
+        self.assertEqual(plan["userIds"], ["user-one", "user-two"])
+        self.assertEqual(plan["planCount"], 3)
+        self.assertFalse(plan["readyToApply"])
+        self.assertEqual(len(plan["manualActions"]), 1)
+
+        result = {
+            "project": self.new_project,
+            "previousProject": self.old_project,
+            "latestVersion": "2.0",
+            "_upgradePlanInternal": plan,
+            "upgradePlan": self.module._public_upgrade_plan(plan),
+        }
+        asyncio.run(
+            plugin._persist_upgrade_result(self.script_id, result, {})
+        )
+        managed = config.script.config["Managed"]
+        self.assertEqual(managed["Version"], "1.0")
+        self.assertEqual(config.script.config["Info"]["Path"], "C:/store/m9a/1.0")
+        self.assertEqual(managed["PendingVersion"], "2.0")
+        self.assertEqual(managed["PendingUpgrade"]["state"], "blocked")
+        self.assertEqual(
+            config.users[0].config["ManagedUpgrade"]["PendingPlan"]["recordId"],
+            "user-one",
+        )
+        self.assertNotIn(
+            "sourceConfig",
+            managed["PendingUpgrade"]["users"][0],
+        )
+
+    def test_ready_plan_is_cas_applied_then_switches(self) -> None:
+        config = self._fake_config(manual_user=False)
+        self.module.Config = config
+        gateway = self._Gateway(self.old_project, self.new_project, config.events)
+        plugin = self.module.Plugin(self._context())
+        plugin._gateway = lambda: gateway
+        plugin._refresh_project_versions_and_references = self._no_refresh
+        pending = asyncio.run(
+            plugin._build_pack_upgrade_plan(
+                self.script_id,
+                {
+                    "previousProject": self.old_project,
+                    "project": self.new_project,
+                },
+                plan_id="plan-ready",
+                pending_reference="maafw-upgrade:script-one:plan-ready",
+            )
+        )
+        self.assertEqual(pending["state"], "ready")
+        result = {
+            "project": self.new_project,
+            "previousProject": self.old_project,
+            "latestVersion": "2.0",
+            "_upgradePlanInternal": pending,
+            "upgradePlan": self.module._public_upgrade_plan(pending),
+        }
+        asyncio.run(plugin._persist_upgrade_result(self.script_id, result, {}))
+        config.events.clear()
+        applied = asyncio.run(
+            plugin._apply_pending_upgrade_transaction(
+                self.script_id,
+                {
+                    "planId": "plan-ready",
+                    "confirmation": pending["confirmationToken"],
+                },
+            )
+        )
+        self.assertTrue(applied["applied"])
+        self.assertEqual(gateway.switches, ["2.0"])
+        self.assertLess(
+            config.events.index("user:user-two:target"),
+            config.events.index("switch:2.0"),
+        )
+        self.assertEqual(config.script.config["Managed"]["Version"], "2.0")
+        self.assertEqual(config.script.config["Info"]["Path"], "C:/store/m9a/2.0")
+        self.assertEqual(
+            config.users[0].config["Task"]["TaskSnapshot"]["migratedTo"],
+            "2.0",
+        )
+        self.assertEqual(
+            config.users[0].config["ManagedUpgrade"]["PendingPlan"],
+            {},
+        )
+        self.assertEqual(
+            config.transactions,
+            [("enter", "plan-ready"), ("exit", "plan-ready")],
+        )
+
+    def test_changed_user_config_invalidates_plan_before_switch(self) -> None:
+        config = self._fake_config(manual_user=False)
+        self.module.Config = config
+        gateway = self._Gateway(self.old_project, self.new_project, config.events)
+        plugin = self.module.Plugin(self._context())
+        plugin._gateway = lambda: gateway
+        plugin._refresh_project_versions_and_references = self._no_refresh
+        pending = asyncio.run(
+            plugin._build_pack_upgrade_plan(
+                self.script_id,
+                {
+                    "previousProject": self.old_project,
+                    "project": self.new_project,
+                },
+                plan_id="plan-stale",
+                pending_reference="maafw-upgrade:script-one:plan-stale",
+            )
+        )
+        result = {
+            "project": self.new_project,
+            "previousProject": self.old_project,
+            "latestVersion": "2.0",
+            "_upgradePlanInternal": pending,
+            "upgradePlan": self.module._public_upgrade_plan(pending),
+        }
+        asyncio.run(plugin._persist_upgrade_result(self.script_id, result, {}))
+        config.users[0].config["Task"]["SelectedPreset"] = "changed-after-plan"
+        with self.assertRaisesRegex(
+            self.module.ManagedServiceError,
+            "配置在规划后发生变化",
+        ):
+            asyncio.run(
+                plugin._apply_pending_upgrade(
+                    self.script_id,
+                    {
+                        "planId": "plan-stale",
+                        "confirmation": pending["confirmationToken"],
+                    },
+                )
+            )
+        self.assertEqual(gateway.switches, [])
+        self.assertEqual(config.script.config["Managed"]["Version"], "1.0")
+        self.assertEqual(
+            config.script.config["Managed"]["PendingUpgrade"]["state"],
+            "stale",
+        )
+
+    def test_interrupted_apply_restores_exact_json_snapshots(self) -> None:
+        config = self._fake_config(manual_user=False)
+        self.module.Config = config
+        gateway = self._Gateway(self.old_project, self.new_project, config.events)
+        plugin = self.module.Plugin(self._context())
+        plugin._gateway = lambda: gateway
+        plugin._refresh_project_versions_and_references = self._no_refresh
+        pending = asyncio.run(
+            plugin._build_pack_upgrade_plan(
+                self.script_id,
+                {
+                    "previousProject": self.old_project,
+                    "project": self.new_project,
+                },
+                plan_id="plan-recover",
+                pending_reference="maafw-upgrade:script-one:plan-recover",
+            )
+        )
+        result = {
+            "project": self.new_project,
+            "previousProject": self.old_project,
+            "latestVersion": "2.0",
+            "_upgradePlanInternal": pending,
+            "upgradePlan": self.module._public_upgrade_plan(pending),
+        }
+        asyncio.run(plugin._persist_upgrade_result(self.script_id, result, {}))
+        durable = config.script.config["Managed"]["PendingUpgrade"]
+        asyncio.run(
+            config.update_script(
+                self.script_id,
+                self.module._atomic_json_field_update(
+                    durable["script"]["targetConfig"]
+                ),
+            )
+        )
+        for user in durable["users"]:
+            journal = next(
+                record.config["ManagedUpgrade"]["PendingPlan"]
+                for record in config.users
+                if record.id == user["recordId"]
+            )
+            asyncio.run(
+                config.update_user(
+                    self.script_id,
+                    user["recordId"],
+                    self.module._atomic_json_field_update(
+                        journal["targetConfig"]
+                    ),
+                )
+            )
+        asyncio.run(plugin._set_upgrade_state(self.script_id, durable, "applying"))
+
+        with self.assertRaisesRegex(
+            self.module.ManagedServiceError,
+            "已恢复旧版本与旧配置",
+        ):
+            asyncio.run(
+                plugin._apply_pending_upgrade(
+                    self.script_id,
+                    {
+                        "planId": "plan-recover",
+                        "confirmation": pending["confirmationToken"],
+                    },
+                )
+            )
+
+        self.assertEqual(gateway.switches, ["1.0"])
+        self.assertEqual(
+            config.users[0].config["Task"]["TaskSnapshot"],
+            {"value": 1},
+        )
+        self.assertEqual(
+            config.script.config["Managed"]["PendingUpgrade"]["state"],
+            "ready",
+        )
+
+    def test_bound_script_cannot_bypass_upgrade_with_initial_import(self) -> None:
+        config = self._fake_config(manual_user=False)
+        config.script.config["Managed"].update(
+            {
+                "ProjectId": "",
+                "Version": "",
+                "ProjectManifest": {
+                    "projectId": "m9a",
+                    "version": "1.0",
+                },
+            }
+        )
+        config.script.config["Info"]["Path"] = ""
+        self.module.Config = config
+        plugin = self.module.Plugin(self._context())
+        plugin._gateway = lambda: self.fail("bound import must not reach gateway")
+        with self.assertRaisesRegex(
+            self.module.ManagedServiceError,
+            "不能用首次导入绕过升级事务",
+        ):
+            asyncio.run(
+                plugin._import_initial_project(
+                    self.script_id,
+                    {"projectId": "m9a", "sourcePath": "C:/candidate"},
+                )
+            )
+
+    def test_preconfigured_project_id_allows_first_import(self) -> None:
+        config = self._fake_config(manual_user=False)
+        config.script.config["Managed"]["ProjectId"] = ""
+        config.script.config["Managed"]["Version"] = ""
+        config.script.config["Managed"]["ImportProjectId"] = "m9a"
+        config.script.config["Info"]["Path"] = ""
+        self.module.Config = config
+        gateway = self._Gateway(self.old_project, self.new_project, config.events)
+        plugin = self.module.Plugin(self._context())
+        plugin._gateway = lambda: gateway
+        plugin._refresh_project_versions_and_references = self._no_refresh
+
+        result = asyncio.run(
+            plugin._import_initial_project(
+                self.script_id,
+                {"projectId": "m9a", "sourcePath": "C:/candidate"},
+            )
+        )
+
+        self.assertEqual(result["version"], "2.0")
+        self.assertEqual(config.script.config["Managed"]["Version"], "2.0")
+        self.assertEqual(config.script.config["Managed"]["ImportProjectId"], "")
+        self.assertEqual(config.script.config["Info"]["Path"], "C:/store/m9a/2.0")
+
+    def test_script_journal_failure_cleans_users_and_reference(self) -> None:
+        config = self._fake_config(manual_user=False)
+        self.module.Config = config
+        gateway = self._Gateway(self.old_project, self.new_project, config.events)
+        plugin = self.module.Plugin(self._context())
+        plugin._gateway = lambda: gateway
+        plugin._refresh_project_versions_and_references = self._no_refresh
+        pending = asyncio.run(
+            plugin._build_pack_upgrade_plan(
+                self.script_id,
+                {
+                    "previousProject": self.old_project,
+                    "project": self.new_project,
+                },
+                plan_id="plan-write-fail",
+                pending_reference=(
+                    "maafw-upgrade:script-one:plan-write-fail"
+                ),
+            )
+        )
+        original_update_script = config.update_script
+
+        async def fail_pending_script_write(script_id, update):
+            candidate = update.get("Managed", {}).get("PendingUpgrade")
+            if isinstance(candidate, dict) and candidate.get("kind"):
+                raise RuntimeError("script is locked")
+            await original_update_script(script_id, update)
+
+        config.update_script = staticmethod(fail_pending_script_write)
+        result = {
+            "project": self.new_project,
+            "previousProject": self.old_project,
+            "latestVersion": "2.0",
+            "_upgradePlanInternal": pending,
+            "upgradePlan": self.module._public_upgrade_plan(pending),
+        }
+        with self.assertRaisesRegex(RuntimeError, "script is locked"):
+            asyncio.run(plugin._persist_upgrade_result(self.script_id, result, {}))
+
+        self.assertEqual(
+            config.users[0].config["ManagedUpgrade"]["PendingPlan"],
+            {},
+        )
+        self.assertEqual(
+            gateway.releases,
+            [
+                (
+                    "m9a",
+                    "2.0",
+                    "maafw-upgrade:script-one:plan-write-fail",
+                )
+            ],
+        )
+
+    def test_recovery_requires_every_user_journal(self) -> None:
+        config = self._fake_config(manual_user=False)
+        self.module.Config = config
+        gateway = self._Gateway(self.old_project, self.new_project, config.events)
+        plugin = self.module.Plugin(self._context())
+        plugin._gateway = lambda: gateway
+        plugin._refresh_project_versions_and_references = self._no_refresh
+        pending = asyncio.run(
+            plugin._build_pack_upgrade_plan(
+                self.script_id,
+                {
+                    "previousProject": self.old_project,
+                    "project": self.new_project,
+                },
+                plan_id="plan-missing-user",
+                pending_reference=(
+                    "maafw-upgrade:script-one:plan-missing-user"
+                ),
+            )
+        )
+        result = {
+            "project": self.new_project,
+            "previousProject": self.old_project,
+            "latestVersion": "2.0",
+            "_upgradePlanInternal": pending,
+            "upgradePlan": self.module._public_upgrade_plan(pending),
+        }
+        asyncio.run(plugin._persist_upgrade_result(self.script_id, result, {}))
+        durable = config.script.config["Managed"]["PendingUpgrade"]
+        asyncio.run(plugin._set_upgrade_state(self.script_id, durable, "applying"))
+        config.users[0].config["ManagedUpgrade"]["PendingPlan"] = {}
+
+        with self.assertRaisesRegex(
+            self.module.ManagedServiceError,
+            "缺少完整用户 journal",
+        ):
+            asyncio.run(plugin._rollback_pending_upgrade(self.script_id, durable))
+
+        self.assertEqual(gateway.switches, [])
+        self.assertEqual(
+            config.script.config["Managed"]["PendingUpgrade"]["state"],
+            "recovery_required",
+        )
+
+    def test_startup_sweeps_user_journal_without_script_envelope(self) -> None:
+        config = self._fake_config(manual_user=False)
+        self.module.Config = config
+        gateway = self._Gateway(self.old_project, self.new_project, config.events)
+        plugin = self.module.Plugin(self._context())
+        plugin._gateway = lambda: gateway
+        pending = asyncio.run(
+            plugin._build_pack_upgrade_plan(
+                self.script_id,
+                {
+                    "previousProject": self.old_project,
+                    "project": self.new_project,
+                },
+                plan_id="plan-orphan",
+                pending_reference="maafw-upgrade:script-one:plan-orphan",
+            )
+        )
+        result = {
+            "project": self.new_project,
+            "previousProject": self.old_project,
+            "latestVersion": "2.0",
+            "_upgradePlanInternal": pending,
+            "upgradePlan": self.module._public_upgrade_plan(pending),
+        }
+        plugin._refresh_project_versions_and_references = self._no_refresh
+        asyncio.run(plugin._persist_upgrade_result(self.script_id, result, {}))
+        config.script.config["Managed"]["PendingUpgrade"] = {}
+
+        asyncio.run(plugin._repair_upgrade_artifacts_on_start())
+
+        self.assertEqual(
+            config.users[0].config["ManagedUpgrade"]["PendingPlan"],
+            {},
+        )
+        self.assertEqual(gateway.reconciliations, 1)
+
+    def _fake_config(self, *, manual_user: bool):
+        script = SimpleNamespace(
+            id=self.script_id,
+            type="MaaFWManaged",
+            name="M9A managed",
+            config={
+                "Info": {
+                    "Path": "C:/store/m9a/1.0",
+                    "Resource": "Official",
+                },
+                "Managed": {
+                    "ProjectId": "m9a",
+                    "Version": "1.0",
+                    "PendingVersion": "",
+                    "PendingUpgrade": {},
+                },
+            },
+        )
+        users = [
+            SimpleNamespace(
+                id="user-one",
+                type="MaaFWManaged",
+                name="one",
+                config={
+                    "Task": {
+                        "TaskSnapshot": {"value": 1},
+                        "SelectedPreset": "Daily",
+                    }
+                },
+            ),
+            SimpleNamespace(
+                id="user-two",
+                type="MaaFWManaged",
+                name="two",
+                config={
+                    "Task": {
+                        "TaskSnapshot": {"value": 2},
+                        "SelectedPreset": "Daily",
+                    },
+                    "NeedsManual": manual_user,
+                },
+            ),
+        ]
+
+        class FakeConfig:
+            events: list[str] = []
+            transactions: list[tuple[str, str]] = []
+
+            @classmethod
+            def script_config_transaction(cls, script_id, *, owner):
+                assert script_id == script.id
+                plan_id = str(owner).rsplit(":", 1)[-1]
+
+                class Transaction:
+                    async def __aenter__(self):
+                        cls.transactions.append(("enter", plan_id))
+
+                    async def __aexit__(self, exc_type, exc, traceback):
+                        del exc_type, exc, traceback
+                        cls.transactions.append(("exit", plan_id))
+
+                return Transaction()
+
+            @classmethod
+            @asynccontextmanager
+            async def script_config_write_scope(cls, script_id):
+                del cls
+                assert script_id is None
+                yield
+
+            @classmethod
+            async def get_script_records(cls, script_id=None):
+                return [script] if script_id in (None, script.id) else []
+
+            @classmethod
+            async def get_user_records(cls, script_id, user_id=None):
+                assert script_id == script.id
+                return (
+                    users
+                    if user_id is None
+                    else [item for item in users if item.id == user_id]
+                )
+
+            @classmethod
+            async def update_script(cls, script_id, update):
+                assert script_id == script.id
+                _deep_merge_form(script.config, copy.deepcopy(dict(update)))
+                cls.events.append("script:update")
+
+            @classmethod
+            async def update_user(cls, script_id, user_id, update):
+                assert script_id == script.id
+                user = next(item for item in users if item.id == user_id)
+                payload = copy.deepcopy(dict(update))
+                _deep_merge_form(user.config, payload)
+                snapshot = user.config.get("Task", {}).get("TaskSnapshot", {})
+                phase = (
+                    "target"
+                    if isinstance(snapshot, dict)
+                    and snapshot.get("migratedTo") == "2.0"
+                    else "update"
+                )
+                cls.events.append(f"user:{user_id}:{phase}")
+
+        FakeConfig.script = script
+        FakeConfig.users = users
+        FakeConfig.transactions = []
+        return FakeConfig
+
+    def _context(self):
+        class Registry:
+            @staticmethod
+            def get_project_pack(project_id):
+                return {
+                    "key": project_id,
+                    "resource_service_key": "maafw.pack.m9a.v1",
+                    "resource_upgrade_mode": "plan-only",
+                }
+
+        class Pack:
+            @staticmethod
+            def plan_resource_upgrade(old_path, new_path, config):
+                del old_path, new_path
+                target = copy.deepcopy(config)
+                task = target.get("Task")
+                if isinstance(task, dict) and isinstance(
+                    task.get("TaskSnapshot"), dict
+                ):
+                    task["TaskSnapshot"]["migratedTo"] = "2.0"
+                manual = bool(target.pop("NeedsManual", False))
+                return {
+                    "schemaVersion": 1,
+                    "kind": "maafw.resource-upgrade-plan",
+                    "projectId": "m9a",
+                    "fromVersion": "1.0",
+                    "toVersion": "2.0",
+                    "config": target,
+                    "manualActions": (
+                        [{"kind": "manual-test"}] if manual else []
+                    ),
+                    "warnings": [],
+                    "lossless": True,
+                    "readyToApply": not manual,
+                }
+
+        services = {
+            "maafw.registry.v1": Registry(),
+            "maafw.pack.m9a.v1": Pack(),
+        }
+        return SimpleNamespace(
+            get=lambda key: services.get(key),
+            logger=SimpleNamespace(
+                warning=lambda *_args, **_kwargs: None,
+                error=lambda *_args, **_kwargs: None,
+            ),
+        )
+
+    @staticmethod
+    async def _no_refresh(_script_id, _project_id):
+        return None
+
+    @staticmethod
+    def _project(version: str, source_hash: str) -> dict:
+        return {
+            "projectId": "m9a",
+            "version": version,
+            "dataPath": f"C:/store/m9a/{version}",
+            "runtimeConstraint": "==5.10.4",
+            "manifest": {
+                "source": {
+                    "hash": {
+                        "algorithm": "sha256",
+                        "scope": "projected-source",
+                        "value": source_hash,
+                    }
+                }
+            },
+        }
+
+    class _Gateway:
+        def __init__(self, old_project, new_project, events):
+            self.old_project = old_project
+            self.new_project = new_project
+            self.events = events
+            self.switches: list[str] = []
+            self.releases: list[tuple[str, str, str]] = []
+            self.reconciliations = 0
+
+        @asynccontextmanager
+        async def resource_transaction(self):
+            yield
+
+        async def import_project(self, payload):
+            assert payload["projectId"] == "m9a"
+            return self.new_project
+
+        async def resolve_project(self, project_id, version):
+            assert project_id == "m9a"
+            return self.old_project if version == "1.0" else self.new_project
+
+        async def switch_version(self, payload):
+            version = payload["version"]
+            self.switches.append(version)
+            self.events.append(f"switch:{version}")
+            return self.old_project if version == "1.0" else self.new_project
+
+        async def release_project_reference(self, project_id, version, reference):
+            self.releases.append((project_id, version, reference))
+
+        async def reconcile_project_references(self, _records):
+            self.reconciliations += 1
+
+    @staticmethod
+    def _load_plugin_module():
+        package_name = "_automas_script_maafw_managed_contract_package"
+        module_name = f"{package_name}.plugin_contract"
+        existing = sys.modules.get(module_name)
+        if existing is not None:
+            return existing
+        package = types.ModuleType(package_name)
+        package.__path__ = [str(MODULE_ROOT)]
+        sys.modules[package_name] = package
+
+        app = types.ModuleType("app")
+        app_core = types.ModuleType("app.core")
+        app_plugins = types.ModuleType("app.plugins")
+        app_core.Config = object()
+
+        class ScriptAdapterPlugin:
+            def __init__(self, ctx):
+                self.ctx = ctx
+
+            async def on_start(self):
+                return None
+
+        class ScriptAdapterDefinition:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        app_plugins.ScriptAdapterPlugin = ScriptAdapterPlugin
+        app_plugins.ScriptAdapterDefinition = ScriptAdapterDefinition
+        app_plugins.PluginHttpRequest = object
+        app.core = app_core
+        app.plugins = app_plugins
+        sys.modules.setdefault("app", app)
+        sys.modules.setdefault("app.core", app_core)
+        sys.modules.setdefault("app.plugins", app_plugins)
+
+        adapter = types.ModuleType(f"{package_name}.adapter")
+        adapter.MaaFWManagedAdapterHooks = type(
+            "MaaFWManagedAdapterHooks",
+            (),
+            {},
+        )
+        schema = types.ModuleType(f"{package_name}.schema")
+        schema.SCRIPT_GROUPS = ()
+        schema.USER_GROUPS = ()
+        services_source = ScriptMaaFWManagedContractTest._load_services_module()
+        services = types.ModuleType(f"{package_name}.services")
+        for name in (
+            "PROJECT_STORE_SERVICE",
+            "RUNTIME_POOL_SERVICE",
+            "ManagedServiceError",
+            "ManagedServiceGateway",
+            "managed_project_identity",
+        ):
+            setattr(services, name, getattr(services_source, name))
+        sys.modules[adapter.__name__] = adapter
+        sys.modules[schema.__name__] = schema
+        sys.modules[services.__name__] = services
+
+        spec = importlib.util.spec_from_file_location(
+            module_name,
+            MODULE_ROOT / "plugin.py",
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        module.__package__ = package_name
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        return module
+
+
+def _deep_merge(target: dict, update: dict) -> None:
+    for key, value in update.items():
+        if isinstance(value, dict) and isinstance(target.get(key), dict):
+            _deep_merge(target[key], value)
+        else:
+            target[key] = value
+
+
+def _deep_merge_form(target: dict, update: dict) -> None:
+    """Mirror the host deep merge followed by JSON-field decoding."""
+
+    _deep_merge(target, update)
+    for group_name, fields in update.items():
+        if not isinstance(fields, dict):
+            continue
+        target_group = target.get(group_name)
+        if not isinstance(target_group, dict):
+            continue
+        for field_name, raw_value in fields.items():
+            if not isinstance(raw_value, str):
+                continue
+            try:
+                parsed = json.loads(raw_value)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, (dict, list)):
+                target_group[field_name] = parsed
 
 
 if __name__ == "__main__":
