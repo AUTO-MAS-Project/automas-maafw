@@ -54,15 +54,15 @@ class Plugin:
 | PyPI 包 | 当前版本 | 服务名 | 主要职责 |
 |---|---:|---|---|
 | `automas-maafw-interface` | 0.2.0 | `maafw.interface.v1` | PI 加载、校验、预览、任务快照和 option 归一化 |
-| `automas-maafw-project-update` | 0.1.3 | `maafw.project_update.v1` | MirrorChyan/GitHub Release 版本发现、可安装候选与更新 |
+| `automas-maafw-project-update` | 0.2.0 | `maafw.project_update.v1` | MirrorChyan/GitHub Release 版本发现、受限下载、可安装候选与更新 |
 | `automas-maafw-agent-env` | 0.1.2 | `maafw.agent_env.v1` | agent 运行方式识别、命令规划和 Python 环境准备 |
 | `automas-maafw-controller-adb` | 0.1.0 | `maafw.controller.adb` | ADB provider 与设备参数构建 |
 | `automas-maafw-controller-win32` | 0.1.1 | `maafw.controller.win32` | Win32 provider、窗口扫描与设备参数构建 |
 | `automas-maafw-project-store` | 0.2.0 | `maafw.project_store.v1` | 本地目录/ZIP 资源导入、不可变版本、能力摘要、引用和 GC |
 | `automas-maafw-runtime-pool` | 0.1.4 | `maafw.runtime_pool.v1` | 按 requirement selector 隔离环境并通过 uv cache/hardlink 复用依赖 |
 | `automas-maafw-runner` | 0.3.3 | `maafw.runner.v1` | 运行计划、worker job、runtime 路由和结果模型 |
-| `automas-script-maafw` | 0.1.9 | `maafw.registry.v1` | MaaFW 脚本适配与 controller/project pack 注册表 |
-| `automas-script-maafw-managed` | 0.2.0 | 无 | 声明式本地资源管理、运行绑定与 pack 升级计划 |
+| `automas-script-maafw` | 0.1.9 | `maafw.registry.v1`、`maafw.configuration_reuse.v1` | MaaFW 脚本适配、能力注册、原生配置导入和用户复制 |
+| `automas-script-maafw-managed` | 0.2.0 | 无 | 声明式本地/远程资源管理、运行绑定与 pack 升级计划 |
 | `automas-script-maafw-pack-m9a` | 0.1.0 | `maafw.pack.m9a.v1` | M9A 默认约定、通知翻译和旧配置迁移草稿 |
 | `automas-m9a` | 0.1.0 | 无 | 聚合安装上述 MaaFW/M9A 插件 |
 
@@ -272,6 +272,15 @@ await apply_update(
     send_log=None,
 ) -> None
 
+await download_package(
+    download_root,
+    candidate,
+    *,
+    proxy=None,
+    send_log=None,
+    max_download_bytes=4 * 1024 * 1024 * 1024,
+) -> dict[str, Any]
+
 await update_if_needed(
     project_path,
     interface,
@@ -319,6 +328,13 @@ MaaFWProjectUpdateCandidate:
   download_url: str | None
   sha256: str | None
 
+MaaFWDownloadedProjectPackage:
+  source: str
+  version: str
+  path: str
+  size: int
+  sha256: str
+
 MaaFWProjectUpdateResult:
   checked: bool
   updated: bool
@@ -333,6 +349,12 @@ MaaFWProjectUpdateResult:
 `discover_update()` 返回非空但 `candidate=None`，表示提供者确认有更新版本，
 但没有给出可安装下载地址。`check_update()` 仅兼容旧的 candidate-only 调用，
 遇到这种状态会抛出可诊断错误，绝不会返回伪 candidate。
+
+`download_package()` 只接受 HTTPS，逐跳校验重定向，流式限制下载大小，并在
+ZIP/SHA256 校验后以内容哈希文件名原子发布到调用方管理的目录。并发下载不共享
+可变临时文件；相同内容复用同一归档，不同内容不会因版本名相同而互相覆盖。
+该方法不解压、不修改活动项目，Project Store 仍是安全解包与不可变导入的唯一
+权威。
 
 ### 5.4 调用示例：检查并应用更新
 
@@ -952,6 +974,30 @@ Notify:
 
 脚本适配器通常由 AUTO-MAS 的任务管理器创建，其他插件不应直接实例化内部 `MaaFWPluginAutoProxyTask`。
 
+### 11.1 `maafw.configuration_reuse.v1`
+
+普通 MaaFW 项目向导与新增用户页通过以下插件 HTTP 端点使用配置复用控制器：
+
+```text
+POST /plugin/maafw/config-reuse/sources
+POST /plugin/maafw/config-reuse/plan/external
+POST /plugin/maafw/config-reuse/plan/copy
+POST /plugin/maafw/config-reuse/apply
+```
+
+外部来源必须由用户显式选择，当前识别 MFAAvalonia 旧 `instances/*.json`、新
+`multi_config.json + configs/*.json` 与 MXU `mxu-*.json`。导入计划按当前
+ProjectInterface 归一化 controller、resource、游戏路径、ADB/Win32 控制参数、
+任务顺序与 option；外部模拟器名称、路径和实例索引不冒充宿主稳定 UUID，向导
+会把 ADB 提示带到下一步要求用户确认宿主模拟器/实例。旧窗口句柄也不会复制。
+
+计划只向前端返回摘要、人工动作与脱敏 orphan，不暴露待写入配置。应用前重新
+校验来源 fingerprint、脚本配置 hash、用户集合 hash 以及内部来源用户 hash；
+创建用户、写入用户配置和最后写入脚本配置均在
+`Config.script_config_transaction()` 内完成。新增用户导入不会覆盖脚本级项目
+绑定；复制内部用户只复制 `Info/Task/Notify` 业务配置，并重置 `Data`、journal、
+lease 与资源引用。计划有效期为 30 分钟。
+
 ## 12. `maafw.pack.m9a.v1`
 
 ### 12.1 公开方法
@@ -1344,6 +1390,16 @@ Managed 0.2.0 在 Project Store 缺少该 Python 协调接口时失败关闭，�
 兼容路径；它同时要求宿主提供 `Config.script_config_transaction()`、
 `Config.script_config_write_scope()` 和 ScriptConfigStore
 `write_transaction()`，宿主事务改动合入前不得启用或发布。
+
+Managed 的远程检查把“发现新版本”与“存在可安装候选”分开；只有候选带有效
+下载地址时才允许导入/升级。下载发生在宿主配置事务之外，校验后的本地 ZIP 再
+进入 Project Store 的不可变导入和既有升级计划流程。首次导入使用用户填写的
+`ImportProjectId` 与最小来源元数据，绑定后升级只信任 Project Store manifest
+和活动 ProjectInterface。下载 URL（可能包含短期签名或凭据）不会写入脚本配置，
+持久化发现结果只保留来源、版本、hash 与是否可下载。
+
+普通脚本 0.1.9 的配置复用同样依赖上述宿主事务 API。M9A 集成下限保持
+`automas-maafw-runner>=0.3.3` 与 `automas-script-maafw>=0.1.9`。
 
 ## 18. 变更规则
 

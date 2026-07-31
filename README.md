@@ -30,7 +30,7 @@ M9A project pack 与 `automas-m9a` 聚合包位于独立的 `automas-m9a` 仓库
 
 1. `automas-maafw-interface` 0.2.0、`automas-maafw-project-store` 0.2.0、
    `automas-maafw-runtime-pool` 0.1.4。
-2. `automas-maafw-agent-env` 0.1.2、`automas-maafw-project-update` 0.1.3。
+2. `automas-maafw-agent-env` 0.1.2、`automas-maafw-project-update` 0.2.0。
 3. `automas-maafw-runner` 0.3.3。
 4. `automas-script-maafw` 0.1.9。
 5. `automas-script-maafw-managed` 0.2.0。
@@ -41,10 +41,13 @@ Runtime Pool 和 Managed 前，必须创建 `pypi-project-store`、
 PyPI 为相同包名配置与 repo、`publish.yml` 和 environment 精确匹配的 pending
 trusted publisher。
 
-Managed 0.2.0 还要求目标 AUTO-MAS `dev_v2` 已提供
+普通 MaaFW 脚本 0.1.9 的配置导入/用户复制与 Managed 0.2.0 都要求目标
+AUTO-MAS `dev_v2` 已提供
 `Config.script_config_transaction()`、`Config.script_config_write_scope()` 和
 ScriptConfigStore 的 `write_transaction()`；宿主事务改动合入前不得发布或启用
-Managed 0.2.0。
+这两个版本的新事务能力。M9A 的最低依赖继续保持
+`automas-maafw-runner>=0.3.3`、`automas-script-maafw>=0.1.9`，不要因本轮功能
+把普通脚本包错误提升到 0.2.0。
 
 兼容性审计见
 [`docs/pi-2.8.1-maafw-5.12-compatibility.md`](docs/pi-2.8.1-maafw-5.12-compatibility.md)，
