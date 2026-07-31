@@ -7,9 +7,12 @@ without a project-specific Vue page.
 The adapter resolves an immutable Project Store version, routes it to a shared
 runtime selector, persists the exact runtime binding, and delegates execution
 to the existing MaaFW runner. Its declarative actions accept a local project
-folder or ZIP for import/upgrade and cover capability inspection, version
-listing/switching, project/runtime deletion, pinning and garbage collection.
-It deliberately does not download releases.
+folder or ZIP for import/upgrade, or discover and download an installable
+MirrorChyan/GitHub Release candidate through `maafw.project_update.v1`.
+Remote archives are validated without overwriting the active project, then
+passed to Project Store through the same immutable import and confirmation
+workflow. Actions also cover capability inspection, version listing/switching,
+project/runtime deletion, pinning and garbage collection.
 
 `ImportProjectId` is a first-import input only and is cleared after a successful
 bind. The displayed `ProjectId` and `Version` are read-only. Once bound,

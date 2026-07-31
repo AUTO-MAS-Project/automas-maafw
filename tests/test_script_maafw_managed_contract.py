@@ -40,9 +40,7 @@ class ScriptMaaFWManagedContractTest(unittest.TestCase):
         self.assertIn("automas-maafw-runner>=0.3.3", dependencies)
         self.assertIn("automas-maafw-project-store>=0.2.0", dependencies)
         self.assertIn("automas-maafw-runtime-pool>=0.1.4", dependencies)
-        self.assertFalse(
-            any(item.startswith("automas-maafw-project-update") for item in dependencies)
-        )
+        self.assertIn("automas-maafw-project-update>=0.2.0", dependencies)
 
     def test_adapter_registration_is_declarative_and_reuses_icon(self) -> None:
         tree = ast.parse((MODULE_ROOT / "plugin.py").read_text(encoding="utf-8"))
@@ -523,6 +521,20 @@ class ScriptMaaFWManagedContractTest(unittest.TestCase):
             "AutoGC",
             "GCGraceDays",
             "KeepLatest",
+            "Source",
+            "Channel",
+            "MirrorChyanRID",
+            "MirrorChyanCDK",
+            "GitHubRepo",
+            "GitHubTag",
+            "GitHubAssetPattern",
+            "LatestVersion",
+            "Installable",
+            "Discovery",
+            "LastDownload",
+            "CheckRemote",
+            "ImportRemote",
+            "UpgradeRemote",
         ):
             self.assertIn(f'"{field_name}"', schema_source)
         for route in (
@@ -539,6 +551,9 @@ class ScriptMaaFWManagedContractTest(unittest.TestCase):
             "/plugin/maafw-managed/runtime/delete",
             "/plugin/maafw-managed/pin",
             "/plugin/maafw-managed/gc",
+            "/plugin/maafw-managed/remote/check",
+            "/plugin/maafw-managed/remote/import",
+            "/plugin/maafw-managed/remote/upgrade",
         ):
             self.assertIn(route, schema_source)
         self.assertNotIn("/plugin/maafw-managed/check-update", schema_source)
@@ -583,7 +598,9 @@ class ScriptMaaFWManagedContractTest(unittest.TestCase):
         self.assertIn('("update_project", "import_project")', services_source)
         self.assertIn("sourceArchive", services_source)
         self.assertNotIn("TemporaryDirectory", services_source)
-        self.assertNotIn("PROJECT_UPDATE_SERVICE", services_source)
+        self.assertIn('PROJECT_UPDATE_SERVICE = "maafw.project_update.v1"', services_source)
+        self.assertIn('INTERFACE_SERVICE = "maafw.interface.v1"', services_source)
+        self.assertIn("download_remote_package", services_source)
 
         plugin_source = (MODULE_ROOT / "plugin.py").read_text(encoding="utf-8")
         self.assertIn("Config.update_script", plugin_source)
@@ -744,6 +761,25 @@ class ManagedUpgradeStateMachineTest(unittest.TestCase):
                     "runtimeConstraint": "==5.10.4",
                 },
             )
+
+    def test_remote_discovery_drops_ephemeral_download_url_before_persistence(self) -> None:
+        public = self.module._public_remote_discovery(
+            {
+                "latestVersion": "2.0.0",
+                "installable": True,
+                "candidate": {
+                    "source": "mirrorchyan",
+                    "version": "2.0.0",
+                    "download_url": "https://download.example/pkg.zip?cdk=secret",
+                    "sha256": "a" * 64,
+                },
+            }
+        )
+
+        self.assertNotIn("download_url", public["candidate"])
+        self.assertNotIn("downloadUrl", public["candidate"])
+        self.assertTrue(public["candidate"]["downloadAvailable"])
+        self.assertEqual(public["candidate"]["sha256"], "a" * 64)
 
     def test_plans_and_persists_every_user_without_switching(self) -> None:
         config = self._fake_config(manual_user=True)
@@ -1419,6 +1455,8 @@ class ManagedUpgradeStateMachineTest(unittest.TestCase):
         for name in (
             "PROJECT_STORE_SERVICE",
             "RUNTIME_POOL_SERVICE",
+            "PROJECT_UPDATE_SERVICE",
+            "INTERFACE_SERVICE",
             "ManagedServiceError",
             "ManagedServiceGateway",
             "managed_project_identity",

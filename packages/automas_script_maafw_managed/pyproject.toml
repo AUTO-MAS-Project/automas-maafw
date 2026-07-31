@@ -12,6 +12,7 @@ dependencies = [
     "automas-script-maafw>=0.1.9",
     "automas-maafw-runner>=0.3.3",
     "automas-maafw-project-store>=0.2.0",
+    "automas-maafw-project-update>=0.2.0",
     "automas-maafw-runtime-pool>=0.1.4",
 ]
 

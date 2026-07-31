@@ -17,6 +17,8 @@ from automas_maafw_runner.environment import (
 
 PROJECT_STORE_SERVICE = "maafw.project_store.v1"
 RUNTIME_POOL_SERVICE = "maafw.runtime_pool.v1"
+PROJECT_UPDATE_SERVICE = "maafw.project_update.v1"
+INTERFACE_SERVICE = "maafw.interface.v1"
 
 
 class ManagedServiceError(RuntimeError):
@@ -30,6 +32,8 @@ class ManagedServiceGateway:
         self,
         project_store: Any,
         runtime_pool: Any,
+        project_update: Any = None,
+        interface_service: Any = None,
     ) -> None:
         if project_store is None:
             raise ManagedServiceError(f"缺少服务 {PROJECT_STORE_SERVICE}")
@@ -37,6 +41,8 @@ class ManagedServiceGateway:
             raise ManagedServiceError(f"缺少服务 {RUNTIME_POOL_SERVICE}")
         self.project_store = project_store
         self.runtime_pool = runtime_pool
+        self.project_update = project_update
+        self.interface_service = interface_service
 
     @asynccontextmanager
     async def resource_transaction(self) -> AsyncIterator[None]:
@@ -261,6 +267,72 @@ class ManagedServiceGateway:
         )
         return _as_dict_list(value, "project_store list projects")
 
+    async def load_interface(self, project_path: str) -> dict[str, Any]:
+        if self.interface_service is None:
+            raise ManagedServiceError(f"缺少服务 {INTERFACE_SERVICE}")
+        value = await _call_variants(
+            self.interface_service,
+            ("load",),
+            (
+                ((project_path,), {"force_reload": False}),
+                ((project_path,), {}),
+            ),
+            operation="读取托管 MaaFW ProjectInterface",
+        )
+        return _as_dict(value, "maafw.interface.v1 load")
+
+    async def discover_remote_update(
+        self,
+        interface: Mapping[str, Any],
+        *,
+        current_version: str,
+        source_config: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        if self.project_update is None:
+            raise ManagedServiceError(f"缺少服务 {PROJECT_UPDATE_SERVICE}")
+        method = getattr(self.project_update, "discover_update", None)
+        if not callable(method):
+            raise ManagedServiceError(
+                f"{PROJECT_UPDATE_SERVICE} 未提供 discover_update"
+            )
+        value = await _invoke(
+            method,
+            (dict(interface),),
+            {
+                "current_version": current_version,
+                "source_config": dict(source_config),
+            },
+            "发现 MaaFW 远程资源",
+        )
+        if value is None:
+            return None
+        return _as_dict(value, "maafw.project_update.v1 discover_update")
+
+    async def download_remote_package(
+        self,
+        download_root: str | Path,
+        candidate: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        if self.project_update is None:
+            raise ManagedServiceError(f"缺少服务 {PROJECT_UPDATE_SERVICE}")
+        method = getattr(self.project_update, "download_package", None)
+        if not callable(method):
+            raise ManagedServiceError(
+                f"{PROJECT_UPDATE_SERVICE} 未提供 download_package；"
+                "请升级 automas-maafw-project-update"
+            )
+        value = await _invoke(
+            method,
+            (Path(download_root), dict(candidate)),
+            {},
+            "下载 MaaFW 远程资源包",
+        )
+        package = _as_dict(value, "maafw.project_update.v1 download_package")
+        path = _required_text(package, "path", "远程下载包路径")
+        if not Path(path).is_file():
+            raise ManagedServiceError("远程下载服务未返回可读取的本地 ZIP")
+        return package
+
     async def delete_runtime(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         runtime_id = _required_text(payload, "runtimeId", "运行时 ID")
         if _optional_text(payload.get("confirmation")) != runtime_id:
@@ -324,8 +396,8 @@ class ManagedServiceGateway:
     async def upgrade_project(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         """Import a caller-supplied folder/ZIP as a new immutable version.
 
-        Managed resources deliberately do not download releases.  The caller
-        selects a local artifact.  The imported version remains inactive until
+        Remote downloads are deliberately handled by Project Update before
+        this method is called.  The imported version remains inactive until
         the host has generated and explicitly applied every script/user
         configuration plan.
         """

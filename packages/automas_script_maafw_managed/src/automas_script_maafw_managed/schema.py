@@ -268,6 +268,85 @@ PROJECT_GROUP = PluginField.group(
 )
 
 
+REMOTE_GROUP = PluginField.group(
+    "ManagedRemote",
+    "远程资源",
+    [
+        PluginField.select(
+            "Source",
+            "远程来源",
+            "MirrorChyan",
+            ["MirrorChyan", "GitHub"],
+        ),
+        PluginField.select(
+            "Channel",
+            "更新渠道",
+            "stable",
+            ["stable", "beta"],
+        ),
+        PluginField.string(
+            "MirrorChyanRID",
+            "MirrorChyan RID",
+            "",
+            placeholder="首次远程导入时填写；升级可继承 ProjectInterface",
+        ),
+        PluginField.string(
+            "MirrorChyanCDK",
+            "Mirror 酱 CDK",
+            "",
+            sensitive=True,
+        ),
+        PluginField.string(
+            "GitHubRepo",
+            "GitHub 仓库",
+            "",
+            placeholder="owner/repository；升级可继承 ProjectInterface",
+        ),
+        PluginField.string("GitHubTag", "GitHub Tag", ""),
+        PluginField.string(
+            "GitHubAssetPattern",
+            "GitHub Asset 匹配",
+            r"\.zip$",
+        ),
+        PluginField.string(
+            "LatestVersion",
+            "发现的远程版本",
+            "",
+            readonly=True,
+        ),
+        PluginField.boolean(
+            "Installable",
+            "存在可下载候选",
+            False,
+            readonly=True,
+        ),
+        PluginField.string(
+            "Status",
+            "远程检查状态",
+            "尚未检查",
+            readonly=True,
+            size="large",
+        ),
+        PluginField.json(
+            "Discovery",
+            "远程发现结果",
+            "{}",
+            json_type="object",
+            readonly=True,
+            size="large",
+        ),
+        PluginField.json(
+            "LastDownload",
+            "最近下载包校验信息",
+            "{}",
+            json_type="object",
+            readonly=True,
+            size="large",
+        ),
+    ],
+)
+
+
 RUNTIME_GROUP = PluginField.group(
     "ManagedRuntime",
     "共享运行时与空间策略",
@@ -353,6 +432,75 @@ ACTION_GROUP = PluginField.group(
     "ManagedActions",
     "资源操作",
     [
+        PluginField.button(
+            "CheckRemote",
+            "检查远程资源",
+            _action(
+                "检查远程资源",
+                "/plugin/maafw-managed/remote/check",
+                {
+                    "scriptId": "{{scriptId}}",
+                    "projectId": "{{formModel.Managed.ImportProjectId}}",
+                    "source": "{{formModel.ManagedRemote.Source}}",
+                    "channel": "{{formModel.ManagedRemote.Channel}}",
+                    "mirrorChyanRid": "{{formModel.ManagedRemote.MirrorChyanRID}}",
+                    "mirrorChyanCDK": "{{formModel.ManagedRemote.MirrorChyanCDK}}",
+                    "githubRepo": "{{formModel.ManagedRemote.GitHubRepo}}",
+                    "githubTag": "{{formModel.ManagedRemote.GitHubTag}}",
+                    "githubAssetPattern": (
+                        "{{formModel.ManagedRemote.GitHubAssetPattern}}"
+                    ),
+                },
+            ),
+        ),
+        PluginField.button(
+            "ImportRemote",
+            "首次下载并导入远程资源",
+            _action(
+                "首次下载并导入远程资源",
+                "/plugin/maafw-managed/remote/import",
+                {
+                    "scriptId": "{{scriptId}}",
+                    "projectId": "{{formModel.Managed.ImportProjectId}}",
+                    "runtimeConstraint": (
+                        "{{formModel.Managed.RuntimeConstraint}}"
+                    ),
+                    "source": "{{formModel.ManagedRemote.Source}}",
+                    "channel": "{{formModel.ManagedRemote.Channel}}",
+                    "mirrorChyanRid": "{{formModel.ManagedRemote.MirrorChyanRID}}",
+                    "mirrorChyanCDK": "{{formModel.ManagedRemote.MirrorChyanCDK}}",
+                    "githubRepo": "{{formModel.ManagedRemote.GitHubRepo}}",
+                    "githubTag": "{{formModel.ManagedRemote.GitHubTag}}",
+                    "githubAssetPattern": (
+                        "{{formModel.ManagedRemote.GitHubAssetPattern}}"
+                    ),
+                },
+            ),
+        ),
+        PluginField.button(
+            "UpgradeRemote",
+            "下载远程升级并生成计划",
+            _action(
+                "下载远程升级并生成计划",
+                "/plugin/maafw-managed/remote/upgrade",
+                {
+                    "scriptId": "{{scriptId}}",
+                    "projectId": "{{formModel.Managed.ProjectId}}",
+                    "runtimeConstraint": (
+                        "{{formModel.Managed.RuntimeConstraint}}"
+                    ),
+                    "source": "{{formModel.ManagedRemote.Source}}",
+                    "channel": "{{formModel.ManagedRemote.Channel}}",
+                    "mirrorChyanRid": "{{formModel.ManagedRemote.MirrorChyanRID}}",
+                    "mirrorChyanCDK": "{{formModel.ManagedRemote.MirrorChyanCDK}}",
+                    "githubRepo": "{{formModel.ManagedRemote.GitHubRepo}}",
+                    "githubTag": "{{formModel.ManagedRemote.GitHubTag}}",
+                    "githubAssetPattern": (
+                        "{{formModel.ManagedRemote.GitHubAssetPattern}}"
+                    ),
+                },
+            ),
+        ),
         PluginField.button(
             "ImportProject",
             "导入资源版本",
@@ -597,6 +745,7 @@ def _managed_maafw_groups():
 SCRIPT_GROUPS = (
     PROJECT_GROUP,
     *_managed_maafw_groups(),
+    REMOTE_GROUP,
     RUNTIME_GROUP,
     ACTION_GROUP,
 )

@@ -20,7 +20,9 @@ from app.plugins import (
 from .adapter import MaaFWManagedAdapterHooks
 from .schema import SCRIPT_GROUPS, USER_GROUPS
 from .services import (
+    INTERFACE_SERVICE,
     PROJECT_STORE_SERVICE,
+    PROJECT_UPDATE_SERVICE,
     RUNTIME_POOL_SERVICE,
     ManagedServiceError,
     ManagedServiceGateway,
@@ -64,7 +66,12 @@ _JSON_OBJECT_FIELDS = frozenset(
 class Plugin(ScriptAdapterPlugin):
     """Declarative adapter for resource-only, versioned MaaFW projects."""
 
-    needs = [PROJECT_STORE_SERVICE, RUNTIME_POOL_SERVICE]
+    needs = [
+        PROJECT_STORE_SERVICE,
+        RUNTIME_POOL_SERVICE,
+        PROJECT_UPDATE_SERVICE,
+        INTERFACE_SERVICE,
+    ]
     wants = [
         "emulator",
         "maafw.agent_env.v1",
@@ -146,6 +153,21 @@ class Plugin(ScriptAdapterPlugin):
     async def on_start(self) -> None:
         await super().on_start()
         self.ctx.server.http(
+            "/maafw-managed/remote/check",
+            self._check_remote_project,
+            methods=("POST",),
+        )
+        self.ctx.server.http(
+            "/maafw-managed/remote/import",
+            self._import_remote_project,
+            methods=("POST",),
+        )
+        self.ctx.server.http(
+            "/maafw-managed/remote/upgrade",
+            self._upgrade_remote_project,
+            methods=("POST",),
+        )
+        self.ctx.server.http(
             "/maafw-managed/import",
             self._import_project,
             methods=("POST",),
@@ -212,6 +234,235 @@ class Plugin(ScriptAdapterPlugin):
         )
         await self._recover_interrupted_upgrades()
         await self._repair_upgrade_artifacts_on_start()
+
+    async def _check_remote_project(
+        self,
+        request: PluginHttpRequest,
+    ) -> dict[str, Any]:
+        payload = _payload(request)
+        return await self._respond_for_script(
+            payload,
+            lambda script_id: self._run_upgrade_locked(
+                script_id,
+                lambda: self._check_remote_project_locked(script_id, payload),
+            ),
+        )
+
+    async def _check_remote_project_locked(
+        self,
+        script_id: str,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        discovery = await self._discover_remote_project(script_id, payload)
+        public_discovery = _public_remote_discovery(discovery)
+
+        async def persist() -> dict[str, Any]:
+            await self._persist_remote_result(
+                script_id,
+                public_discovery,
+                status=str(discovery.get("message") or "远程资源检查完成"),
+            )
+            return public_discovery
+
+        return await self._run_config_transaction(
+            script_id,
+            f"maafw-remote-check:{script_id}",
+            persist,
+        )
+
+    async def _import_remote_project(
+        self,
+        request: PluginHttpRequest,
+    ) -> dict[str, Any]:
+        payload = _payload(request)
+        return await self._respond_for_script(
+            payload,
+            lambda script_id: self._run_upgrade_locked(
+                script_id,
+                lambda: self._download_and_import_remote(
+                    script_id,
+                    payload,
+                    initial=True,
+                ),
+            ),
+        )
+
+    async def _upgrade_remote_project(
+        self,
+        request: PluginHttpRequest,
+    ) -> dict[str, Any]:
+        payload = _payload(request)
+        return await self._respond_for_script(
+            payload,
+            lambda script_id: self._run_upgrade_locked(
+                script_id,
+                lambda: self._download_and_import_remote(
+                    script_id,
+                    payload,
+                    initial=False,
+                ),
+            ),
+        )
+
+    async def _download_and_import_remote(
+        self,
+        script_id: str,
+        payload: Mapping[str, Any],
+        *,
+        initial: bool,
+    ) -> dict[str, Any]:
+        discovery = await self._discover_remote_project(script_id, payload)
+        candidate = _mapping(discovery.get("candidate"))
+        if discovery.get("installable") is not True or not candidate:
+            reason = str(
+                discovery.get("unavailableReason")
+                or discovery.get("message")
+                or "远程来源没有可下载候选"
+            )
+            raise ManagedServiceError(reason)
+
+        download_root = Path.cwd() / "data" / "maafw-managed" / "downloads"
+        downloaded = await self._gateway().download_remote_package(
+            download_root,
+            candidate,
+        )
+        imported_payload = dict(payload)
+        imported_payload.update(
+            {
+                "sourcePath": "",
+                "sourceArchive": str(downloaded.get("path") or ""),
+                "version": str(candidate.get("version") or "").strip(),
+            }
+        )
+
+        async def persist() -> dict[str, Any]:
+            if initial:
+                result = await self._import_initial_project(
+                    script_id,
+                    imported_payload,
+                )
+                status = "远程资源已下载、校验并导入"
+            else:
+                result = await self._stage_and_persist_upgrade(
+                    script_id,
+                    imported_payload,
+                    existing_version=False,
+                )
+                status = "远程资源已下载并生成待确认升级计划"
+            await self._persist_remote_result(
+                script_id,
+                _public_remote_discovery(discovery),
+                status=status,
+                downloaded=downloaded,
+            )
+            return {**result, "download": downloaded}
+
+        return await self._run_config_transaction(
+            script_id,
+            (
+                f"maafw-remote-import:{script_id}"
+                if initial
+                else f"maafw-remote-stage:{script_id}"
+            ),
+            persist,
+        )
+
+    async def _discover_remote_project(
+        self,
+        script_id: str,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        record = await _managed_script_record(script_id)
+        config = _record_config(record, "脚本")
+        managed = _mapping(config.get("Managed"))
+        project_id, version = managed_project_identity(managed)
+        gateway = self._gateway()
+        if project_id and version:
+            project = await gateway.resolve_project(project_id, version)
+            interface = await gateway.load_interface(_project_data_path(project))
+            current_version = str(project.get("version") or version)
+            mode = "upgrade"
+        else:
+            requested_project_id = str(payload.get("projectId") or "").strip()
+            if not requested_project_id:
+                raise ManagedServiceError(
+                    "首次远程导入前请填写 ImportProjectId"
+                )
+            interface = _remote_probe_interface(payload, requested_project_id)
+            current_version = "0.0.0"
+            mode = "initial"
+
+        discovery = await gateway.discover_remote_update(
+            interface,
+            current_version=current_version,
+            source_config=_remote_source_config(payload),
+        )
+        if discovery is None:
+            return {
+                "mode": mode,
+                "currentVersion": current_version,
+                "latestVersion": current_version if mode == "upgrade" else "",
+                "updateAvailable": False,
+                "installable": False,
+                "candidate": None,
+                "unavailableReason": "",
+                "message": (
+                    "当前资源已是远程来源可用的最新版本"
+                    if mode == "upgrade"
+                    else "远程来源未发现可导入版本"
+                ),
+            }
+
+        candidate = _mapping(discovery.get("candidate"))
+        installable = bool(candidate) and bool(
+            str(
+                candidate.get("download_url")
+                or candidate.get("downloadUrl")
+                or ""
+            ).strip()
+        )
+        latest_version = str(discovery.get("version") or "").strip()
+        unavailable_reason = str(
+            discovery.get("unavailable_reason")
+            or discovery.get("unavailableReason")
+            or ""
+        ).strip()
+        return {
+            "mode": mode,
+            "currentVersion": current_version,
+            "latestVersion": latest_version,
+            "updateAvailable": True,
+            "installable": installable,
+            "candidate": candidate or None,
+            "unavailableReason": unavailable_reason,
+            "message": (
+                f"发现可下载远程资源 {latest_version}"
+                if installable
+                else f"发现远程版本 {latest_version}，但没有可下载资源："
+                f"{unavailable_reason or '来源未返回下载地址'}"
+            ),
+        }
+
+    @staticmethod
+    async def _persist_remote_result(
+        script_id: str,
+        discovery: Mapping[str, Any],
+        *,
+        status: str,
+        downloaded: Mapping[str, Any] | None = None,
+    ) -> None:
+        update: dict[str, Any] = {
+            "LatestVersion": str(discovery.get("latestVersion") or ""),
+            "Installable": discovery.get("installable") is True,
+            "Status": status,
+            "Discovery": dict(discovery),
+        }
+        if downloaded is not None:
+            update["LastDownload"] = dict(downloaded)
+        await Config.update_script(
+            script_id,
+            {"ManagedRemote": update},
+        )
 
     async def _import_project(self, request: PluginHttpRequest) -> dict[str, Any]:
         payload = _payload(request)
@@ -1461,6 +1712,8 @@ class Plugin(ScriptAdapterPlugin):
         return ManagedServiceGateway(
             self.ctx.get(PROJECT_STORE_SERVICE),
             self.ctx.get(RUNTIME_POOL_SERVICE),
+            self.ctx.get(PROJECT_UPDATE_SERVICE),
+            self.ctx.get(INTERFACE_SERVICE),
         )
 
     @staticmethod
@@ -1784,6 +2037,71 @@ def _payload(request: PluginHttpRequest) -> dict[str, Any]:
     if isinstance(request.query, Mapping):
         return dict(request.query)
     return {}
+
+
+def _remote_source_config(payload: Mapping[str, Any]) -> dict[str, Any]:
+    source = str(payload.get("source") or "").strip().casefold()
+    if source in {"github", "github_release"}:
+        return {
+            "source": "github_release",
+            "repo": str(payload.get("githubRepo") or "").strip(),
+            "tag": str(payload.get("githubTag") or "").strip(),
+            "asset_pattern": str(
+                payload.get("githubAssetPattern") or r"\.zip$"
+            ).strip(),
+            "channel": str(payload.get("channel") or "stable").strip(),
+        }
+    if source in {"mirrorchyan", "mirror_chyan", "mirror酱"}:
+        return {
+            "source": "mirrorchyan",
+            "cdk": str(payload.get("mirrorChyanCDK") or "").strip(),
+            "channel": str(payload.get("channel") or "stable").strip(),
+        }
+    raise ManagedServiceError("远程来源必须是 MirrorChyan 或 GitHub")
+
+
+def _remote_probe_interface(
+    payload: Mapping[str, Any],
+    project_id: str,
+) -> dict[str, Any]:
+    source_config = _remote_source_config(payload)
+    interface: dict[str, Any] = {
+        "interface_version": 2,
+        "name": project_id,
+        "version": "0.0.0",
+    }
+    if source_config["source"] == "mirrorchyan":
+        rid = str(payload.get("mirrorChyanRid") or project_id).strip()
+        if not rid:
+            raise ManagedServiceError("首次 MirrorChyan 导入需要 RID")
+        interface["mirrorchyan_rid"] = rid
+        interface["mirrorchyan_multiplatform"] = True
+    else:
+        repo = str(payload.get("githubRepo") or "").strip()
+        if not repo:
+            raise ManagedServiceError("首次 GitHub 导入需要 owner/repository")
+        interface["github"] = repo
+    return interface
+
+
+def _public_remote_discovery(discovery: Mapping[str, Any]) -> dict[str, Any]:
+    """Remove ephemeral or credential-bearing download URLs before persistence."""
+
+    result = _json_clone(discovery)
+    if not isinstance(result, dict):
+        raise ManagedServiceError("远程发现结果必须是 JSON object")
+    candidate = _mapping(result.get("candidate"))
+    if candidate:
+        had_url = bool(
+            str(
+                candidate.pop("download_url", None)
+                or candidate.pop("downloadUrl", None)
+                or ""
+            ).strip()
+        )
+        candidate["downloadAvailable"] = had_url
+        result["candidate"] = candidate
+    return result
 
 
 def _with_project_reference(
