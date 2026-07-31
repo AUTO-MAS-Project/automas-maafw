@@ -3,6 +3,7 @@ from __future__ import annotations
 from app.plugins import ScriptAdapterDefinition, ScriptAdapterPlugin
 
 from .adapter import MaaFWAdapterHooks
+from .configuration_controller import MaaFWConfigurationReuseController
 from .registry import MaaFWRegistryService
 from .schema import SCRIPT_GROUPS, USER_GROUPS
 
@@ -27,7 +28,7 @@ schema = {
 class Plugin(ScriptAdapterPlugin):
     """MaaFW script adapter plugin."""
 
-    provides = ["maafw.registry.v1"]
+    provides = ["maafw.registry.v1", "maafw.configuration_reuse.v1"]
     wants = [
         "emulator",
         "maafw.interface.v1",
@@ -39,6 +40,10 @@ class Plugin(ScriptAdapterPlugin):
     def __init__(self, ctx):
         super().__init__(ctx)
         self.registry = MaaFWRegistryService()
+        self.configuration_reuse = MaaFWConfigurationReuseController(
+            ctx,
+            self.registry,
+        )
 
     def build_script_adapters(self):
         return [
@@ -70,8 +75,12 @@ class Plugin(ScriptAdapterPlugin):
 
     async def on_start(self) -> None:
         self.ctx.set("maafw.registry.v1", self.registry)
+        self.ctx.set("maafw.configuration_reuse.v1", self.configuration_reuse)
+        self.configuration_reuse.register_routes()
         await super().on_start()
 
     async def on_stop(self, reason: str) -> None:
+        self.configuration_reuse.clear()
+        self.ctx.set("maafw.configuration_reuse.v1", None)
         self.ctx.set("maafw.registry.v1", None)
         await super().on_stop(reason)
