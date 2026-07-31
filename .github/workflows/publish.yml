@@ -12,9 +12,12 @@ on:
           - automas-maafw-agent-env
           - automas-maafw-controller-adb
           - automas-maafw-controller-win32
+          - automas-maafw-project-store
           - automas-maafw-project-update
+          - automas-maafw-runtime-pool
           - automas-maafw-runner
           - automas-script-maafw
+          - automas-script-maafw-managed
 
 permissions:
   contents: read
@@ -101,6 +104,38 @@ jobs:
         with:
           packages-dir: dist
 
+  publish-project-store:
+    name: Publish automas-maafw-project-store
+    if: inputs.package == 'automas-maafw-project-store'
+    runs-on: ubuntu-latest
+    environment: pypi-project-store
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade build
+      - run: python -m build packages/automas_maafw_project_store --outdir dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+
+  publish-runtime-pool:
+    name: Publish automas-maafw-runtime-pool
+    if: inputs.package == 'automas-maafw-runtime-pool'
+    runs-on: ubuntu-latest
+    environment: pypi-runtime-pool
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade build
+      - run: python -m build packages/automas_maafw_runtime_pool --outdir dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+
   publish-runner:
     name: Publish automas-maafw-runner
     if: inputs.package == 'automas-maafw-runner'
@@ -129,6 +164,22 @@ jobs:
           python-version: "3.12"
       - run: python -m pip install --upgrade build
       - run: python -m build packages/automas_script_maafw --outdir dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+
+  publish-script-maafw-managed:
+    name: Publish automas-script-maafw-managed
+    if: inputs.package == 'automas-script-maafw-managed'
+    runs-on: ubuntu-latest
+    environment: pypi-script-maafw-managed
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade build
+      - run: python -m build packages/automas_script_maafw_managed --outdir dist
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist

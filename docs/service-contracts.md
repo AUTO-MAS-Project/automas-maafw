@@ -54,15 +54,15 @@ class Plugin:
 | PyPI 包 | 当前版本 | 服务名 | 主要职责 |
 |---|---:|---|---|
 | `automas-maafw-interface` | 0.2.0 | `maafw.interface.v1` | PI 加载、校验、预览、任务快照和 option 归一化 |
-| `automas-maafw-project-update` | 0.1.1 | `maafw.project_update.v1` | MirrorChyan/GitHub Release 检查与更新 |
-| `automas-maafw-agent-env` | 0.1.1 | `maafw.agent_env.v1` | agent 运行方式识别、命令规划和 Python 环境准备 |
+| `automas-maafw-project-update` | 0.1.3 | `maafw.project_update.v1` | MirrorChyan/GitHub Release 版本发现、可安装候选与更新 |
+| `automas-maafw-agent-env` | 0.1.2 | `maafw.agent_env.v1` | agent 运行方式识别、命令规划和 Python 环境准备 |
 | `automas-maafw-controller-adb` | 0.1.0 | `maafw.controller.adb` | ADB provider 与设备参数构建 |
 | `automas-maafw-controller-win32` | 0.1.1 | `maafw.controller.win32` | Win32 provider、窗口扫描与设备参数构建 |
-| `automas-maafw-project-store` | 0.1.0 | `maafw.project_store.v1` | 纯资源项目版本、引用、切换、删除和 GC |
-| `automas-maafw-runtime-pool` | 0.1.0 | `maafw.runtime_pool.v1` | 按规范化 requirement selector 共享多版本 MaaFW 环境 |
-| `automas-maafw-runner` | 0.3.0 | `maafw.runner.v1` | 运行计划、worker job、runtime 路由和结果模型 |
-| `automas-script-maafw` | 0.1.6 | `maafw.registry.v1` | MaaFW 脚本适配与 controller/project pack 注册表 |
-| `automas-script-maafw-managed` | 0.1.1 | 无 | 声明式 `MaaFWManaged` 脚本类型与托管动作 |
+| `automas-maafw-project-store` | 0.2.0 | `maafw.project_store.v1` | 本地目录/ZIP 资源导入、不可变版本、能力摘要、引用和 GC |
+| `automas-maafw-runtime-pool` | 0.1.4 | `maafw.runtime_pool.v1` | 按 requirement selector 隔离环境并通过 uv cache/hardlink 复用依赖 |
+| `automas-maafw-runner` | 0.3.3 | `maafw.runner.v1` | 运行计划、worker job、runtime 路由和结果模型 |
+| `automas-script-maafw` | 0.1.9 | `maafw.registry.v1` | MaaFW 脚本适配与 controller/project pack 注册表 |
+| `automas-script-maafw-managed` | 0.2.0 | 无 | 声明式本地资源管理、运行绑定与 pack 升级计划 |
 | `automas-script-maafw-pack-m9a` | 0.1.0 | `maafw.pack.m9a.v1` | M9A 默认约定、通知翻译和旧配置迁移草稿 |
 | `automas-m9a` | 0.1.0 | 无 | 聚合安装上述 MaaFW/M9A 插件 |
 
@@ -246,6 +246,15 @@ choices = interface_service.rescan_option(
 ```python
 list_providers() -> list[MaaFWUpdateProviderInfo]
 
+await discover_update(
+    interface,
+    *,
+    current_version=None,
+    source_config=None,
+    proxy=None,
+    send_log=None,
+) -> MaaFWProjectUpdateDiscovery | None
+
 await check_update(
     interface,
     *,
@@ -298,6 +307,12 @@ MaaFWUpdateProviderInfo:
   label: str
   description: str
 
+MaaFWProjectUpdateDiscovery:
+  source: str
+  version: str
+  candidate: MaaFWProjectUpdateCandidate | None
+  unavailable_reason: str
+
 MaaFWProjectUpdateCandidate:
   source: str
   version: str
@@ -311,7 +326,13 @@ MaaFWProjectUpdateResult:
   latest_version: str | None
   source: str | None
   message: str
+  update_available: bool
+  installable: bool
 ```
+
+`discover_update()` 返回非空但 `candidate=None`，表示提供者确认有更新版本，
+但没有给出可安装下载地址。`check_update()` 仅兼容旧的 candidate-only 调用，
+遇到这种状态会抛出可诊断错误，绝不会返回伪 candidate。
 
 ### 5.4 调用示例：检查并应用更新
 
@@ -938,6 +959,14 @@ Notify:
 ```python
 get_definition() -> M9APackDefinition
 
+describe_resource(source_path) -> dict
+
+plan_resource_upgrade(
+    old_interface,
+    new_interface,
+    config,
+) -> dict
+
 translate_notification(
     result,
     *,
@@ -946,13 +975,6 @@ translate_notification(
     started_at=None,
     ended_at=None,
 ) -> M9ANotificationContent
-
-create_migration_draft(
-    old_script_config,
-    old_user_configs=None,
-    *,
-    script_name="M9A",
-) -> M9AMigrationDraft
 ```
 
 ### 12.2 Pack 字段
@@ -974,13 +996,18 @@ M9APackDefinition:
   notes
   framework
   capabilities
+  resource_contract_version
+  resource_version_source
+  resource_service_key
+  resource_upgrade_mode
 ```
 
 默认周期规则：
 
 ```text
 Psychube: daily
-SleepDream: monthly
+Limbo: monthly
+Lucidscape: monthly
 ```
 
 通知输出：
@@ -1032,37 +1059,6 @@ print(notification.title)
 print(notification.text)
 ```
 
-### 12.5 调用示例：生成旧配置迁移草稿
-
-```python
-draft = m9a_service.create_migration_draft(
-    old_script_config={
-        "Info": {
-            "Name": "旧 M9A",
-            "Path": r"D:\M9A",
-        },
-        "Run": {
-            "IfAutoUpdateAfterQueue": True,
-            "WeeklyOnceTasks": [],
-            "MonthlyOnceTasks": ["SleepDream"],
-        },
-    },
-    old_user_configs=[
-        {
-            "Info": {"Name": "账号一"},
-            "Task": {"Queue": ["StartUp", "Psychube"]},
-            "Notify": {"Enabled": True},
-        }
-    ],
-    script_name="M9A 插件版",
-)
-
-# draft 只用于创建新 PluginScriptConfig/PluginUserConfig，不能覆盖旧配置。
-print(draft.script)
-print(draft.users)
-print(draft.warnings)
-```
-
 ## 13. `automas-m9a` 聚合包
 
 `automas-m9a` 没有运行时代码、插件 entry point 或独立服务。它只用于一次安装完整的 M9A 依赖集合。
@@ -1077,8 +1073,8 @@ python -m pip install automas-m9a
 
 ```text
 automas-maafw-interface >= 0.2.0
-automas-maafw-runner >= 0.3.0
-automas-script-maafw >= 0.1.6
+automas-maafw-runner >= 0.3.3
+automas-script-maafw >= 0.1.9
 ```
 
 ## 14. 完整调用示例
@@ -1159,16 +1155,20 @@ async def run_maafw_project() -> None:
 
 ## 15. `maafw.project_store.v1`
 
-项目存储只接受本地目录或已解压发行包。下载与远程更新由
-`maafw.project_update.v1` 完成，随后把结果重新导入为新不可变版本。
+项目存储只接受本地目录或 ZIP，不负责下载。ZIP 会在 Store 自己的 `.staging`
+中安全展开，并拒绝越界/绝对路径、大小写碰撞、链接和设备项、加密项及超过
+条目数、单文件、总展开体积或压缩比限制的输入。导入后只保留
+ProjectInterface 可达资源和运行内容，不保留可识别的外部 UI 壳。
 
 ```python
 import_project(
     source_path,
     project_id,
-    version,
+    version=None,
     *,
     runtime_constraint=None,
+    platform=None,
+    arch=None,
     runtime_binding=None,
     reference=None,
     pinned=False,
@@ -1187,7 +1187,12 @@ acquire_lease(project_id, version=None, *, owner, ttl_seconds=300, lease_id=None
 release_lease(project_id, version=None, *, lease_id) -> dict
 delete_version(project_id, version) -> dict
 collect_garbage(*, project_id=None, dry_run=True, grace_seconds=86400, keep_latest=1) -> dict
+resource_lifecycle_transaction() -> AsyncContextManager[None]
 ```
+
+显式 `version` 与 `ProjectInterface.version` 同时存在时必须语义等价；最终使用
+ProjectInterface 的原始版本拼写。未显式给版本时必须能从 ProjectInterface
+推断，否则拒绝导入。
 
 `resolve_project()` 至少返回：
 
@@ -1197,7 +1202,13 @@ version
 dataPath
 runtimeConstraint
 manifest
+summary
 ```
+
+`summary` 是供本地资源管理界面消费的 JSON 摘要，包含 `interfaceVersion`、
+`sourceKind`、`runtimeConstraint`、`agents`/`agentCount`、`capabilities`、
+`shells`、`size`、`flags` 和 `warningCount`。`shells` 记录被剥离壳的类别与路径；
+`size` 同时给出输入、原树、最终投影与节省字节数。
 
 `dataPath` 内含根级 `interface.json[c]` 与私有
 `.auto_mas_maafw_project.json`。Project Store 不会覆盖已提交的投影 payload；
@@ -1206,7 +1217,40 @@ Runner 运行时仍会在 `dataPath` 下创建 `debug/`、`logs/`、`temp/`，�
 `config/maa_option.json`；这些运行产物不参与版本内容身份。
 
 删除操作只处理 Project Store 自己的根目录，并拒绝当前版本、固定版本和有引用
-版本。`collect_garbage()` 默认 dry-run。
+版本。`collect_garbage()` 默认 dry-run。跨多个异步调用的资源引用新增/释放、
+全量引用对账、版本绑定与实际 GC 必须进入共享的
+`resource_lifecycle_transaction()`；同一 asyncio task 可以重入，ContextVar
+即使被子 task 继承，子 task 尝试重入也会被拒绝，其他 task 等待。它是同进程、
+同一服务实例上的 Python 协调接口，
+不是 JSON action 或跨进程文件锁，也不替代 reference、pin、lease 删除守卫和
+同步方法内部的单调用 `RLock`。典型用法：
+
+```python
+async with project_store.resource_lifecycle_transaction():
+    records = await load_all_managed_script_records()
+    await reconcile_project_references(records)
+    await collect_garbage(dry_run=False)
+```
+
+### 15.1 `MaaFWManaged` 资源升级事务
+
+`ImportProjectId` 只用于首次导入，成功绑定后清空。`ProjectId` 和 `Version`
+由 Project Store 写入并在配置页只读展示。绑定后的运行、升级校验、运行时安装
+和引用对账以私有不可变 manifest 中的 `projectId`/`version` 为权威身份，
+不以可编辑表单载荷重定义项目归属。
+
+本地目录或 ZIP 升级先以非活动版本导入；选择已安装版本也进入相同流程，不提供
+直接或强制切换旁路。Managed 调用项目 pack 的 `plan_resource_upgrade()` 分别
+规划脚本记录与当时存在的全部用户记录，并持久化一个带 `planId` 的 journal。
+脚本记录只保存用户计划摘要；每个用户的完整 source/target 配置只保存在自己的
+隐藏记录中。
+
+应用前必须同时匹配确认令牌、`planId`、源/目标资源哈希、脚本/用户配置哈希和
+用户 ID 集合。应用的是已持久化计划，不在确认时重新规划；所有配置写入成功后
+才激活目标版本。JSON object 字段以原子替换语义写入，使配置应用和回滚都不会
+因宿主深合并保留旧键。`applying`/`committing` 等中断状态会阻断运行，并在插件
+启动或再次应用时恢复源版本和源配置。规划错误、人工动作、CAS 失配或回滚失败
+都不会把目标版本报告为已生效。
 
 ## 16. `maafw.runtime_pool.v1`
 
@@ -1247,7 +1291,14 @@ runtime identity 由规范化 requirement selector 集合、Python ABI、操作�
 安全跨项目共享，服务会拒绝创建共享 identity。删除与 GC 会保护固定、引用和活动
 lease。
 
-## 17. Runner 0.2 路由补充
+每个完整 requirement selector 仍对应一个独立 venv；环境之间不共享
+`site-packages`，也不拼接 `PYTHONPATH`。使用 uv 时，它们共享 pool 内的
+下载/解包缓存，并以 hardlink 安装可复用文件，因此依赖隔离与磁盘复用可以同时
+成立。每次 GC 返回 `cachePrune`：dry-run 只统计缓存并展示命令，实际 GC 在删除
+符合条件的 runtime 后执行 `uv cache prune --cache-dir <pool-cache>`。uv 缺失、
+缓存路径不安全或命令失败会返回显式状态，不会直接递归删除缓存目录。
+
+## 17. Runner 路由补充
 
 `prepare_environment()` 新增可选参数：
 
@@ -1285,7 +1336,14 @@ Controller 与 Tasker 前加载这些目录；任一路径越出项目根、缺�
 现存项目 binding 对账 `maafw-project:*` runtime 引用。dry-run 不删除任何目录，
 但也会修正项目引用 manifest。当前项目版本始终受保护；应先切换到其他版本，再
 删除旧版本。声明式动作同时提供项目版本和 runtime 列表，便于在通用 SchemaForm
-内完成选择、切换与删除。
+内完成选择、切换与删除。HTTP 动作与运行 Hooks 通过同一个 Project Store 服务
+实例共享资源生命周期事务；各路径按需取得锁时，顺序固定为“资源生命周期 →
+单脚本升级 → 宿主配置事务 → 运行锁”，因此引用快照、对账和回收不会与
+stage/apply/prepare 交错。
+Managed 0.2.0 在 Project Store 缺少该 Python 协调接口时失败关闭，不提供无锁
+兼容路径；它同时要求宿主提供 `Config.script_config_transaction()`、
+`Config.script_config_write_scope()` 和 ScriptConfigStore
+`write_transaction()`，宿主事务改动合入前不得启用或发布。
 
 ## 18. 变更规则
 

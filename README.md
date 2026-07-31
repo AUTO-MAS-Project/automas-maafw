@@ -23,6 +23,29 @@ AUTO-MAS 的通用 MaaFW 插件工作区。仓库统一维护共享运行栈，�
 
 M9A project pack 与 `automas-m9a` 聚合包位于独立的 `automas-m9a` 仓库。
 
+## Release
+
+`publish.yml` 每次只发布一个 distribution，不会自动处理包间顺序。当前版本应按
+以下层级发布；同层可并行，下一层须等待依赖版本已经可从 PyPI 安装：
+
+1. `automas-maafw-interface` 0.2.0、`automas-maafw-project-store` 0.2.0、
+   `automas-maafw-runtime-pool` 0.1.4。
+2. `automas-maafw-agent-env` 0.1.2、`automas-maafw-project-update` 0.1.3。
+3. `automas-maafw-runner` 0.3.3。
+4. `automas-script-maafw` 0.1.9。
+5. `automas-script-maafw-managed` 0.2.0。
+
+不要以相同版本重新发布已经存在的 controller 包。首次发布 Project Store、
+Runtime Pool 和 Managed 前，必须创建 `pypi-project-store`、
+`pypi-runtime-pool`、`pypi-script-maafw-managed` GitHub Environments，并在
+PyPI 为相同包名配置与 repo、`publish.yml` 和 environment 精确匹配的 pending
+trusted publisher。
+
+Managed 0.2.0 还要求目标 AUTO-MAS `dev_v2` 已提供
+`Config.script_config_transaction()`、`Config.script_config_write_scope()` 和
+ScriptConfigStore 的 `write_transaction()`；宿主事务改动合入前不得发布或启用
+Managed 0.2.0。
+
 兼容性审计见
 [`docs/pi-2.8.1-maafw-5.12-compatibility.md`](docs/pi-2.8.1-maafw-5.12-compatibility.md)，
 其中区分了已实现的 PI v2.8.1 能力、MaaFW 5.12.2 宿主升级门禁和仅作为

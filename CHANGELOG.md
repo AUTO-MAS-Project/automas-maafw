@@ -3,6 +3,25 @@
 ## Unreleased
 
 - 将通用 MaaFW 插件从 AUTO-MAS 主仓迁移到独立工作区仓库。
+- Project Store 0.2.0 支持从本地目录或 ZIP 安全导入不可变资源版本；可从
+  `ProjectInterface.version` 推断版本，并记录 agent、能力、被剥离前端壳与体积
+  摘要；新增进程内共享资源生命周期事务，供 Managed 串行多调用引用对账、
+  版本绑定与 GC。
+- Runtime Pool 0.1.4 让不同依赖选择器保持独立 venv，同时通过 pool 内 uv cache
+  和 hardlink 复用下载及解包内容；实际 GC 交由 `uv cache prune` 清理过时缓存，
+  dry-run 只返回统计和待执行命令。
+- Managed 0.2.0 改为纯本地资源管理：支持目录/ZIP 导入、版本升级/切换/删除、
+  脚本与 runtime 引用保护及能力查看，不再下载远程发行版。升级先导入非活动
+  版本，再为脚本和全部用户持久化带 `planId` 的 pack 计划；确认时校验资源、
+  配置和用户集合后应用同一份计划，最后才切换资源。中断会回滚，人工动作、
+  规划失败或过期计划都保持旧资源生效，已安装版本也不能绕过该流程。共享
+  生命周期事务会串行资源引用、运行绑定、版本切换与 GC，避免并发对账误删
+  新导入版本；运行时安装只接受脚本当前已保存的资源绑定，旧 Project Store
+  缺少事务能力时拒绝降级到无锁执行。首次导入输入与已绑定项目身份分离；
+  绑定后只认不可变 Project Store manifest 中的 `projectId`/`version`，
+  表单身份改为只读并自动清空首次导入字段。
+- Project Update 0.1.3、Runner 0.3.3 与 Script MaaFW 0.1.9 修复异步更新阻塞、
+  Runtime Pool 环境准备、外部项目路径锁与首次运行状态衔接问题。
 - 兼容跨插件来源的 Win32 controller Pydantic 模型。
 - 为 MaaFW 脚本类型提供插件内置图标。
 - 将 MaaFW controller、resource 与设备配置收敛至脚本级，用户配置不再覆盖。
@@ -25,16 +44,26 @@
 - 托管 MaaFW 网关 0.1.4 把同步服务方法放到线程池执行，不再在宿主事件循环上
   内联跑 venv 创建、pip install 与整树哈希；`MaaFWManaged` 不再声明与
   `MaaFW` 相同的 legacy 配置类名。
+- MaaFW Project Update 0.1.2 将“发现新版本”与“存在可安装候选”拆成独立
+  契约；MirrorChyan/GitHub 未返回下载地址时保留版本发现信息，但不再返回
+  可安装 candidate，也不会在自动更新流程中进入下载阶段。
+- Agent Env 提升为 0.1.2，避免已发布但不含 embeddable Python fallback 的
+  旧 0.1.1 wheel 满足依赖；Runner、Script 与 Managed 同步提升内部最低依赖，
+  确保正式 dev_v2 不会解析到缺 Runtime Pool/Agent Env 修复的旧 wheel。
+- MaaFW Runtime Pool 0.1.2 从 bootstrap Python 同级 `Scripts/uv.exe` 定位
+  便携版 uv，不再依赖进程当前目录；普通 Runner 在当前 runtime lease 生效后，
+  每个 pool root、每个进程执行一次受 pin/reference/lease、7 天宽限期和
+  keep-latest 保护的过时环境清理，清理失败只告警、不阻断首跑。
 
 ## Current package versions
 
 - `automas-maafw-interface`: 0.2.0
-- `automas-maafw-agent-env`: 0.1.1
+- `automas-maafw-agent-env`: 0.1.2
 - `automas-maafw-controller-adb`: 0.1.0
 - `automas-maafw-controller-win32`: 0.1.1
-- `automas-maafw-project-update`: 0.1.1
-- `automas-maafw-project-store`: 0.1.0
-- `automas-maafw-runtime-pool`: 0.1.1
-- `automas-maafw-runner`: 0.3.1
-- `automas-script-maafw`: 0.1.7
-- `automas-script-maafw-managed`: 0.1.4
+- `automas-maafw-project-update`: 0.1.3
+- `automas-maafw-project-store`: 0.2.0
+- `automas-maafw-runtime-pool`: 0.1.4
+- `automas-maafw-runner`: 0.3.3
+- `automas-script-maafw`: 0.1.9
+- `automas-script-maafw-managed`: 0.2.0
