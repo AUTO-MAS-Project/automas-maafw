@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import fnmatch
 import hashlib
 import json
@@ -11,6 +12,10 @@ import stat
 import sys
 import time
 import uuid
+import zipfile
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,8 +26,15 @@ import json5
 
 
 MANIFEST_FILE_NAME = ".auto_mas_maafw_project.json"
-MANIFEST_SCHEMA_VERSION = 1
+MANIFEST_SCHEMA_VERSION = 2
 DEFAULT_STORE_DIR = Path("data") / "maafw_project_store"
+
+MAX_ZIP_FILE_COUNT = 200_000
+MAX_ZIP_MEMBER_UNCOMPRESSED_BYTES = 8 * 1024 * 1024 * 1024
+MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES = 16 * 1024 * 1024 * 1024
+MAX_ZIP_COMPRESSION_RATIO = 500.0
+_ZIP_COPY_CHUNK_SIZE = 1024 * 1024
+MAX_SUMMARY_ITEM_NAMES = 128
 
 _COMPONENT_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$")
 _WINDOWS_RESERVED_NAMES = {
@@ -170,6 +182,16 @@ class _RequiredProjectionPath:
     allow_stripped_python_interpreter: bool = False
 
 
+@dataclass(frozen=True)
+class _ImportSource:
+    root: Path
+    input_path: Path
+    kind: str
+    input_size_bytes: int
+    archive_sha256: str | None = None
+    cleanup_root: Path | None = None
+
+
 class MaaFWProjectStoreService:
     """JSON-friendly implementation of ``maafw.project_store.v1``.
 
@@ -186,8 +208,40 @@ class MaaFWProjectStoreService:
         _assert_not_reparse(absolute_root)
         self.root = absolute_root.resolve(strict=True)
         self._lock = RLock()
+        self._resource_lifecycle_lock = asyncio.Lock()
+        self._resource_lifecycle_task: ContextVar[
+            asyncio.Task[Any] | None
+        ] = ContextVar(
+            f"maafw_project_resource_lifecycle_{id(self)}",
+            default=None,
+        )
         self._projects_root.mkdir(parents=True, exist_ok=True)
         self._staging_root.mkdir(parents=True, exist_ok=True)
+
+    @asynccontextmanager
+    async def resource_lifecycle_transaction(self) -> AsyncIterator[None]:
+        """Serialize reference reconciliation with project mutation and GC."""
+
+        task = asyncio.current_task()
+        if task is None:
+            raise MaaFWProjectStoreError(
+                "project resource transaction requires an asyncio task"
+            )
+        active_task = self._resource_lifecycle_task.get()
+        if active_task is task:
+            yield
+            return
+        if active_task is not None:
+            raise MaaFWProjectStoreError(
+                "project resource transaction cannot cross asyncio tasks"
+            )
+
+        async with self._resource_lifecycle_lock:
+            token = self._resource_lifecycle_task.set(task)
+            try:
+                yield
+            finally:
+                self._resource_lifecycle_task.reset(token)
 
     @property
     def _projects_root(self) -> Path:
@@ -201,7 +255,7 @@ class MaaFWProjectStoreService:
         self,
         source_path: str | Path,
         project_id: str,
-        version: str,
+        version: str | None = None,
         *,
         runtime_constraint: str | None = None,
         platform: str | None = None,
@@ -211,15 +265,56 @@ class MaaFWProjectStoreService:
         pinned: bool = False,
         activate: bool = True,
     ) -> dict[str, Any]:
-        """Import a local directory or unpacked release as an immutable version."""
+        """Import a local directory or ZIP release as an immutable version."""
 
+        imported_source = _materialize_import_source(
+            source_path,
+            store_root=self.root,
+            staging_root=self._staging_root,
+        )
+        try:
+            return self._import_materialized_project(
+                imported_source,
+                project_id,
+                version,
+                runtime_constraint=runtime_constraint,
+                platform=platform,
+                arch=arch,
+                runtime_binding=runtime_binding,
+                reference=reference,
+                pinned=pinned,
+                activate=activate,
+            )
+        finally:
+            if (
+                imported_source.cleanup_root is not None
+                and imported_source.cleanup_root.exists()
+            ):
+                _safe_remove_tree(imported_source.cleanup_root, self.root)
+
+    def _import_materialized_project(
+        self,
+        imported_source: _ImportSource,
+        project_id: str,
+        version: str | None,
+        *,
+        runtime_constraint: str | None,
+        platform: str | None,
+        arch: str | None,
+        runtime_binding: dict[str, Any] | None,
+        reference: str | None,
+        pinned: bool,
+        activate: bool,
+    ) -> dict[str, Any]:
         normalized_project_id = _validate_component(project_id, "project_id")
-        normalized_version = _validate_component(version, "version")
-        source_root = _canonical_source_directory(source_path, self.root)
+        source_root = imported_source.root
         interface_base, source_interface_path = _discover_project_interface(source_root)
         interface_data = _read_json_object(source_interface_path)
         plan = _build_projection_plan(source_root, source_interface_path, interface_data)
+        interface_version = _optional_string(plan.interface_data.get("version"))
+        normalized_version = _resolve_import_version(version, interface_version)
         source_hash = _calculate_projected_source_hash(source_root, plan.copied_files)
+        source_tree_bytes = _tree_size(source_root)
 
         with self._lock:
             final_dir = self._version_dir(normalized_project_id, normalized_version)
@@ -254,6 +349,7 @@ class MaaFWProjectStoreService:
                 data_dir.mkdir(parents=True, exist_ok=False)
                 cleared_hashes = _clear_native_resource_hashes(plan)
                 _materialize_projection(plan, data_dir)
+                projected_payload_bytes = _tree_size(data_dir)
                 warnings = list(plan.warnings)
                 if cleared_hashes:
                     warnings.append(
@@ -273,16 +369,34 @@ class MaaFWProjectStoreService:
                         "or requirements files; managed routing must reject this version "
                         "until a constraint is supplied."
                     )
+                agents = _build_agent_summary(plan.agent_runtime)
+                capabilities = _build_capability_summary(plan)
+                shells = _build_shell_summary(plan.excluded_reasons)
+                size_summary = _build_size_summary(
+                    source_tree_bytes=source_tree_bytes,
+                    projected_payload_bytes=projected_payload_bytes,
+                    input_size_bytes=imported_source.input_size_bytes,
+                )
                 manifest = {
                     "schemaVersion": MANIFEST_SCHEMA_VERSION,
                     "projectId": normalized_project_id,
                     "version": normalized_version,
                     "createdAt": imported_at,
                     "source": {
-                        "path": str(source_root),
-                        "projectPath": str(interface_base),
+                        "kind": imported_source.kind,
+                        "path": str(imported_source.input_path),
+                        "projectPath": (
+                            interface_base.relative_to(source_root).as_posix()
+                            if interface_base != source_root
+                            else "."
+                        ),
                         "interfacePath": source_interface_path.relative_to(source_root).as_posix(),
-                        "version": _optional_string(plan.interface_data.get("version")),
+                        "interfaceVersion": interface_version,
+                        # Compatibility alias retained for existing readers.
+                        "version": interface_version,
+                        "archiveSha256": imported_source.archive_sha256,
+                        "inputSizeBytes": imported_source.input_size_bytes,
+                        "treeSizeBytes": source_tree_bytes,
                         "hash": {
                             "algorithm": "sha256",
                             "scope": "projected-source",
@@ -296,11 +410,15 @@ class MaaFWProjectStoreService:
                     },
                     "runtimeConstraint": constraint,
                     "requiredPythonAbi": plan.required_python_abi,
+                    "agents": agents,
+                    "capabilities": capabilities,
+                    "shells": shells,
+                    "size": size_summary,
                     "runtime": {
                         "constraint": constraint,
                         "platform": _optional_string(platform) or sys.platform,
                         "arch": _optional_string(arch) or host_platform.machine() or "unknown",
-                        "agent": plan.agent_runtime,
+                        "agent": agents,
                         "requiredPythonAbi": plan.required_python_abi,
                         "sharedAgentDependenciesComplete": (
                             plan.shared_agent_dependencies_complete
@@ -329,6 +447,10 @@ class MaaFWProjectStoreService:
                         ),
                         "excluded": sorted(plan.excluded_reasons),
                         "excludedReasons": dict(sorted(plan.excluded_reasons.items())),
+                        "sourceSizeBytes": source_tree_bytes,
+                        "payloadSizeBytes": projected_payload_bytes,
+                        "savedBytes": size_summary["savedBytes"],
+                        "savedPercent": size_summary["savedPercent"],
                     },
                     "flags": {
                         "opaqueAgent": plan.opaque_agent,
@@ -362,7 +484,7 @@ class MaaFWProjectStoreService:
         self,
         source_path: str | Path,
         project_id: str,
-        version: str,
+        version: str | None = None,
         *,
         runtime_constraint: str | None = None,
         platform: str | None = None,
@@ -447,6 +569,22 @@ class MaaFWProjectStoreService:
                         "currentVersion": self._read_current(project_id),
                         "versionCount": len(versions),
                         "versions": [item["version"] for item in versions],
+                        "versionSummaries": [
+                            {
+                                "version": item["version"],
+                                "current": item["current"],
+                                "summary": _json_clone(item["summary"]),
+                            }
+                            for item in versions
+                        ],
+                        "summary": next(
+                            (
+                                _json_clone(item["summary"])
+                                for item in versions
+                                if item["current"]
+                            ),
+                            _json_clone(versions[0]["summary"]) if versions else None,
+                        ),
                     }
                 )
             return result
@@ -774,6 +912,7 @@ class MaaFWProjectStoreService:
             "runtimeConstraint": manifest.get("runtime", {}).get("constraint"),
             "manifestPath": str((data_path / MANIFEST_FILE_NAME).resolve(strict=True)),
             "projectInterfacePath": str(interface_path),
+            "summary": _build_inventory_summary(manifest),
             "manifest": _json_clone(manifest),
         }
 
@@ -1268,6 +1407,8 @@ def _validate_required_projection_paths(
                 "reason": reason,
                 "retainedEntrypoints": entrypoints,
             }
+            agent["interpreterRoute"] = "managed-python"
+            agent["projectedChildExec"] = "python"
             warnings.append(
                 f"{requirement.label} embedded Python interpreter was stripped "
                 f"({requirement.path.as_posix()}); retained Python entrypoint(s): "
@@ -1675,7 +1816,14 @@ def _rewrite_agent_paths(
                     and _is_python_interpreter_path(source_path)
                 ),
             )
-            projected_agent[key] = _format_project_path(output_path)
+            projected_agent[key] = (
+                "python"
+                if classification == "python"
+                and _is_python_interpreter_path(source_path)
+                and _exclusion_reason(source_path.relative_to(source_root))
+                in {"embedded-python", "embedded-runtime"}
+                else _format_project_path(output_path)
+            )
         for key in ("child_args", "childArgs"):
             raw_args = source_agent.get(key)
             projected_args = projected_agent.get(key)
@@ -2207,6 +2355,235 @@ def _write_json_atomic(path: Path, payload: dict[str, Any], store_root: Path) ->
             temp_path.unlink()
 
 
+def _materialize_import_source(
+    source_path: str | Path,
+    *,
+    store_root: Path,
+    staging_root: Path,
+) -> _ImportSource:
+    raw_path = Path(source_path)
+    absolute_path = Path(os.path.abspath(raw_path))
+    _assert_existing_chain_has_no_reparse(absolute_path)
+    try:
+        source = raw_path.resolve(strict=True)
+    except OSError as exc:
+        raise MaaFWProjectStoreError(f"source path does not exist: {source_path}") from exc
+    _assert_not_reparse(source)
+
+    if source.is_dir():
+        root = _canonical_source_directory(source, store_root)
+        return _ImportSource(
+            root=root,
+            input_path=source,
+            kind="directory",
+            input_size_bytes=_tree_size(root),
+        )
+
+    if not source.is_file():
+        raise MaaFWProjectStoreError(
+            f"source path must be a directory or ZIP archive: {source_path}"
+        )
+    if _is_within(source, store_root):
+        raise MaaFWProjectStoreError("source ZIP must be outside the project store")
+    if source.suffix.casefold() != ".zip" or not zipfile.is_zipfile(source):
+        raise MaaFWProjectStoreError(f"source file is not a valid ZIP archive: {source_path}")
+
+    stage_dir = staging_root / f"import-{uuid.uuid4().hex}"
+    extract_root = stage_dir / "extract"
+    _assert_path_chain_within_root(stage_dir, store_root)
+    try:
+        extract_root.mkdir(parents=True, exist_ok=False)
+        archive_size = source.stat().st_size
+        archive_sha256 = _sha256_file(source)
+        _safe_extract_import_zip(source, extract_root)
+        if source.stat().st_size != archive_size or _sha256_file(source) != archive_sha256:
+            raise MaaFWProjectStoreError("source ZIP changed while it was being imported")
+        _scan_safe_tree(extract_root)
+        release_root = _select_zip_release_root(extract_root)
+        return _ImportSource(
+            root=release_root,
+            input_path=source,
+            kind="zip",
+            input_size_bytes=archive_size,
+            archive_sha256=archive_sha256,
+            cleanup_root=stage_dir,
+        )
+    except Exception:
+        if stage_dir.exists():
+            _safe_remove_tree(stage_dir, store_root)
+        raise
+
+
+def _select_zip_release_root(extract_root: Path) -> Path:
+    try:
+        _discover_project_interface(extract_root)
+        return extract_root
+    except MaaFWProjectStoreError:
+        pass
+
+    candidates: list[Path] = []
+    for child in sorted(extract_root.iterdir(), key=lambda item: item.name.casefold()):
+        _assert_not_reparse(child)
+        if not child.is_dir():
+            continue
+        try:
+            _discover_project_interface(child)
+        except MaaFWProjectStoreError:
+            continue
+        candidates.append(child.resolve(strict=True))
+    if len(candidates) == 1:
+        return candidates[0]
+    if not candidates:
+        raise MaaFWProjectStoreError(
+            "interface.json or interface.jsonc was not found at the ZIP root, "
+            "assets/, or one direct wrapper directory"
+        )
+    raise MaaFWProjectStoreError(
+        "ZIP contains multiple direct project roots; import one project per archive"
+    )
+
+
+def _safe_extract_import_zip(source: Path, extract_root: Path) -> None:
+    try:
+        archive = zipfile.ZipFile(source)
+    except (OSError, zipfile.BadZipFile) as exc:
+        raise MaaFWProjectStoreError(f"cannot open ZIP archive {source}: {exc}") from exc
+
+    with archive:
+        members = archive.infolist()
+        if len(members) > MAX_ZIP_FILE_COUNT:
+            raise MaaFWProjectStoreError(
+                f"ZIP contains too many entries: {len(members)} > {MAX_ZIP_FILE_COUNT}"
+            )
+
+        checked: list[tuple[str, tuple[str, ...], zipfile.ZipInfo, bool]] = []
+        total_declared = 0
+        for member in members:
+            normalized, parts = _validate_zip_member_name(member.filename)
+            if member.flag_bits & 0x1:
+                raise MaaFWProjectStoreError(
+                    f"encrypted ZIP entries are not supported: {member.filename}"
+                )
+
+            unix_mode = (member.external_attr >> 16) & 0xFFFF
+            unix_type = stat.S_IFMT(unix_mode)
+            if unix_type and unix_type not in {stat.S_IFREG, stat.S_IFDIR}:
+                raise MaaFWProjectStoreError(
+                    f"ZIP links, devices and special files are not allowed: {member.filename}"
+                )
+            is_directory = member.is_dir() or unix_type == stat.S_IFDIR
+            if is_directory and member.file_size:
+                raise MaaFWProjectStoreError(
+                    f"ZIP directory entry has file content: {member.filename}"
+                )
+            if member.file_size > MAX_ZIP_MEMBER_UNCOMPRESSED_BYTES:
+                raise MaaFWProjectStoreError(
+                    f"ZIP entry is too large after extraction: {member.filename}"
+                )
+            total_declared += member.file_size
+            if total_declared > MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES:
+                raise MaaFWProjectStoreError(
+                    "ZIP declared uncompressed size exceeds the import limit"
+                )
+            if member.file_size:
+                if member.compress_size <= 0:
+                    raise MaaFWProjectStoreError(
+                        f"ZIP entry has an unsafe compression ratio: {member.filename}"
+                    )
+                ratio = member.file_size / member.compress_size
+                if ratio > MAX_ZIP_COMPRESSION_RATIO:
+                    raise MaaFWProjectStoreError(
+                        f"ZIP entry compression ratio exceeds the import limit: "
+                        f"{member.filename}"
+                    )
+            checked.append((normalized.casefold(), parts, member, is_directory))
+
+        checked.sort(key=lambda item: item[0])
+        seen: dict[str, bool] = {}
+        for folded, _parts, member, is_directory in checked:
+            if folded in seen:
+                raise MaaFWProjectStoreError(
+                    f"ZIP contains duplicate or case-colliding paths: {member.filename}"
+                )
+            ancestors = folded.split("/")[:-1]
+            for index in range(1, len(ancestors) + 1):
+                ancestor = "/".join(ancestors[:index])
+                if seen.get(ancestor) is False:
+                    raise MaaFWProjectStoreError(
+                        f"ZIP path crosses a file entry: {member.filename}"
+                    )
+            seen[folded] = is_directory
+
+        total_actual = 0
+        for _folded, parts, member, is_directory in checked:
+            target = extract_root.joinpath(*parts)
+            _assert_within(target.resolve(strict=False), extract_root)
+            if is_directory:
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            member_actual = 0
+            try:
+                with archive.open(member, "r") as source_file, target.open("xb") as output:
+                    while True:
+                        chunk = source_file.read(_ZIP_COPY_CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        member_actual += len(chunk)
+                        total_actual += len(chunk)
+                        if member_actual > MAX_ZIP_MEMBER_UNCOMPRESSED_BYTES:
+                            raise MaaFWProjectStoreError(
+                                f"ZIP entry exceeded the extraction limit: {member.filename}"
+                            )
+                        if total_actual > MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES:
+                            raise MaaFWProjectStoreError(
+                                "ZIP exceeded the total extraction limit"
+                            )
+                        output.write(chunk)
+            except (OSError, RuntimeError, zipfile.BadZipFile) as exc:
+                raise MaaFWProjectStoreError(
+                    f"cannot safely extract ZIP entry {member.filename}: {exc}"
+                ) from exc
+            if member_actual != member.file_size:
+                raise MaaFWProjectStoreError(
+                    f"ZIP entry size changed while extracting: {member.filename}"
+                )
+
+
+def _validate_zip_member_name(raw_name: str) -> tuple[str, tuple[str, ...]]:
+    if "\x00" in raw_name:
+        raise MaaFWProjectStoreError("ZIP entry name contains a NUL byte")
+    normalized = raw_name.replace("\\", "/")
+    if (
+        not normalized
+        or normalized.startswith("/")
+        or normalized.startswith("//")
+        or re.match(r"^[A-Za-z]:", normalized)
+    ):
+        raise MaaFWProjectStoreError(f"ZIP entry uses an absolute path: {raw_name}")
+    parts = tuple(part for part in normalized.split("/") if part)
+    if not parts or any(part in {".", ".."} for part in parts):
+        raise MaaFWProjectStoreError(f"ZIP entry escapes the extraction root: {raw_name}")
+    for part in parts:
+        if ":" in part or part.endswith((".", " ")):
+            raise MaaFWProjectStoreError(
+                f"ZIP entry uses an unsafe Windows path component: {raw_name}"
+            )
+        if part.split(".", 1)[0].upper() in _WINDOWS_RESERVED_NAMES:
+            raise MaaFWProjectStoreError(
+                f"ZIP entry uses a reserved Windows path component: {raw_name}"
+            )
+    return "/".join(parts), parts
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _canonical_source_directory(source_path: str | Path, store_root: Path) -> Path:
     raw_path = Path(source_path)
     _assert_existing_chain_has_no_reparse(Path(os.path.abspath(raw_path)))
@@ -2256,6 +2633,39 @@ def _validate_component(value: str, field_name: str) -> str:
     if normalized.split(".", 1)[0].upper() in _WINDOWS_RESERVED_NAMES:
         raise MaaFWProjectStoreError(f"{field_name} uses a reserved Windows name")
     return normalized
+
+
+def _resolve_import_version(
+    explicit_version: str | None,
+    interface_version: str | None,
+) -> str:
+    explicit = _optional_string(explicit_version)
+    declared = _optional_string(interface_version)
+    if explicit and declared and not _versions_equivalent(explicit, declared):
+        raise MaaFWProjectStoreError(
+            "explicit version does not match ProjectInterface version: "
+            f"{explicit!r} != {declared!r}"
+        )
+    # ProjectInterface is the authoritative resource identity.  If the caller
+    # supplied an equivalent spelling (for example ``2.0.0`` vs ``v2.0.0``),
+    # keep the declared spelling so repeated imports cannot create duplicate
+    # logical versions under two directory names.
+    selected = declared or explicit
+    if selected is None:
+        raise MaaFWProjectStoreError(
+            "version is required when ProjectInterface does not declare one"
+        )
+    return _validate_component(selected, "version")
+
+
+def _versions_equivalent(left: str, right: str) -> bool:
+    def normalize(value: str) -> str:
+        normalized = value.strip().casefold()
+        if len(normalized) > 1 and normalized.startswith("v") and normalized[1].isdigit():
+            normalized = normalized[1:]
+        return normalized
+
+    return normalize(left) == normalize(right)
 
 
 def _exclusion_reason(path: Path, *, is_directory: bool = False) -> str | None:
@@ -2364,6 +2774,255 @@ def _safe_remove_tree(path: Path, store_root: Path) -> None:
         for name in [*directory_names, *file_names]:
             _assert_not_reparse(current / name)
     shutil.rmtree(path)
+
+
+def _build_agent_summary(agents: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    summaries: list[dict[str, Any]] = []
+    for agent in agents:
+        summaries.append(
+            {
+                key: _json_clone(value)
+                for key, value in agent.items()
+                if not str(key).startswith("_")
+            }
+        )
+    return summaries
+
+
+def _build_capability_summary(plan: _ProjectionPlan) -> dict[str, Any]:
+    counters = {
+        "controllers": 0,
+        "resources": 0,
+        "tasks": 0,
+        "pretasks": 0,
+        "presets": 0,
+        "groups": 0,
+        "settings": 0,
+        "options": 0,
+        "imports": 0,
+        "languages": 0,
+        "agents": len(plan.agent_runtime),
+    }
+    controller_names: set[str] = set()
+    controller_types: set[str] = set()
+    resource_names: set[str] = set()
+    task_names: set[str] = set()
+    option_types: set[str] = set()
+    language_names: set[str] = set()
+    features: set[str] = set()
+
+    for payload in plan.rewritten_json.values():
+        controllers = _interface_object_items(payload.get("controller"))
+        resources = _interface_object_items(payload.get("resource"))
+        tasks = _interface_object_items(payload.get("task"))
+        pretasks = _interface_object_items(payload.get("pretask"))
+        presets = _interface_object_items(payload.get("preset"))
+        groups = _interface_object_items(payload.get("group"))
+        settings = _interface_object_items(payload.get("setting"))
+        options = _interface_object_items(
+            payload.get("option")
+            if payload.get("option") is not None
+            else payload.get("options")
+        )
+        imports = _string_or_list(payload.get("import"))
+        languages = payload.get("languages")
+
+        counters["controllers"] += len(controllers)
+        counters["resources"] += len(resources)
+        counters["tasks"] += len(tasks)
+        counters["pretasks"] += len(pretasks)
+        counters["presets"] += len(presets)
+        counters["groups"] += len(groups)
+        counters["settings"] += len(settings)
+        counters["options"] += len(options)
+        counters["imports"] += len(imports)
+        if isinstance(languages, dict):
+            counters["languages"] += len(languages)
+            language_names.update(str(key) for key in languages)
+
+        _collect_field_values(controllers, "name", controller_names)
+        _collect_field_values(controllers, "type", controller_types)
+        _collect_field_values(resources, "name", resource_names)
+        _collect_field_values(tasks, "name", task_names)
+        _collect_field_values(options, "type", option_types)
+
+        for key, feature in (
+            ("agent", "agents"),
+            ("pretask", "pretasks"),
+            ("preset", "presets"),
+            ("group", "groups"),
+            ("setting", "settings"),
+            ("option", "options"),
+            ("hotkey", "hotkeys"),
+            ("scan", "scan"),
+            ("import", "imports"),
+            ("languages", "i18n"),
+        ):
+            value = payload.get(key)
+            if value not in (None, [], {}):
+                features.add(feature)
+
+    if any(path.parts and path.parts[0].casefold() == "plugins" for path in plan.copied_files):
+        features.add("native-plugins")
+    if plan.required_python_abi:
+        features.add("native-python-abi")
+    if plan.opaque_agent:
+        features.add("opaque-agent")
+
+    return {
+        "counts": counters,
+        "features": sorted(features),
+        "controllerNames": _bounded_summary_names(controller_names),
+        "controllerTypes": _bounded_summary_names(controller_types),
+        "resourceNames": _bounded_summary_names(resource_names),
+        "taskNames": _bounded_summary_names(task_names),
+        "optionTypes": _bounded_summary_names(option_types),
+        "languageNames": _bounded_summary_names(language_names),
+        "truncated": {
+            "taskNames": len(task_names) > MAX_SUMMARY_ITEM_NAMES,
+            "resourceNames": len(resource_names) > MAX_SUMMARY_ITEM_NAMES,
+        },
+    }
+
+
+def _build_shell_summary(excluded_reasons: dict[str, str]) -> dict[str, Any]:
+    relevant_reasons = {"ui-shell", "ui-runtime", "ui-or-updater-shell", "updater-shell"}
+    family_names = {
+        "mfaavalonia": "MFAAvalonia",
+        "mxu": "MXU",
+        "mfw": "MFW",
+        "maapicli": "MaaPiCli",
+    }
+    paths: list[dict[str, str]] = []
+    families: set[str] = set()
+    reason_counts: dict[str, int] = {}
+    for path, reason in sorted(excluded_reasons.items()):
+        if reason not in relevant_reasons:
+            continue
+        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        for part in Path(path).parts:
+            stem = part.casefold().split(".", 1)[0]
+            if stem in family_names:
+                families.add(family_names[stem])
+        if len(paths) < MAX_SUMMARY_ITEM_NAMES:
+            paths.append({"path": path, "reason": reason})
+    stripped_count = sum(reason_counts.values())
+    return {
+        "families": sorted(families),
+        "strippedCount": stripped_count,
+        "reasonCounts": dict(sorted(reason_counts.items())),
+        "paths": paths,
+        "pathsTruncated": stripped_count > len(paths),
+    }
+
+
+def _build_size_summary(
+    *,
+    source_tree_bytes: int,
+    projected_payload_bytes: int,
+    input_size_bytes: int,
+) -> dict[str, Any]:
+    saved_bytes = max(0, source_tree_bytes - projected_payload_bytes)
+    saved_percent = (
+        round(saved_bytes * 100 / source_tree_bytes, 2)
+        if source_tree_bytes
+        else 0.0
+    )
+    return {
+        "inputBytes": int(input_size_bytes),
+        "sourceTreeBytes": int(source_tree_bytes),
+        "projectedBytes": int(projected_payload_bytes),
+        "savedBytes": int(saved_bytes),
+        "savedPercent": saved_percent,
+    }
+
+
+def _build_inventory_summary(manifest: dict[str, Any]) -> dict[str, Any]:
+    source = manifest.get("source")
+    source = source if isinstance(source, dict) else {}
+    runtime = manifest.get("runtime")
+    runtime = runtime if isinstance(runtime, dict) else {}
+    agents = manifest.get("agents")
+    if not isinstance(agents, list):
+        agents = runtime.get("agent") if isinstance(runtime.get("agent"), list) else []
+    capabilities = manifest.get("capabilities")
+    if not isinstance(capabilities, dict):
+        capabilities = {
+            "counts": {"agents": len(agents)},
+            "features": ["agents"] if agents else [],
+        }
+    shells = manifest.get("shells")
+    if not isinstance(shells, dict):
+        shells = {
+            "families": [],
+            "strippedCount": 0,
+            "reasonCounts": {},
+            "paths": [],
+            "pathsTruncated": False,
+        }
+    size = manifest.get("size")
+    if not isinstance(size, dict):
+        projection = manifest.get("projection")
+        projection = projection if isinstance(projection, dict) else {}
+        source_tree_bytes = int(
+            source.get("treeSizeBytes")
+            or projection.get("sourceSizeBytes")
+            or 0
+        )
+        projected_bytes = int(projection.get("payloadSizeBytes") or 0)
+        size = _build_size_summary(
+            source_tree_bytes=source_tree_bytes,
+            projected_payload_bytes=projected_bytes,
+            input_size_bytes=int(source.get("inputSizeBytes") or source_tree_bytes),
+        )
+    warnings = manifest.get("warnings")
+    warning_count = len(warnings) if isinstance(warnings, list) else 0
+    return {
+        "projectId": manifest.get("projectId"),
+        "version": manifest.get("version"),
+        "interfaceVersion": (
+            source.get("interfaceVersion")
+            if source.get("interfaceVersion") is not None
+            else source.get("version")
+        ),
+        "sourceKind": source.get("kind") or "directory",
+        "runtimeConstraint": runtime.get("constraint"),
+        "requiredPythonAbi": _json_clone(
+            manifest.get("requiredPythonAbi")
+            if isinstance(manifest.get("requiredPythonAbi"), list)
+            else runtime.get("requiredPythonAbi") or []
+        ),
+        "agentCount": len(agents),
+        "agents": _json_clone(agents),
+        "capabilities": _json_clone(capabilities),
+        "shells": _json_clone(shells),
+        "size": _json_clone(size),
+        "flags": _json_clone(manifest.get("flags") or {}),
+        "warningCount": warning_count,
+    }
+
+
+def _interface_object_items(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, dict):
+        return [value]
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    return []
+
+
+def _collect_field_values(
+    items: Iterable[dict[str, Any]],
+    field: str,
+    target: set[str],
+) -> None:
+    for item in items:
+        value = _optional_string(item.get(field))
+        if value:
+            target.add(value)
+
+
+def _bounded_summary_names(values: Iterable[str]) -> list[str]:
+    return sorted(set(values), key=str.casefold)[:MAX_SUMMARY_ITEM_NAMES]
 
 
 def _tree_size(path: Path) -> int:

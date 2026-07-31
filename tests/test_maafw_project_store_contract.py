@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import stat
 import sys
 import tempfile
 import time
 import tomllib
 import unittest
+import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,6 +24,7 @@ from automas_maafw_project_store import (  # noqa: E402
     MaaFWProjectStoreError,
     MaaFWProjectStoreService,
 )
+from automas_maafw_project_store import service as project_store_service  # noqa: E402
 
 
 class MaaFWProjectStoreContractTest(unittest.TestCase):
@@ -47,6 +52,39 @@ class MaaFWProjectStoreContractTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn('provides = ["maafw.project_store.v1"]', plugin_source)
         self.assertIn("DEFAULT_INSTANCE", plugin_source)
+
+    def test_resource_lifecycle_transaction_is_task_reentrant(self) -> None:
+        async def verify() -> None:
+            release_owner = asyncio.Event()
+            waiter_entered = asyncio.Event()
+
+            async def waiter() -> None:
+                await release_owner.wait()
+                async with self.store.resource_lifecycle_transaction():
+                    waiter_entered.set()
+
+            waiting_task = asyncio.create_task(waiter())
+            async with self.store.resource_lifecycle_transaction():
+                async with self.store.resource_lifecycle_transaction():
+                    pass
+                release_owner.set()
+                await asyncio.sleep(0)
+                self.assertFalse(waiter_entered.is_set())
+
+                async def inherited_child() -> None:
+                    async with self.store.resource_lifecycle_transaction():
+                        pass
+
+                with self.assertRaisesRegex(
+                    MaaFWProjectStoreError,
+                    "cannot cross asyncio tasks",
+                ):
+                    await asyncio.create_task(inherited_child())
+
+            await waiting_task
+            self.assertTrue(waiter_entered.is_set())
+
+        asyncio.run(verify())
 
     def test_root_project_projection_preserves_resources_and_clears_all_hashes(self) -> None:
         self._write_json(
@@ -132,6 +170,7 @@ class MaaFWProjectStoreContractTest(unittest.TestCase):
                 "runtimeConstraint",
                 "manifestPath",
                 "projectInterfacePath",
+                "summary",
                 "manifest",
             },
         )
@@ -193,6 +232,19 @@ class MaaFWProjectStoreContractTest(unittest.TestCase):
             ],
         )
         self.assertIn("Bundle/base/pipeline/main.json", manifest["projection"]["copied"])
+        self.assertEqual(manifest["capabilities"]["counts"]["controllers"], 1)
+        self.assertEqual(manifest["capabilities"]["counts"]["resources"], 3)
+        self.assertEqual(manifest["capabilities"]["counts"]["agents"], 1)
+        self.assertEqual(
+            manifest["shells"]["families"],
+            ["MFAAvalonia", "MXU"],
+        )
+        self.assertGreater(manifest["size"]["sourceTreeBytes"], 0)
+        self.assertLess(
+            manifest["size"]["projectedBytes"],
+            manifest["size"]["sourceTreeBytes"],
+        )
+        self.assertEqual(resolved["summary"]["capabilities"], manifest["capabilities"])
 
     def test_assets_project_is_promoted_and_parent_agent_paths_are_rewritten(self) -> None:
         assets = self.source / "assets"
@@ -322,9 +374,13 @@ class MaaFWProjectStoreContractTest(unittest.TestCase):
         resolved = self.store.import_project(self.source, "bundled-python", "4.5")
         data_path = Path(resolved["dataPath"])
         runtime = resolved["manifest"]["runtime"]
+        projected_interface = json.loads(
+            (data_path / "interface.json").read_text(encoding="utf-8")
+        )
 
         self.assertFalse((data_path / "python" / "python.exe").exists())
         self.assertTrue((data_path / "agent" / "bootstrap.py").is_file())
+        self.assertEqual(projected_interface["agent"]["child_exec"], "python")
         self.assertEqual(
             runtime["agent"][0]["strippedInterpreter"],
             {
@@ -333,6 +389,8 @@ class MaaFWProjectStoreContractTest(unittest.TestCase):
                 "retainedEntrypoints": ["agent/bootstrap.py"],
             },
         )
+        self.assertEqual(runtime["agent"][0]["interpreterRoute"], "managed-python")
+        self.assertEqual(runtime["agent"][0]["projectedChildExec"], "python")
         self.assertTrue(runtime["sharedAgentDependenciesComplete"])
         self.assertTrue(
             any(
@@ -582,6 +640,135 @@ class MaaFWProjectStoreContractTest(unittest.TestCase):
         self._write_text(self.source / "Bundle" / "pipeline.json", '{"changed": true}')
         with self.assertRaises(MaaFWProjectStoreError):
             self.store.import_project(self.source, "immutable", "1.0")
+
+    def test_zip_import_infers_declared_version_and_exposes_inventory(self) -> None:
+        archive = self.temp_root / "M9A-release-name-does-not-match.zip"
+        with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as output:
+            output.writestr(
+                "M9A/interface.json",
+                json.dumps(
+                    {
+                        "interface_version": 2,
+                        "name": "m9a",
+                        "version": "v1.2.3",
+                        "controller": [{"name": "adb", "type": "Adb"}],
+                        "resource": [{"name": "base", "path": ["Bundle"]}],
+                        "task": [{"name": "Daily"}],
+                    }
+                ),
+            )
+            output.writestr("M9A/Bundle/pipeline.json", "{}")
+            output.writestr("M9A/MFW.exe", "shell")
+
+        resolved = self.store.import_project(archive, "m9a")
+
+        self.assertEqual(resolved["version"], "v1.2.3")
+        self.assertEqual(resolved["manifest"]["source"]["kind"], "zip")
+        self.assertEqual(resolved["manifest"]["source"]["projectPath"], ".")
+        self.assertEqual(len(resolved["manifest"]["source"]["archiveSha256"]), 64)
+        self.assertEqual(
+            resolved["summary"]["capabilities"]["controllerTypes"],
+            ["Adb"],
+        )
+        self.assertEqual(
+            resolved["summary"]["capabilities"]["taskNames"],
+            ["Daily"],
+        )
+        self.assertEqual(resolved["summary"]["shells"]["families"], ["MFW"])
+        self.assertEqual(
+            self.store.list_versions("m9a")[0]["summary"],
+            resolved["summary"],
+        )
+        projects = self.store.list_projects()
+        self.assertEqual(projects[0]["summary"], resolved["summary"])
+        self.assertEqual(
+            projects[0]["versionSummaries"][0]["summary"],
+            resolved["summary"],
+        )
+        self.assertEqual(list((self.store.root / ".staging").iterdir()), [])
+
+    def test_explicit_version_must_match_project_interface_version(self) -> None:
+        self._write_json(
+            self.source / "interface.json",
+            {
+                "interface_version": 2,
+                "name": "versioned",
+                "version": "v2.0.0",
+                "resource": [{"name": "base", "path": ["Bundle"]}],
+                "task": [],
+            },
+        )
+        self._write_json(self.source / "Bundle" / "pipeline.json", {})
+
+        equivalent = self.store.import_project(
+            self.source,
+            "versioned",
+            "2.0.0",
+            activate=False,
+        )
+        self.assertEqual(equivalent["version"], "v2.0.0")
+
+        with self.assertRaisesRegex(
+            MaaFWProjectStoreError,
+            "does not match ProjectInterface version",
+        ):
+            self.store.import_project(self.source, "mismatch", "3.0.0")
+
+        unversioned = self.temp_root / "release-v9.9.9"
+        self._write_json(
+            unversioned / "interface.json",
+            {
+                "interface_version": 2,
+                "name": "unversioned",
+                "resource": [{"name": "base", "path": ["Bundle"]}],
+                "task": [],
+            },
+        )
+        self._write_json(unversioned / "Bundle" / "pipeline.json", {})
+        with self.assertRaisesRegex(MaaFWProjectStoreError, "version is required"):
+            self.store.import_project(unversioned, "unversioned")
+
+        self.assertEqual(
+            {item["projectId"] for item in self.store.list_projects()},
+            {"versioned"},
+        )
+
+    def test_zip_rejects_traversal_links_devices_and_expansion_bombs(self) -> None:
+        unsafe_members: list[tuple[str, zipfile.ZipInfo | str, bytes]] = [
+            ("traversal", "../escape.txt", b"escape"),
+        ]
+        symlink = zipfile.ZipInfo("link")
+        symlink.create_system = 3
+        symlink.external_attr = (stat.S_IFLNK | 0o777) << 16
+        unsafe_members.append(("symlink", symlink, b"target"))
+        device = zipfile.ZipInfo("device")
+        device.create_system = 3
+        device.external_attr = (stat.S_IFCHR | 0o666) << 16
+        unsafe_members.append(("device", device, b""))
+
+        for name, member, content in unsafe_members:
+            with self.subTest(name=name):
+                archive = self.temp_root / f"{name}.zip"
+                with zipfile.ZipFile(archive, "w") as output:
+                    output.writestr(member, content)
+                with self.assertRaises(MaaFWProjectStoreError):
+                    self.store.import_project(archive, name)
+                self.assertEqual(list((self.store.root / ".staging").iterdir()), [])
+
+        bomb = self.temp_root / "bomb.zip"
+        with zipfile.ZipFile(bomb, "w", compression=zipfile.ZIP_DEFLATED) as output:
+            output.writestr("payload.bin", b"x" * 65)
+        with patch.object(
+            project_store_service,
+            "MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES",
+            64,
+        ):
+            with self.assertRaisesRegex(
+                MaaFWProjectStoreError,
+                "uncompressed size exceeds",
+            ):
+                self.store.import_project(bomb, "bomb")
+        self.assertEqual(list((self.store.root / ".staging").iterdir()), [])
 
     def _write_minimal_project(self) -> None:
         self._write_json(
