@@ -8,6 +8,7 @@ import sys
 import tempfile
 import tomllib
 import unittest
+from unittest import mock
 from types import SimpleNamespace
 from pathlib import Path
 from typing import Any
@@ -75,6 +76,20 @@ class MaaFWRuntimePoolContractTest(unittest.TestCase):
             "maafwVersion": maafw_version or "test",
             "resolvedRequirements": list(requirements),
             "source": "fake-installer",
+            "installer": {
+                "name": "uv",
+                "version": "test",
+                "environment": "uv-venv",
+                "dependencies": "uv-pip",
+            },
+            "cache": {
+                "kind": "uv",
+                "scope": "pool",
+                "shared": True,
+                "path": str(self.pool_root / "cache" / "uv"),
+                "relativeToPool": "cache/uv",
+            },
+            "link": {"mode": "hardlink"},
         }
 
     def test_canonical_selector_is_shared_without_project_path_identity(self) -> None:
@@ -114,6 +129,11 @@ class MaaFWRuntimePoolContractTest(unittest.TestCase):
             ["json5==0.14.0", "maafw==4.3.0"],
         )
         self.assertRegex(first["pythonPatchVersion"], r"^\d+\.\d+\.\d+")
+        installer_metadata = first["installerMetadata"]
+        self.assertEqual(installer_metadata["installer"]["name"], "uv")
+        self.assertTrue(installer_metadata["cache"]["shared"])
+        self.assertEqual(installer_metadata["cache"]["relativeToPool"], "cache/uv")
+        self.assertEqual(installer_metadata["link"]["mode"], "hardlink")
         json.dumps(first)
 
         identity = build_runtime_identity(["maafw==4.3.0"])
@@ -263,6 +283,132 @@ class MaaFWRuntimePoolContractTest(unittest.TestCase):
         released = module.release_runner_environment(environment)
         self.assertEqual(released["activeLeaseIds"], [])
         self.assertTrue(self.service.delete(environment.runtime_id)["deleted"])
+
+    def test_runner_collects_stale_runtime_after_current_lease_is_acquired(
+        self,
+    ) -> None:
+        module_name = "_automas_maafw_runner_automatic_gc_contract"
+        module_path = RUNNER_SOURCE / "environment.py"
+        spec = importlib.util.spec_from_file_location(module_name, module_path)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader if spec is not None else None)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+
+        project_path = Path(self.temporary_directory.name) / "gc-project"
+        project_path.mkdir()
+        stale_packages = module.build_runner_packages(
+            project_path,
+            maafw_requirement="maafw==4.2.0",
+        )
+        stale = self.service.ensure_runtime({"requirements": stale_packages})
+        self.service.touch(stale["runtimeId"], at="2000-01-01T00:00:00Z")
+
+        logs: list[str] = []
+        environment = module.prepare_runner_environment(
+            project_path,
+            runtime_pool=self.service.pool,
+            runtime_installer=self._fake_installer,
+            runtime_requirement="maafw==4.3.0",
+            send_log=logs.append,
+        )
+        try:
+            self.assertFalse(Path(stale["path"]).exists())
+            self.assertTrue(Path(environment.venv_path).exists())
+            self.assertIn(stale["runtimeId"], "\n".join(logs))
+            self.assertEqual(
+                self.service.delete(environment.runtime_id)["blocked"],
+                ["leased"],
+            )
+        finally:
+            module.release_runner_environment(environment)
+
+    def test_runner_gc_failure_warns_once_without_blocking_prepares(self) -> None:
+        module_name = "_automas_maafw_runner_automatic_gc_failure_contract"
+        module_path = RUNNER_SOURCE / "environment.py"
+        spec = importlib.util.spec_from_file_location(module_name, module_path)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader if spec is not None else None)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+
+        project_path = Path(self.temporary_directory.name) / "gc-failure-project"
+        project_path.mkdir()
+        logs: list[str] = []
+        with mock.patch.object(
+            self.service.pool,
+            "gc",
+            side_effect=RuntimeError("injected gc failure"),
+        ) as gc_mock:
+            environment = module.prepare_runner_environment(
+                project_path,
+                runtime_pool=self.service.pool,
+                runtime_installer=self._fake_installer,
+                runtime_requirement="maafw==4.3.0",
+                send_log=logs.append,
+            )
+            second_environment = module.prepare_runner_environment(
+                project_path,
+                runtime_pool=self.service.pool,
+                runtime_installer=self._fake_installer,
+                runtime_requirement="maafw==4.3.0",
+                send_log=logs.append,
+            )
+        try:
+            self.assertTrue(Path(environment.venv_path).exists())
+            self.assertTrue(Path(second_environment.venv_path).exists())
+            self.assertIn("injected gc failure", "\n".join(logs))
+            self.assertEqual(gc_mock.call_count, 1)
+        finally:
+            module.release_runner_environment(second_environment)
+            module.release_runner_environment(environment)
+
+    def test_runner_logs_uv_cache_prune_unavailable_status(self) -> None:
+        module_name = "_automas_maafw_runner_cache_gc_status_contract"
+        module_path = RUNNER_SOURCE / "environment.py"
+        spec = importlib.util.spec_from_file_location(module_name, module_path)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader if spec is not None else None)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+
+        project_path = Path(self.temporary_directory.name) / "gc-cache-status"
+        project_path.mkdir()
+        logs: list[str] = []
+        original_gc = self.service.pool.gc
+
+        def gc_with_unavailable_cache(**kwargs: Any) -> dict[str, Any]:
+            result = original_gc(**kwargs)
+            result["cachePrune"] = {
+                "status": "unavailable",
+                "error": "uv executable was not found",
+            }
+            return result
+
+        with mock.patch.object(
+            self.service.pool,
+            "gc",
+            side_effect=gc_with_unavailable_cache,
+        ):
+            environment = module.prepare_runner_environment(
+                project_path,
+                runtime_pool=self.service.pool,
+                runtime_installer=self._fake_installer,
+                runtime_requirement="maafw==4.3.0",
+                send_log=logs.append,
+            )
+        try:
+            output = "\n".join(logs)
+            self.assertIn("status=unavailable", output)
+            self.assertIn("uv executable was not found", output)
+        finally:
+            module.release_runner_environment(environment)
 
     def test_runner_prefers_recovered_exact_binding_over_original_range(self) -> None:
         module_name = "_automas_maafw_runner_recovered_binding_contract"
@@ -609,7 +755,7 @@ class MaaFWRuntimePoolStaticContractTest(unittest.TestCase):
         entry_points = project["entry-points"]["auto_mas.plugins"]
 
         self.assertEqual(project["name"], "automas-maafw-runtime-pool")
-        self.assertEqual(project["version"], "0.1.1")
+        self.assertEqual(project["version"], "0.1.4")
         self.assertEqual(
             entry_points["automas_maafw_runtime_pool"],
             "automas_maafw_runtime_pool.plugin:Plugin",
@@ -662,13 +808,13 @@ class MaaFWRuntimePoolStaticContractTest(unittest.TestCase):
         pyproject = tomllib.loads(
             (RUNNER_PACKAGE / "pyproject.toml").read_text(encoding="utf-8")
         )
-        self.assertEqual(pyproject["project"]["version"], "0.3.1")
+        self.assertEqual(pyproject["project"]["version"], "0.3.3")
         self.assertIn(
-            "automas-maafw-runtime-pool>=0.1.0",
+            "automas-maafw-runtime-pool>=0.1.4",
             pyproject["project"]["dependencies"],
         )
         self.assertIn(
-            "automas-maafw-agent-env>=0.1.1",
+            "automas-maafw-agent-env>=0.1.2",
             pyproject["project"]["dependencies"],
         )
         self.assertIn(
@@ -678,7 +824,7 @@ class MaaFWRuntimePoolStaticContractTest(unittest.TestCase):
         agent_env_pyproject = tomllib.loads(
             (AGENT_ENV_PACKAGE / "pyproject.toml").read_text(encoding="utf-8")
         )
-        self.assertEqual(agent_env_pyproject["project"]["version"], "0.1.1")
+        self.assertEqual(agent_env_pyproject["project"]["version"], "0.1.2")
 
         environment_source = (RUNNER_SOURCE / "environment.py").read_text(
             encoding="utf-8"

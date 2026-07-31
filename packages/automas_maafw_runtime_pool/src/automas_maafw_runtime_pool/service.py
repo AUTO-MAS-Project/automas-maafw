@@ -5,9 +5,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from .cache import prune_uv_cache
 from .identity import build_runtime_id
 from .installer import install_python_runtime
-from .pool import MaaFWRuntimePool, MaaFWRuntimePoolError, RuntimeInstaller
+from .pool import (
+    MaaFWRuntimePool,
+    MaaFWRuntimePoolError,
+    RuntimeCachePruner,
+    RuntimeInstaller,
+)
 
 
 class MaaFWRuntimePoolService:
@@ -18,9 +24,14 @@ class MaaFWRuntimePoolService:
         pool_root: str | Path | None = None,
         *,
         installer: RuntimeInstaller | None = install_python_runtime,
+        cache_pruner: RuntimeCachePruner | None = prune_uv_cache,
     ) -> None:
         root = pool_root or (Path.cwd() / "config" / "maafw_runtime_pool")
-        self.pool = MaaFWRuntimePool(root, installer=installer)
+        self.pool = MaaFWRuntimePool(
+            root,
+            installer=installer,
+            cache_pruner=cache_pruner,
+        )
 
     def list(self) -> list[dict[str, Any]]:
         return self.pool.list()

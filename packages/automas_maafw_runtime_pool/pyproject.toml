@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "automas-maafw-runtime-pool"
-version = "0.1.1"
+version = "0.1.4"
 description = "Shared multi-version MaaFW runtime pool plugin for AUTO-MAS"
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.10"

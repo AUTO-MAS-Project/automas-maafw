@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import sysconfig
+import threading
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -34,10 +35,15 @@ RUNNER_DEFAULT_PACKAGES = (
 )
 RUNNER_ENV_TIMEOUT = 300
 DEFAULT_RUNTIME_LEASE_TTL_SECONDS = 24 * 60 * 60
+AUTOMATIC_RUNTIME_GC_GRACE_SECONDS = 7 * 24 * 60 * 60
+AUTOMATIC_RUNTIME_GC_KEEP_LATEST = 1
 REQUIREMENT_NAME_RE = re.compile(
     r"^\s*([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)"
     r"\s*(?:\[[^\]]+\])?\s*(?:===|[<>=!~]=?|@|;|\s|$)"
 )
+
+_AUTOMATIC_GC_ROOTS: set[str] = set()
+_AUTOMATIC_GC_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -174,6 +180,7 @@ def prepare_runner_environment(
     try:
         venv_path = Path(str(runtime["venvPath"])).resolve()
         python_executable = Path(str(runtime["pythonExecutable"])).resolve()
+        _collect_stale_runtimes_once(pool, send_log=send_log)
         resolved_packages = tuple(
             str(item) for item in runtime.get("packages", packages)
         )
@@ -225,6 +232,73 @@ def release_runner_environment(
             return None
         pool = MaaFWRuntimePool(environment.runtime_pool_root)
     return pool.release_lease(runtime_id, lease_id)
+
+
+def _collect_stale_runtimes_once(
+    pool: MaaFWRuntimePool,
+    *,
+    send_log: Callable[[str], None] | None,
+) -> None:
+    """Collect stale runtimes once per pool root for this process.
+
+    The current runtime already holds a lease when this runs, so pool GC keeps
+    it along with pinned, referenced, recently used, and keep-latest runtimes.
+    Cleanup is maintenance rather than a run prerequisite: failures are logged
+    without blocking the first run or retrying in this process.
+    """
+
+    root_key = os.path.normcase(str(pool.root.resolve()))
+    with _AUTOMATIC_GC_LOCK:
+        if root_key in _AUTOMATIC_GC_ROOTS:
+            return
+        _AUTOMATIC_GC_ROOTS.add(root_key)
+
+    try:
+        result = pool.gc(
+            dry_run=False,
+            grace_seconds=AUTOMATIC_RUNTIME_GC_GRACE_SECONDS,
+            keep_latest=AUTOMATIC_RUNTIME_GC_KEEP_LATEST,
+        )
+    except Exception as exc:
+        _send_log(
+            send_log,
+            f"[MaaFW Runner] 过时 runtime 自动清理失败，继续运行: {exc}",
+        )
+        return
+
+    deleted = [str(item) for item in result.get("deleted", [])]
+    errors = [
+        item
+        for item in result.get("errors", [])
+        if isinstance(item, Mapping)
+    ]
+    if deleted:
+        _send_log(
+            send_log,
+            "[MaaFW Runner] 已清理过时 runtime: " + ", ".join(deleted),
+        )
+    if errors:
+        _send_log(
+            send_log,
+            f"[MaaFW Runner] 部分过时 runtime 清理失败，继续运行: {errors}",
+        )
+    cache_prune = result.get("cachePrune")
+    if isinstance(cache_prune, Mapping):
+        status = str(cache_prune.get("status") or "unknown")
+        if status == "pruned":
+            _send_log(
+                send_log,
+                "[MaaFW Runner] uv 缓存清理完成: "
+                f"removedFiles={int(cache_prune.get('removedFiles') or 0)}, "
+                f"removedBytes={int(cache_prune.get('removedBytes') or 0)}",
+            )
+        elif status in {"disabled", "error", "unavailable", "unsafe"}:
+            detail = str(cache_prune.get("error") or "no detail")
+            _send_log(
+                send_log,
+                "[MaaFW Runner] uv 缓存清理未完成，继续运行: "
+                f"status={status}, error={detail}",
+            )
 
 
 def build_runner_packages(

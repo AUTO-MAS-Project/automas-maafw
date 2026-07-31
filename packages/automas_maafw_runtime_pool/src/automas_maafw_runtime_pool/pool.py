@@ -13,6 +13,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from .cache import prune_uv_cache
+
 from .identity import (
     RUNTIME_ID_PREFIX,
     build_runtime_identity,
@@ -34,6 +36,7 @@ RuntimeInstaller = Callable[
     [Path, Sequence[str], dict[str, Any]],
     Mapping[str, Any] | None,
 ]
+RuntimeCachePruner = Callable[..., Mapping[str, Any]]
 
 _LOCKS_GUARD = threading.Lock()
 _POOL_LOCKS: dict[str, threading.RLock] = {}
@@ -49,11 +52,13 @@ class MaaFWRuntimePool:
         root: str | Path,
         *,
         installer: RuntimeInstaller | None = None,
+        cache_pruner: RuntimeCachePruner | None = prune_uv_cache,
     ) -> None:
         self.root = Path(root).resolve()
         self.runtime_root = self.root / RUNTIME_DIRECTORY_NAME
         self.staging_root = self.root / STAGING_DIRECTORY_NAME
         self.installer = installer
+        self.cache_pruner = cache_pruner
         self._lock = _pool_lock(self.root)
 
     def list(self) -> list[dict[str, Any]]:
@@ -390,6 +395,7 @@ class MaaFWRuntimePool:
                 except Exception as exc:
                     errors.append({"runtimeId": runtime_id, "error": str(exc)})
 
+            cache_prune = self._prune_cache(dry_run=bool(dry_run))
             return {
                 "dryRun": bool(dry_run),
                 "graceSeconds": float(grace_seconds),
@@ -398,6 +404,29 @@ class MaaFWRuntimePool:
                 "deleted": deleted,
                 "kept": kept,
                 "errors": errors,
+                "cachePrune": cache_prune,
+            }
+
+    def _prune_cache(self, *, dry_run: bool) -> dict[str, Any]:
+        if self.cache_pruner is None:
+            return {
+                "kind": "uv",
+                "scope": "pool",
+                "dryRun": dry_run,
+                "attempted": False,
+                "status": "disabled",
+                "error": "runtime pool cache pruner is disabled",
+            }
+        try:
+            return dict(self.cache_pruner(self.root, dry_run=dry_run))
+        except Exception as exc:
+            return {
+                "kind": "uv",
+                "scope": "pool",
+                "dryRun": dry_run,
+                "attempted": False,
+                "status": "error",
+                "error": f"runtime pool cache prune failed: {exc}",
             }
 
     def _initialize(self) -> None:

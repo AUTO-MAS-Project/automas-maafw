@@ -48,6 +48,10 @@ class MaaFWRuntimeInstallerBootstrapTest(unittest.TestCase):
         self.environment_path = (
             Path(self.temporary_directory.name) / "stage" / "environment"
         )
+        self.uv_cache_dir = (
+            Path(self.temporary_directory.name)
+            / runtime_installer.UV_CACHE_RELATIVE_PATH
+        ).resolve()
         self.requirements = ("maafw==5.8.1",)
         self.identity = build_runtime_identity(self.requirements)
         self.commands: list[list[str]] = []
@@ -93,6 +97,21 @@ class MaaFWRuntimeInstallerBootstrapTest(unittest.TestCase):
                 "_resolved_requirements",
                 return_value=["maafw==5.8.1"],
             ),
+            mock.patch.object(
+                runtime_installer,
+                "_resolved_requirements_with_uv",
+                return_value=["maafw==5.8.1"],
+            ),
+            mock.patch.object(
+                runtime_installer,
+                "_uv_version",
+                return_value="0.11.26",
+            ),
+            mock.patch.object(
+                runtime_installer,
+                "_pip_version",
+                return_value="25.1.1",
+            ),
         ):
             return runtime_installer.install_python_runtime(
                 self.environment_path,
@@ -117,21 +136,77 @@ class MaaFWRuntimeInstallerBootstrapTest(unittest.TestCase):
         )
         self.assertEqual(result["maafwVersion"], "5.8.1")
         self.assertEqual(result["resolvedRequirements"], ["maafw==5.8.1"])
+        self.assertEqual(result["installer"]["name"], "pip")
+        self.assertEqual(result["installer"]["environment"], "stdlib-venv")
+        self.assertFalse(result["cache"]["shared"])
+
+    def test_complete_python_uses_uv_for_dependencies_when_available(self) -> None:
+        result = self._install(
+            supports_venv=True,
+            uv_executable="C:/portable/uv.exe",
+        )
+
+        self.assertEqual(
+            self.commands[0],
+            [
+                "C:/portable/python.exe",
+                "-m",
+                "venv",
+                "--without-pip",
+                str(self.environment_path),
+            ],
+        )
+        self.assertEqual(
+            self.commands[1],
+            [
+                "C:/portable/uv.exe",
+                "pip",
+                "install",
+                "--python",
+                str(runtime_installer._venv_python(self.environment_path)),
+                "--cache-dir",
+                str(self.uv_cache_dir),
+                "--link-mode",
+                runtime_installer.UV_LINK_MODE,
+                "--upgrade",
+                "--quiet",
+                "maafw==5.8.1",
+            ],
+        )
+        self.assertEqual(result["installer"]["name"], "uv")
+        self.assertEqual(result["installer"]["dependencies"], "uv-pip")
+        self.assertEqual(result["cache"]["scope"], "pool")
+        self.assertEqual(result["cache"]["path"], str(self.uv_cache_dir))
+        self.assertEqual(
+            result["cache"]["relativeToPool"],
+            runtime_installer.UV_CACHE_RELATIVE_PATH.as_posix(),
+        )
+        self.assertEqual(
+            result["link"]["mode"],
+            runtime_installer.UV_LINK_MODE,
+        )
 
     def test_embeddable_bootstrap_python_falls_back_to_uv(self) -> None:
-        self._install(supports_venv=False, uv_executable="C:/portable/uv.exe")
+        result = self._install(
+            supports_venv=False,
+            uv_executable="C:/portable/uv.exe",
+        )
 
         self.assertEqual(
             self.commands[0],
             [
                 "C:/portable/uv.exe",
                 "venv",
-                "--seed",
                 "--python",
                 HOST_SHORT_VERSION,
+                "--cache-dir",
+                str(self.uv_cache_dir),
+                "--link-mode",
+                runtime_installer.UV_LINK_MODE,
                 str(self.environment_path),
             ],
         )
+        self.assertEqual(result["installer"]["environment"], "uv-venv")
         self.assertTrue(
             any("uv" in message for message in self.logs),
             self.logs,
@@ -163,7 +238,7 @@ class MaaFWRuntimeInstallerBootstrapTest(unittest.TestCase):
             )
 
         self.assertIn("ABI", str(raised.exception))
-        # pip install 必须没有发生：只创建了环境就中止。
+        # uv pip install 必须没有发生：只创建了环境就中止。
         self.assertEqual(len(self.commands), 1)
 
     def test_python_version_mismatch_between_identity_and_runtime_is_rejected(
@@ -183,6 +258,25 @@ class MaaFWRuntimeInstallerBootstrapTest(unittest.TestCase):
 
 
 class MaaFWRuntimeInstallerProbeTest(unittest.TestCase):
+    def test_uv_lookup_prefers_bootstrap_python_sibling(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            bootstrap = root / "portable" / "python.exe"
+            uv_executable = bootstrap.parent / "Scripts" / "uv.exe"
+            bootstrap.parent.mkdir(parents=True)
+            uv_executable.parent.mkdir()
+            bootstrap.write_text("fake python", encoding="utf-8")
+            uv_executable.write_text("fake uv", encoding="utf-8")
+
+            with mock.patch.object(
+                runtime_installer.shutil,
+                "which",
+                return_value=None,
+            ):
+                resolved = runtime_installer._find_uv_executable(str(bootstrap))
+
+        self.assertEqual(resolved, str(uv_executable.resolve()))
+
     def test_venv_probe_accepts_the_current_interpreter(self) -> None:
         self.assertTrue(runtime_installer._python_supports_venv(sys.executable))
 
