@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import ipaddress
 import json
+import os
 import re
 import shutil
+import uuid
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urljoin, urlsplit
 
 import aiofiles
 import httpx
@@ -20,6 +24,10 @@ UPDATE_WORK_DIR = ".mas-update"
 DOWNLOAD_FILE_NAME = "download.zip"
 DOWNLOAD_TEMP_NAME = "download.tmp"
 DOWNLOAD_RETRY_TIMES = 3
+DOWNLOAD_MAX_BYTES = 4 * 1024 * 1024 * 1024
+DOWNLOAD_REDIRECT_LIMIT = 10
+DOWNLOAD_CHUNK_SIZE = 64 * 1024
+DOWNLOAD_ERROR_HINT_BYTES = 4096
 HTTP_HEADERS = {"User-Agent": "AutoMasGui"}
 
 MIRROR_ERROR_INFO = {
@@ -56,6 +64,17 @@ class MaaFWProjectUpdateCandidate:
         """Return whether this candidate has an actionable package URL."""
 
         return bool(str(self.download_url or "").strip())
+
+
+@dataclass
+class MaaFWDownloadedProjectPackage:
+    """A validated project archive downloaded without applying it in place."""
+
+    source: str
+    version: str
+    path: str
+    size: int
+    sha256: str
 
 
 @dataclass
@@ -308,6 +327,83 @@ async def apply_maafw_project_update(
     await _apply_update_package(project_path.resolve(), package_path, send_update_log)
 
 
+async def download_maafw_project_package(
+    download_root: Path,
+    candidate: MaaFWProjectUpdateCandidate,
+    *,
+    proxy: httpx.Proxy | None = None,
+    send_log: Callable[[str], None] | None = None,
+    max_download_bytes: int = DOWNLOAD_MAX_BYTES,
+) -> MaaFWDownloadedProjectPackage:
+    """Download and validate one candidate without mutating a project tree.
+
+    The archive is published atomically below ``download_root``.  Managed
+    consumers can pass the returned path to Project Store, which remains the
+    authority for safe extraction and immutable project import.
+    """
+
+    source = str(candidate.source or "").strip()
+    project_version = str(candidate.version or "").strip()
+    download_url = _validate_download_url(candidate.download_url)
+    if not source or not project_version:
+        raise MaaFWProjectUpdateError(
+            "update candidate is missing source or version"
+        )
+    if max_download_bytes <= 0:
+        raise MaaFWProjectUpdateError("download size limit must be positive")
+
+    resolved_root = Path(download_root).resolve()
+    archive_key = hashlib.sha256(
+        f"{source}\0{project_version}\0{download_url}".encode("utf-8")
+    ).hexdigest()[:24]
+    download_dir = (resolved_root / archive_key).resolve()
+    if not _is_within_path(download_dir, resolved_root):
+        raise MaaFWProjectUpdateError("download destination escapes managed root")
+
+    download_id = uuid.uuid4().hex
+    temp_path = download_dir / f"{download_id}.{DOWNLOAD_TEMP_NAME}"
+    provisional_path = download_dir / f"{download_id}.{DOWNLOAD_FILE_NAME}"
+    await asyncio.to_thread(
+        _prepare_download_paths,
+        download_dir,
+        temp_path,
+        provisional_path,
+    )
+
+    send_update_log = send_log or (lambda _: None)
+    try:
+        await _download_candidate_to_paths(
+            temp_path,
+            provisional_path,
+            download_url,
+            expected_sha256=candidate.sha256,
+            proxy=proxy,
+            send_log=send_update_log,
+            max_download_bytes=max_download_bytes,
+        )
+        package_sha256 = await asyncio.to_thread(
+            _calculate_sha256,
+            provisional_path,
+        )
+        package_path = await asyncio.to_thread(
+            _publish_content_addressed_download,
+            provisional_path,
+            download_dir,
+            package_sha256,
+        )
+        package_size = package_path.stat().st_size
+    except Exception:
+        await asyncio.to_thread(_remove_path, provisional_path)
+        raise
+    return MaaFWDownloadedProjectPackage(
+        source=source,
+        version=project_version,
+        path=str(package_path),
+        size=package_size,
+        sha256=package_sha256,
+    )
+
+
 async def _check_mirrorchyan_update(
     interface_model: MaaFWInterface,
     *,
@@ -486,15 +582,43 @@ async def _download_update_package(
         package_path,
     )
 
-    send_log(f"start downloading MaaFW update package: {_sanitize_log_message(download_url)}")
+    await _download_candidate_to_paths(
+        temp_path,
+        package_path,
+        download_url,
+        expected_sha256=expected_sha256,
+        proxy=proxy,
+        send_log=send_log,
+        max_download_bytes=DOWNLOAD_MAX_BYTES,
+    )
+    return package_path
+
+
+async def _download_candidate_to_paths(
+    temp_path: Path,
+    package_path: Path,
+    download_url: str,
+    *,
+    expected_sha256: str | None,
+    proxy: httpx.Proxy | None,
+    send_log: Callable[[str], None],
+    max_download_bytes: int,
+) -> int:
+    validated_url = _validate_download_url(download_url)
+
+    send_log(
+        "start downloading MaaFW update package: "
+        f"{_sanitize_log_message(validated_url)}"
+    )
     last_error: Exception | None = None
     for attempt in range(1, DOWNLOAD_RETRY_TIMES + 1):
         await asyncio.to_thread(_remove_path, temp_path)
         try:
             await _stream_update_package(
                 temp_path,
-                download_url,
+                validated_url,
                 proxy=proxy,
+                max_download_bytes=max_download_bytes,
             )
             package_size = await asyncio.to_thread(
                 _validate_and_publish_download,
@@ -503,7 +627,7 @@ async def _download_update_package(
                 expected_sha256,
             )
             send_log(f"MaaFW update package downloaded: {package_size} bytes")
-            return package_path
+            return package_size
         except Exception as exc:
             last_error = exc
             await asyncio.to_thread(_remove_path, temp_path)
@@ -551,31 +675,124 @@ async def _stream_update_package(
     download_url: str,
     *,
     proxy: httpx.Proxy | None,
+    max_download_bytes: int = DOWNLOAD_MAX_BYTES,
 ) -> None:
-    async with httpx.AsyncClient(proxy=proxy, follow_redirects=True, timeout=30.0) as client:
-        async with client.stream("GET", download_url, headers=HTTP_HEADERS) as response:
-            if response.status_code not in (200, 206):
-                error_hint = await _read_download_error_hint(response)
-                if error_hint:
-                    raise MaaFWProjectUpdateError(
-                        f"download update package failed: HTTP {response.status_code}, {error_hint}"
+    current_url = _validate_download_url(download_url)
+    async with httpx.AsyncClient(
+        proxy=proxy,
+        follow_redirects=False,
+        timeout=30.0,
+    ) as client:
+        for redirect_count in range(DOWNLOAD_REDIRECT_LIMIT + 1):
+            async with client.stream(
+                "GET",
+                current_url,
+                headers=HTTP_HEADERS,
+            ) as response:
+                if response.status_code in (301, 302, 303, 307, 308):
+                    location = str(response.headers.get("location") or "").strip()
+                    if not location:
+                        raise MaaFWProjectUpdateError(
+                            "download update package redirect is missing Location"
+                        )
+                    if redirect_count >= DOWNLOAD_REDIRECT_LIMIT:
+                        raise MaaFWProjectUpdateError(
+                            "download update package exceeded redirect limit"
+                        )
+                    current_url = _validate_download_url(
+                        urljoin(current_url, location)
                     )
-                raise MaaFWProjectUpdateError(
-                    f"download update package failed: HTTP {response.status_code}"
-                )
+                    continue
 
-            async with aiofiles.open(temp_path, "wb") as file:
-                async for chunk in response.aiter_bytes(chunk_size=8192):
-                    if chunk:
+                if response.status_code not in (200, 206):
+                    error_hint = await _read_download_error_hint(response)
+                    if error_hint:
+                        raise MaaFWProjectUpdateError(
+                            "download update package failed: "
+                            f"HTTP {response.status_code}, {error_hint}"
+                        )
+                    raise MaaFWProjectUpdateError(
+                        "download update package failed: "
+                        f"HTTP {response.status_code}"
+                    )
+
+                _validate_download_url(str(response.url))
+                content_length = _content_length(response)
+                if (
+                    content_length is not None
+                    and content_length > max_download_bytes
+                ):
+                    raise MaaFWProjectUpdateError(
+                        "download update package exceeds size limit: "
+                        f"{content_length} > {max_download_bytes}"
+                    )
+
+                downloaded_bytes = 0
+                async with aiofiles.open(temp_path, "wb") as file:
+                    async for chunk in response.aiter_bytes(
+                        chunk_size=DOWNLOAD_CHUNK_SIZE
+                    ):
+                        if not chunk:
+                            continue
+                        downloaded_bytes += len(chunk)
+                        if downloaded_bytes > max_download_bytes:
+                            raise MaaFWProjectUpdateError(
+                                "download update package exceeds size limit: "
+                                f"> {max_download_bytes}"
+                            )
                         await file.write(chunk)
+                return
+
+    raise MaaFWProjectUpdateError("download update package redirect failed")
+
+
+def _validate_download_url(raw_url: str | None) -> str:
+    url = str(raw_url or "").strip()
+    parsed = urlsplit(url)
+    if parsed.scheme.lower() != "https":
+        raise MaaFWProjectUpdateError(
+            "MaaFW remote package URL must use HTTPS"
+        )
+    if not parsed.hostname or parsed.username or parsed.password:
+        raise MaaFWProjectUpdateError("MaaFW remote package URL is invalid")
+
+    try:
+        address = ipaddress.ip_address(parsed.hostname)
+    except ValueError:
+        address = None
+    if address is not None and not address.is_global:
+        raise MaaFWProjectUpdateError(
+            "MaaFW remote package URL cannot target a private address"
+        )
+    return url
+
+
+def _content_length(response: httpx.Response) -> int | None:
+    raw_value = str(response.headers.get("content-length") or "").strip()
+    if not raw_value:
+        return None
+    try:
+        value = int(raw_value)
+    except ValueError:
+        return None
+    return value if value >= 0 else None
 
 
 async def _read_download_error_hint(response: httpx.Response) -> str:
     try:
-        content = await response.aread()
+        content = bytearray()
+        async for chunk in response.aiter_bytes(
+            chunk_size=DOWNLOAD_ERROR_HINT_BYTES
+        ):
+            remaining = DOWNLOAD_ERROR_HINT_BYTES - len(content)
+            if remaining <= 0:
+                break
+            content.extend(chunk[:remaining])
+            if len(content) >= DOWNLOAD_ERROR_HINT_BYTES:
+                break
     except Exception:
         return ""
-    return _build_download_error_hint(content)
+    return _build_download_error_hint(bytes(content))
 
 
 def _ensure_downloaded_zip(package_path: Path) -> None:
@@ -610,6 +827,37 @@ def _calculate_sha256(path: Path) -> str:
         for chunk in iter(lambda: file.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _publish_content_addressed_download(
+    provisional_path: Path,
+    download_dir: Path,
+    package_sha256: str,
+) -> Path:
+    """Publish a validated archive without sharing mutable temp names."""
+
+    normalized_sha256 = str(package_sha256 or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", normalized_sha256):
+        raise MaaFWProjectUpdateError("download package has an invalid sha256")
+    package_path = (download_dir / f"{normalized_sha256}.zip").resolve()
+    if not _is_within_path(package_path, download_dir):
+        raise MaaFWProjectUpdateError("download package path escapes managed root")
+
+    try:
+        os.link(provisional_path, package_path)
+    except FileExistsError:
+        pass
+    except OSError:
+        if not package_path.exists():
+            provisional_path.replace(package_path)
+
+    if not package_path.is_file():
+        raise MaaFWProjectUpdateError("download package could not be published")
+    _ensure_downloaded_zip(package_path)
+    if _calculate_sha256(package_path) != normalized_sha256:
+        raise MaaFWProjectUpdateError("download cache sha256 verification failed")
+    _remove_path(provisional_path)
+    return package_path
 
 
 def _read_local_download_error_hint(path: Path) -> str:

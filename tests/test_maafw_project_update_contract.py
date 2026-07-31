@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import tempfile
 import threading
 import time
 import tomllib
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -23,6 +25,7 @@ for source_root in reversed(SOURCE_ROOTS):
 
 from automas_maafw_interface.models import MaaFWInterface  # noqa: E402
 from automas_maafw_project_update import (  # noqa: E402
+    MaaFWDownloadedProjectPackage,
     MaaFWProjectUpdateCandidate,
     MaaFWProjectUpdateError,
     MaaFWProjectUpdateResult,
@@ -61,7 +64,7 @@ class MaaFWProjectUpdateProviderContractTest(unittest.TestCase):
                 / "pyproject.toml"
             ).read_text(encoding="utf-8")
         )
-        self.assertEqual(project["project"]["version"], "0.1.3")
+        self.assertEqual(project["project"]["version"], "0.2.0")
 
     def test_result_positional_contract_keeps_existing_field_order(self) -> None:
         result = MaaFWProjectUpdateResult(
@@ -258,6 +261,99 @@ class MaaFWProjectUpdateProviderContractTest(unittest.TestCase):
             candidate.download_url,
             "https://example.invalid/project.zip",
         )
+
+    def test_service_download_returns_json_only_validated_package(self) -> None:
+        download_mock = AsyncMock(
+            return_value=MaaFWDownloadedProjectPackage(
+                source="github_release",
+                version="2.0.0",
+                path="C:/managed-downloads/project.zip",
+                size=1024,
+                sha256="a" * 64,
+            )
+        )
+        service = MaaFWProjectUpdateService()
+        with patch.object(
+            service_module,
+            "download_maafw_project_package",
+            download_mock,
+        ):
+            result = asyncio.run(
+                service.download_package(
+                    Path("C:/managed-downloads"),
+                    {
+                        "source": "github_release",
+                        "version": "2.0.0",
+                        "downloadUrl": "https://example.invalid/project.zip",
+                    },
+                )
+            )
+
+        self.assertEqual(
+            result,
+            {
+                "source": "github_release",
+                "version": "2.0.0",
+                "path": "C:/managed-downloads/project.zip",
+                "size": 1024,
+                "sha256": "a" * 64,
+            },
+        )
+        candidate = download_mock.await_args.args[1]
+        self.assertIsInstance(candidate, MaaFWProjectUpdateCandidate)
+
+    def test_remote_package_rejects_non_https_and_private_literal_hosts(self) -> None:
+        with self.assertRaisesRegex(MaaFWProjectUpdateError, "must use HTTPS"):
+            updater_module._validate_download_url(
+                "http://example.invalid/project.zip"
+            )
+        with self.assertRaisesRegex(MaaFWProjectUpdateError, "private address"):
+            updater_module._validate_download_url(
+                "https://127.0.0.1/project.zip"
+            )
+
+    def test_managed_downloads_publish_to_a_content_addressed_cache(self) -> None:
+        async def fake_download(
+            temp_path,
+            package_path,
+            _download_url,
+            **_kwargs,
+        ):
+            with zipfile.ZipFile(temp_path, "w") as archive:
+                archive.writestr("interface.json", '{"version":"2.0.0"}')
+            return updater_module._validate_and_publish_download(
+                temp_path,
+                package_path,
+                None,
+            )
+
+        candidate = MaaFWProjectUpdateCandidate(
+            source="github_release",
+            version="2.0.0",
+            download_url="https://example.invalid/project.zip",
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            with patch.object(
+                updater_module,
+                "_download_candidate_to_paths",
+                side_effect=fake_download,
+            ):
+                first = asyncio.run(
+                    updater_module.download_maafw_project_package(
+                        Path(temporary_directory),
+                        candidate,
+                    )
+                )
+                second = asyncio.run(
+                    updater_module.download_maafw_project_package(
+                        Path(temporary_directory),
+                        candidate,
+                    )
+                )
+
+            self.assertEqual(first.path, second.path)
+            self.assertEqual(Path(first.path).name, f"{first.sha256}.zip")
+            self.assertTrue(Path(first.path).is_file())
 
     def test_archive_apply_does_not_block_the_event_loop(self) -> None:
         started = threading.Event()

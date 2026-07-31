@@ -8,6 +8,8 @@ import httpx
 from automas_maafw_interface.models import MaaFWInterface
 
 from .updater import (
+    DOWNLOAD_MAX_BYTES,
+    MaaFWDownloadedProjectPackage,
     MaaFWProjectUpdateCandidate,
     MaaFWProjectUpdateDiscovery,
     MaaFWProjectUpdateError,
@@ -16,6 +18,7 @@ from .updater import (
     apply_maafw_project_update,
     check_maafw_project_update,
     discover_maafw_project_update,
+    download_maafw_project_package,
     list_update_providers,
     update_maafw_project_if_needed,
 )
@@ -76,6 +79,26 @@ class MaaFWProjectUpdateService:
             send_log=send_log,
         )
 
+    async def download_package(
+        self,
+        download_root: str | Path,
+        candidate: MaaFWProjectUpdateCandidate | Mapping[str, Any],
+        *,
+        proxy: httpx.Proxy | None = None,
+        send_log: Any = None,
+        max_download_bytes: int = DOWNLOAD_MAX_BYTES,
+    ) -> dict[str, Any]:
+        """Download a validated ZIP for an immutable-store consumer."""
+
+        downloaded = await download_maafw_project_package(
+            Path(download_root).resolve(),
+            self._coerce_candidate(candidate),
+            proxy=proxy,
+            send_log=send_log,
+            max_download_bytes=max_download_bytes,
+        )
+        return self._downloaded_package_dict(downloaded)
+
     async def update_if_needed(
         self,
         project_path: str | Path,
@@ -127,6 +150,18 @@ class MaaFWProjectUpdateService:
             or None,
             sha256=str(data.get("sha256") or "").strip() or None,
         )
+
+    @staticmethod
+    def _downloaded_package_dict(
+        package: MaaFWDownloadedProjectPackage,
+    ) -> dict[str, Any]:
+        return {
+            "source": package.source,
+            "version": package.version,
+            "path": package.path,
+            "size": package.size,
+            "sha256": package.sha256,
+        }
 
     @staticmethod
     def _coerce_interface(interface: MaaFWInterface | dict[str, Any]) -> MaaFWInterface:
