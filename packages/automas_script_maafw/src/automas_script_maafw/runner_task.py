@@ -34,11 +34,10 @@ from automas_maafw_runner.models import (
 from automas_maafw_runner.run_plan import MaaFWRunPlanError
 from automas_maafw_runner.service import MaaFWRunnerService
 
+from .project_path import release_project_path, try_reserve_project_path
+
 
 logger = get_logger("MaaFW 插件自动代理")
-
-_RUNNING_PROJECT_PATHS: set[str] = set()
-_RUNNING_PROJECT_PATHS_LOCK = asyncio.Lock()
 
 
 # MaaFW 的 ADB 截图/输入方法枚举（EmulatorExtras 硬件加速相关）在此镜像为整型常量，
@@ -144,37 +143,48 @@ class MaaFWPluginAutoProxyTask(TaskExecuteBase):
             self.cur_user_item.status = "跳过"
             return "今日代理次数已达上限，跳过该用户"
 
-        try:
-            self.interface_model = MaaFWInterfaceService().load(self.project_path)
-            self.base_run_plan = self._build_run_plan(self.interface_model)
-            self.run_plan = self._filter_period_once_tasks(self.base_run_plan)
-        except Exception as exc:
-            self.cur_user_item.status = "异常"
-            return f"无法构建 MaaFW 运行计划，请检查项目和任务配置: {exc}"
-
-        if not self.run_plan.tasks:
-            self.cur_user_item.status = "跳过"
-            return "MaaFW 周期任务已在本周或本月完成，跳过本次运行"
-
-        if self.run_plan.controllerType == "Adb":
-            emulator_id = self.script_config.get("Emulator", "Id")
-            emulator_index = self.script_config.get("Emulator", "Index")
-            if emulator_id == "-" or emulator_index in ("", "-"):
-                self.cur_user_item.status = "异常"
-                return "当前 MaaFW controller 需要 ADB，请在脚本管理页选择模拟器和实例"
-        elif self.run_plan.controllerType == "Win32":
-            # 由 MAS 负责启动桌面游戏，因此仅校验 Game.Path 指向真实 exe，
-            # 窗口由 _ensure_desktop_game_started 启动游戏后再解析，无需此处已存在
-            game_path = Path(str(self.script_config.get("Game", "Path") or "").strip())
-            if not game_path.is_file():
-                self.cur_user_item.status = "异常"
-                return "当前 MaaFW controller 需要由 MAS 启动游戏，请在脚本管理页选择实际游戏 exe"
-
         if not await self._try_enter_project_path():
             self.cur_user_item.status = "跳过"
-            return "同一路径 MaaFW 脚本正在运行，已跳过本次启动"
+            return "同一路径 MaaFW 脚本正在运行或更新，已跳过本次启动"
 
-        return "Pass"
+        keep_reservation = False
+        try:
+            try:
+                self.interface_model = await asyncio.to_thread(
+                    MaaFWInterfaceService().load,
+                    self.project_path,
+                )
+                self.base_run_plan = self._build_run_plan(self.interface_model)
+                self.run_plan = self._filter_period_once_tasks(self.base_run_plan)
+            except Exception as exc:
+                self.cur_user_item.status = "异常"
+                return f"无法构建 MaaFW 运行计划，请检查项目和任务配置: {exc}"
+
+            if not self.run_plan.tasks:
+                self.cur_user_item.status = "跳过"
+                return "MaaFW 周期任务已在本周或本月完成，跳过本次运行"
+
+            if self.run_plan.controllerType == "Adb":
+                emulator_id = self.script_config.get("Emulator", "Id")
+                emulator_index = self.script_config.get("Emulator", "Index")
+                if emulator_id == "-" or emulator_index in ("", "-"):
+                    self.cur_user_item.status = "异常"
+                    return "当前 MaaFW controller 需要 ADB，请在脚本管理页选择模拟器和实例"
+            elif self.run_plan.controllerType == "Win32":
+                # 由 MAS 负责启动桌面游戏，因此仅校验 Game.Path 指向真实 exe，
+                # 窗口由 _ensure_desktop_game_started 启动游戏后再解析，无需此处已存在
+                game_path = Path(
+                    str(self.script_config.get("Game", "Path") or "").strip()
+                )
+                if not game_path.is_file():
+                    self.cur_user_item.status = "异常"
+                    return "当前 MaaFW controller 需要由 MAS 启动游戏，请在脚本管理页选择实际游戏 exe"
+
+            keep_reservation = True
+            return "Pass"
+        finally:
+            if not keep_reservation:
+                await self._release_project_path()
 
     async def prepare(self) -> None:
         start_time = datetime.now()
@@ -1143,19 +1153,16 @@ class MaaFWPluginAutoProxyTask(TaskExecuteBase):
             self.opened_game = False
 
     async def _try_enter_project_path(self) -> bool:
-        project_lock_key = _normalize_project_path(self.project_path)
-        async with _RUNNING_PROJECT_PATHS_LOCK:
-            if project_lock_key in _RUNNING_PROJECT_PATHS:
-                return False
-            _RUNNING_PROJECT_PATHS.add(project_lock_key)
-            self.project_lock_key = project_lock_key
-            return True
+        project_lock_key = await try_reserve_project_path(self.project_path)
+        if project_lock_key is None:
+            return False
+        self.project_lock_key = project_lock_key
+        return True
 
     async def _release_project_path(self) -> None:
         if self.project_lock_key is None:
             return
-        async with _RUNNING_PROJECT_PATHS_LOCK:
-            _RUNNING_PROJECT_PATHS.discard(self.project_lock_key)
+        await release_project_path(self.project_lock_key)
         self.project_lock_key = None
 
     async def _save_user_logs(self) -> None:
@@ -1312,10 +1319,6 @@ def _current_period_keys(now: datetime | None = None) -> tuple[str, str, str]:
         f"{iso_year}-W{iso_week:02d}",
         current.strftime("%Y-%m"),
     )
-
-
-def _normalize_project_path(path: Path) -> str:
-    return str(path.resolve()).casefold()
 
 
 def _format_user_log_line(message: str) -> str:

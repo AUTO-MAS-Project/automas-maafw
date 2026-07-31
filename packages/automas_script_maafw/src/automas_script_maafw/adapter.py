@@ -13,6 +13,7 @@ from automas_maafw_interface.loader import MaaFWInterfaceLoadError
 from automas_maafw_interface.service import MaaFWInterfaceService
 from automas_maafw_project_update.service import MaaFWProjectUpdateService
 
+from .project_path import release_project_path, try_reserve_project_path
 from .runner_task import MaaFWPluginAutoProxyTask
 from .schema import build_source_config
 
@@ -102,10 +103,11 @@ class MaaFWAdapterHooks(ScriptAdapterHooks):
         previous_status = runtime.script_info.status
         try:
             if runtime.user_config is not None and runtime.mode == "AutoProxy":
-                # prepare() 锁定了整棵配置树（含 UserData），写回前必须先解锁，
-                # 否则 PluginUserConfig.set() 会抛出 "配置已锁定, 无法修改"
-                await runtime.storage.unlock()
-                await runtime.storage.save_user_models(runtime.user_config)
+                # 先取得宿主写事务，再解锁并整批写回。这样资源升级事务无法
+                # 插入 unlock 与多用户保存之间，也不会用旧运行快照覆盖升级结果。
+                async with runtime.storage.write_transaction():
+                    await runtime.storage.unlock()
+                    await runtime.storage.save_user_models(runtime.user_config)
         finally:
             await runtime.storage.unlock()
 
@@ -123,10 +125,6 @@ class MaaFWAdapterHooks(ScriptAdapterHooks):
             runtime.script_info.status = "跳过"
 
     async def on_crash(self, runtime: ScriptAdapterRuntime, error: Exception) -> None:
-        try:
-            await runtime.storage.unlock()
-        except Exception:
-            pass
         await super().on_crash(runtime, error)
 
     async def _update_project_before_run(
@@ -139,48 +137,74 @@ class MaaFWAdapterHooks(ScriptAdapterHooks):
             return
 
         project_path = Path(script_config.get("Info", "Path")).resolve()
-        try:
-            interface_model = MaaFWInterfaceService().load(project_path)
-        except MaaFWInterfaceLoadError as exc:
-            self._emit_log(runtime, f"MaaFW 项目更新跳过，interface 读取失败: {exc}")
-            return
-
-        script_data = await runtime.storage.read_script_data()
-        source_config = build_source_config(script_data)
-        mirror_cdk = (
-            script_config.get("Update", "MirrorChyanCDK")
-            or Config.get("Update", "MirrorChyanCDK")
-        )
-        channel = script_config.get("Update", "Channel") or Config.get("Update", "Channel")
-        try:
-            update_result = await MaaFWProjectUpdateService().update_if_needed(
-                project_path,
-                interface_model,
-                mirror_cdk=mirror_cdk,
-                channel=channel,
-                proxy=Config.proxy,
-                send_log=lambda message: self._emit_log(runtime, message),
-                source_config=source_config,
+        project_reservation = await try_reserve_project_path(project_path)
+        if project_reservation is None:
+            self._emit_log(
+                runtime,
+                "同一路径 MaaFW 项目正在运行或更新，跳过本次运行前自动更新",
             )
-            if update_result.updated:
-                refreshed_interface = MaaFWInterfaceService().load(
+            return
+        try:
+            try:
+                interface_model = await asyncio.to_thread(
+                    MaaFWInterfaceService().load,
                     project_path,
-                    force_reload=True,
                 )
-                self._emit_log(runtime, "MaaFW project updated, preparing agent Python env")
-                agent_prepare_logs: list[str] = []
-                try:
-                    await asyncio.to_thread(
-                        _prepare_maafw_agent_python_envs,
+            except MaaFWInterfaceLoadError as exc:
+                self._emit_log(
+                    runtime,
+                    f"MaaFW 项目更新跳过，interface 读取失败: {exc}",
+                )
+                return
+
+            script_data = await runtime.storage.read_script_data()
+            source_config = build_source_config(script_data)
+            mirror_cdk = (
+                script_config.get("Update", "MirrorChyanCDK")
+                or Config.get("Update", "MirrorChyanCDK")
+            )
+            channel = script_config.get("Update", "Channel") or Config.get(
+                "Update",
+                "Channel",
+            )
+            try:
+                update_result = await MaaFWProjectUpdateService().update_if_needed(
+                    project_path,
+                    interface_model,
+                    mirror_cdk=mirror_cdk,
+                    channel=channel,
+                    proxy=Config.proxy,
+                    send_log=lambda message: self._emit_log(runtime, message),
+                    source_config=source_config,
+                )
+                if update_result.updated:
+                    refreshed_interface = await asyncio.to_thread(
+                        MaaFWInterfaceService().load,
                         project_path,
-                        refreshed_interface,
-                        send_log=agent_prepare_logs.append,
+                        force_reload=True,
                     )
-                finally:
-                    for log_line in agent_prepare_logs:
-                        self._emit_log(runtime, log_line)
-        except Exception as exc:
-            self._emit_log(runtime, f"MaaFW 项目更新失败，继续使用当前目录: {exc}")
+                    self._emit_log(
+                        runtime,
+                        "MaaFW project updated, preparing agent Python env",
+                    )
+                    agent_prepare_logs: list[str] = []
+                    try:
+                        await asyncio.to_thread(
+                            _prepare_maafw_agent_python_envs,
+                            project_path,
+                            refreshed_interface,
+                            send_log=agent_prepare_logs.append,
+                        )
+                    finally:
+                        for log_line in agent_prepare_logs:
+                            self._emit_log(runtime, log_line)
+            except Exception as exc:
+                self._emit_log(
+                    runtime,
+                    f"MaaFW 项目更新失败，继续使用当前目录: {exc}",
+                )
+        finally:
+            await release_project_path(project_reservation)
 
     @staticmethod
     def _emit_log(runtime: ScriptAdapterRuntime, message: str) -> None:

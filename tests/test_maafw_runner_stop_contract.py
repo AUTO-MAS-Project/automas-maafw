@@ -193,9 +193,9 @@ class MaaFWRunnerStopContractTest(unittest.TestCase):
                 / "pyproject.toml"
             ).read_text(encoding="utf-8")
         )
-        self.assertEqual(script_project["project"]["version"], "0.1.7")
+        self.assertEqual(script_project["project"]["version"], "0.1.9")
         self.assertIn(
-            "automas-maafw-runner>=0.3.1",
+            "automas-maafw-runner>=0.3.3",
             script_project["project"]["dependencies"],
         )
 
