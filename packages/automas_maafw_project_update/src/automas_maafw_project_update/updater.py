@@ -51,6 +51,32 @@ class MaaFWProjectUpdateCandidate:
     download_url: str | None = None
     sha256: str | None = None
 
+    @property
+    def installable(self) -> bool:
+        """Return whether this candidate has an actionable package URL."""
+
+        return bool(str(self.download_url or "").strip())
+
+
+@dataclass
+class MaaFWProjectUpdateDiscovery:
+    """A newer version discovered by a provider.
+
+    Version discovery and package installation are separate provider
+    capabilities. ``candidate`` is populated only when the provider returned
+    an actionable download URL; callers must not treat a discovery without a
+    candidate as installable.
+    """
+
+    source: str
+    version: str
+    candidate: MaaFWProjectUpdateCandidate | None = None
+    unavailable_reason: str = ""
+
+    @property
+    def installable(self) -> bool:
+        return self.candidate is not None and self.candidate.installable
+
 
 @dataclass
 class MaaFWProjectUpdateResult:
@@ -60,6 +86,8 @@ class MaaFWProjectUpdateResult:
     latest_version: str | None = None
     source: str | None = None
     message: str = ""
+    update_available: bool = False
+    installable: bool = False
 
 
 class MaaFWProjectUpdateError(RuntimeError):
@@ -112,7 +140,7 @@ async def update_maafw_project_if_needed(
     merged_source_config = dict(source_config or {})
     merged_source_config.setdefault("mirror_cdk", mirror_cdk)
     merged_source_config.setdefault("channel", update_channel)
-    candidate = await check_maafw_project_update(
+    discovery = await discover_maafw_project_update(
         interface_model,
         current_version=current_version,
         source_config=merged_source_config,
@@ -120,7 +148,7 @@ async def update_maafw_project_if_needed(
         send_log=send_update_log,
     )
 
-    if candidate is None:
+    if discovery is None:
         message = f"MaaFW project is up to date: {current_version}"
         send_update_log(message)
         return MaaFWProjectUpdateResult(
@@ -128,6 +156,33 @@ async def update_maafw_project_if_needed(
             updated=False,
             current_version=current_version,
             message=message,
+        )
+
+    if not discovery.installable:
+        reason = (
+            discovery.unavailable_reason
+            or f"{discovery.source} did not return an installable download URL"
+        )
+        message = (
+            f"found MaaFW project update {current_version} -> {discovery.version} "
+            f"({discovery.source}), but it is not installable: {reason}"
+        )
+        send_update_log(message)
+        return MaaFWProjectUpdateResult(
+            checked=True,
+            updated=False,
+            current_version=current_version,
+            update_available=True,
+            installable=False,
+            latest_version=discovery.version,
+            source=discovery.source,
+            message=message,
+        )
+
+    candidate = discovery.candidate
+    if candidate is None:
+        raise MaaFWProjectUpdateError(
+            "update discovery is marked installable but has no candidate"
         )
 
     send_update_log(
@@ -146,20 +201,22 @@ async def update_maafw_project_if_needed(
         checked=True,
         updated=True,
         current_version=current_version,
+        update_available=True,
+        installable=True,
         latest_version=candidate.version,
         source=candidate.source,
         message=message,
     )
 
 
-async def check_maafw_project_update(
+async def discover_maafw_project_update(
     interface_model: MaaFWInterface,
     *,
     current_version: str | None = None,
     source_config: dict[str, Any] | None = None,
     proxy: httpx.Proxy | None = None,
     send_log: Callable[[str], None] | None = None,
-) -> MaaFWProjectUpdateCandidate | None:
+) -> MaaFWProjectUpdateDiscovery | None:
     config = dict(source_config or {})
     provider = str(config.get("source") or "").strip().lower()
     if not provider:
@@ -194,6 +251,41 @@ async def check_maafw_project_update(
     raise MaaFWProjectUpdateError(f"unsupported MaaFW project update provider: {provider}")
 
 
+async def check_maafw_project_update(
+    interface_model: MaaFWInterface,
+    *,
+    current_version: str | None = None,
+    source_config: dict[str, Any] | None = None,
+    proxy: httpx.Proxy | None = None,
+    send_log: Callable[[str], None] | None = None,
+) -> MaaFWProjectUpdateCandidate | None:
+    """Return only an installable candidate for the legacy check contract.
+
+    Use :func:`discover_maafw_project_update` when the caller must distinguish
+    "newer version exists" from "an installable package is available".
+    """
+
+    discovery = await discover_maafw_project_update(
+        interface_model,
+        current_version=current_version,
+        source_config=source_config,
+        proxy=proxy,
+        send_log=send_log,
+    )
+    if discovery is None:
+        return None
+    if not discovery.installable or discovery.candidate is None:
+        reason = (
+            discovery.unavailable_reason
+            or f"{discovery.source} did not return an installable download URL"
+        )
+        raise MaaFWProjectUpdateError(
+            f"{discovery.source} discovered version {discovery.version}, "
+            f"but no installable update candidate is available: {reason}"
+        )
+    return discovery.candidate
+
+
 async def apply_maafw_project_update(
     project_path: Path,
     candidate: MaaFWProjectUpdateCandidate,
@@ -202,12 +294,13 @@ async def apply_maafw_project_update(
     send_log: Callable[[str], None] | None = None,
 ) -> None:
     send_update_log = send_log or (lambda _: None)
-    if not candidate.download_url:
+    download_url = str(candidate.download_url or "").strip()
+    if not download_url:
         raise MaaFWProjectUpdateError("update provider did not return a download URL")
 
     package_path = await _download_update_package(
         project_path.resolve(),
-        candidate.download_url,
+        download_url,
         expected_sha256=candidate.sha256,
         proxy=proxy,
         send_log=send_update_log,
@@ -222,7 +315,7 @@ async def _check_mirrorchyan_update(
     mirror_cdk: str,
     channel: str,
     proxy: httpx.Proxy | None,
-) -> MaaFWProjectUpdateCandidate | None:
+) -> MaaFWProjectUpdateDiscovery | None:
     rid = interface_model.mirrorchyan_rid
     if not rid:
         return None
@@ -265,11 +358,14 @@ async def _check_mirrorchyan_update(
     if not _is_remote_newer(latest_version, current_version):
         return None
 
-    return MaaFWProjectUpdateCandidate(
+    return _build_update_discovery(
         source="mirrorchyan",
         version=latest_version,
         download_url=str(data.get("url") or "").strip() or None,
         sha256=str(data.get("sha256") or "").strip() or None,
+        unavailable_reason=(
+            "MirrorChyan returned newer version metadata without a download URL"
+        ),
     )
 
 
@@ -279,18 +375,29 @@ async def _check_github_release_update(
     current_version: str,
     source_config: dict[str, Any],
     proxy: httpx.Proxy | None,
-) -> MaaFWProjectUpdateCandidate | None:
-    repo = _normalize_github_repo(str(source_config.get("repo") or interface_model.github or ""))
+) -> MaaFWProjectUpdateDiscovery | None:
+    repo = _normalize_github_repo(
+        str(
+            source_config.get("repo")
+            or source_config.get("github_repo")
+            or interface_model.github
+            or ""
+        )
+    )
     if not repo:
         return None
 
-    tag = str(source_config.get("tag") or "").strip()
+    tag = str(
+        source_config.get("tag") or source_config.get("github_tag") or ""
+    ).strip()
     api_url = (
         f"https://api.github.com/repos/{repo}/releases/tags/{tag}"
         if tag
         else f"https://api.github.com/repos/{repo}/releases/latest"
     )
-    token = str(source_config.get("token") or "").strip()
+    token = str(
+        source_config.get("token") or source_config.get("github_token") or ""
+    ).strip()
     headers = dict(HTTP_HEADERS)
     headers["Accept"] = "application/vnd.github+json"
     if token:
@@ -314,16 +421,50 @@ async def _check_github_release_update(
     if not _is_remote_newer(latest_version, current_version):
         return None
 
-    asset_pattern = str(source_config.get("asset_pattern") or r"\.zip$").strip()
+    asset_pattern = str(
+        source_config.get("asset_pattern")
+        or source_config.get("github_asset_pattern")
+        or r"\.zip$"
+    ).strip()
     download_url = _select_github_release_asset(data, asset_pattern)
     if not download_url:
         download_url = str(data.get("zipball_url") or "").strip() or None
 
-    return MaaFWProjectUpdateCandidate(
+    return _build_update_discovery(
         source="github_release",
         version=latest_version,
         download_url=download_url,
         sha256=str(source_config.get("sha256") or "").strip() or None,
+        unavailable_reason=(
+            "GitHub release has no matching asset or source archive download URL"
+        ),
+    )
+
+
+def _build_update_discovery(
+    *,
+    source: str,
+    version: str,
+    download_url: str | None,
+    sha256: str | None,
+    unavailable_reason: str,
+) -> MaaFWProjectUpdateDiscovery:
+    normalized_url = str(download_url or "").strip()
+    candidate = (
+        MaaFWProjectUpdateCandidate(
+            source=source,
+            version=version,
+            download_url=normalized_url,
+            sha256=str(sha256 or "").strip() or None,
+        )
+        if normalized_url
+        else None
+    )
+    return MaaFWProjectUpdateDiscovery(
+        source=source,
+        version=version,
+        candidate=candidate,
+        unavailable_reason="" if candidate is not None else unavailable_reason,
     )
 
 
@@ -336,31 +477,36 @@ async def _download_update_package(
     send_log: Callable[[str], None],
 ) -> Path:
     update_dir = project_path / UPDATE_WORK_DIR
-    update_dir.mkdir(parents=True, exist_ok=True)
-
     temp_path = update_dir / DOWNLOAD_TEMP_NAME
     package_path = update_dir / DOWNLOAD_FILE_NAME
-    _remove_path(temp_path)
-    _remove_path(package_path)
+    await asyncio.to_thread(
+        _prepare_download_paths,
+        update_dir,
+        temp_path,
+        package_path,
+    )
 
     send_log(f"start downloading MaaFW update package: {_sanitize_log_message(download_url)}")
     last_error: Exception | None = None
     for attempt in range(1, DOWNLOAD_RETRY_TIMES + 1):
-        _remove_path(temp_path)
+        await asyncio.to_thread(_remove_path, temp_path)
         try:
             await _stream_update_package(
                 temp_path,
                 download_url,
                 proxy=proxy,
             )
-            _ensure_downloaded_zip(temp_path)
-            _ensure_expected_sha256(temp_path, expected_sha256)
-            temp_path.replace(package_path)
-            send_log(f"MaaFW update package downloaded: {package_path.stat().st_size} bytes")
+            package_size = await asyncio.to_thread(
+                _validate_and_publish_download,
+                temp_path,
+                package_path,
+                expected_sha256,
+            )
+            send_log(f"MaaFW update package downloaded: {package_size} bytes")
             return package_path
         except Exception as exc:
             last_error = exc
-            _remove_path(temp_path)
+            await asyncio.to_thread(_remove_path, temp_path)
             if attempt >= DOWNLOAD_RETRY_TIMES:
                 break
             send_log(
@@ -375,6 +521,29 @@ async def _download_update_package(
         "download MaaFW update package failed: "
         f"{_sanitize_log_message(str(last_error))}"
     ) from None
+
+
+def _prepare_download_paths(
+    update_dir: Path,
+    temp_path: Path,
+    package_path: Path,
+) -> None:
+    update_dir.mkdir(parents=True, exist_ok=True)
+    _remove_path(temp_path)
+    _remove_path(package_path)
+
+
+def _validate_and_publish_download(
+    temp_path: Path,
+    package_path: Path,
+    expected_sha256: str | None,
+) -> int:
+    """Validate a complete archive and atomically publish it off the event loop."""
+
+    _ensure_downloaded_zip(temp_path)
+    _ensure_expected_sha256(temp_path, expected_sha256)
+    temp_path.replace(package_path)
+    return package_path.stat().st_size
 
 
 async def _stream_update_package(
@@ -489,6 +658,29 @@ def _decode_download_error_text(content: bytes) -> str:
 
 
 async def _apply_update_package(
+    project_path: Path,
+    package_path: Path,
+    send_log: Callable[[str], None],
+) -> None:
+    loop = asyncio.get_running_loop()
+
+    def send_thread_log(message: str) -> None:
+        loop.call_soon_threadsafe(send_log, message)
+
+    try:
+        await asyncio.to_thread(
+            _apply_update_package_sync,
+            project_path,
+            package_path,
+            send_thread_log,
+        )
+    finally:
+        # Flush progress callbacks queued by the worker before returning or
+        # propagating an apply failure.
+        await asyncio.sleep(0)
+
+
+def _apply_update_package_sync(
     project_path: Path,
     package_path: Path,
     send_log: Callable[[str], None],
