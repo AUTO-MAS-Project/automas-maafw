@@ -312,6 +312,8 @@ class ManagedServiceGateway:
         self,
         download_root: str | Path,
         candidate: Mapping[str, Any],
+        *,
+        progress: Any = None,
     ) -> dict[str, Any]:
         if self.project_update is None:
             raise ManagedServiceError(f"缺少服务 {PROJECT_UPDATE_SERVICE}")
@@ -324,7 +326,7 @@ class ManagedServiceGateway:
         value = await _invoke(
             method,
             (Path(download_root), dict(candidate)),
-            {},
+            {"progress": progress} if progress is not None else {},
             "下载 MaaFW 远程资源包",
         )
         package = _as_dict(value, "maafw.project_update.v1 download_package")
@@ -362,6 +364,9 @@ class ManagedServiceGateway:
         project_id = _required_text(payload, "projectId", "项目 ID")
         version = _optional_text(payload.get("version"))
         runtime_constraint = _optional_text(payload.get("runtimeConstraint"))
+        activate = payload.get("activate", True)
+        if not isinstance(activate, bool):
+            raise ManagedServiceError("项目导入 activate 必须是 boolean")
         project_reference = _project_script_reference(
             _optional_text(payload.get("projectReference"))
         )
@@ -370,7 +375,7 @@ class ManagedServiceGateway:
             "projectId": project_id,
             "version": version,
             "runtimeConstraint": runtime_constraint,
-            "activate": True,
+            "activate": activate,
             "pinned": False,
             "reference": project_reference,
         }
@@ -382,7 +387,7 @@ class ManagedServiceGateway:
                     (source_path, project_id, version),
                     {
                         "runtime_constraint": runtime_constraint,
-                        "activate": True,
+                        "activate": activate,
                         "pinned": False,
                         "reference": project_reference,
                     },
@@ -1366,7 +1371,31 @@ async def _invoke(
         if _is_async_callable(method):
             value = method(*args, **kwargs)
         else:
-            value = await asyncio.to_thread(method, *args, **kwargs)
+            worker = asyncio.create_task(
+                asyncio.to_thread(method, *args, **kwargs)
+            )
+            cancellation_requested = False
+            while not worker.done():
+                try:
+                    await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    # Cancelling the waiter cannot stop a function that is
+                    # already running in a worker thread.  Keep the caller
+                    # (and therefore its resource/configuration locks) alive
+                    # until the mutation has really reached a terminal state.
+                    cancellation_requested = True
+                except Exception:
+                    # Inspect and translate the worker exception below.
+                    pass
+            if cancellation_requested:
+                try:
+                    worker.result()
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+                raise asyncio.CancelledError
+            value = worker.result()
         if inspect.isawaitable(value):
             value = await value
         return value

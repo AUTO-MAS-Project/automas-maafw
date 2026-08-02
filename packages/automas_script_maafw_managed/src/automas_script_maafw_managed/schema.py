@@ -206,6 +206,14 @@ PROJECT_GROUP = PluginField.group(
             readonly=True,
             size="large",
         ),
+        PluginField.json(
+            "ConversionJournal",
+            "普通 MaaFW 原地转换 marker",
+            "{}",
+            json_type="object",
+            readonly=True,
+            hidden=True,
+        ),
         PluginField.string(
             "PendingVersion",
             "待确认资源版本",

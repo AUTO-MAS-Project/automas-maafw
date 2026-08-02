@@ -6,6 +6,7 @@ import copy
 import importlib.util
 import json
 import sys
+import threading
 import tomllib
 import types
 import unittest
@@ -62,7 +63,7 @@ class ScriptMaaFWManagedContractTest(unittest.TestCase):
         )
         self.assertEqual(
             self._keyword_literal(definition, "editor_kind"),
-            "schema",
+            "plugin:automas_script_maafw",
         )
         self.assertEqual(
             ast.unparse(self._keyword(definition, "hooks_factory").value),
@@ -71,6 +72,19 @@ class ScriptMaaFWManagedContractTest(unittest.TestCase):
         metadata = self._keyword_literal(definition, "metadata")
         self.assertTrue(metadata["declarative"])
         self.assertEqual(metadata["resource_model"], "project-store")
+        self.assertFalse(metadata["creatable"])
+        self.assertEqual(metadata["create_mode"], "convert-only")
+        self.assertEqual(metadata["editor_reuse_type"], "MaaFW")
+
+    def test_single_entry_backend_routes_are_registered(self) -> None:
+        source = (MODULE_ROOT / "plugin.py").read_text(encoding="utf-8")
+        self.assertIn('"/maafw-managed/capabilities"', source)
+        self.assertIn('"/maafw-managed/progress"', source)
+        self.assertIn('"/maafw-managed/convert"', source)
+        self.assertIn("get_plugin_script_type_conversion_snapshot", source)
+        self.assertIn("convert_plugin_script_type", source)
+        self.assertNotIn("Config.add_script", source)
+        self.assertNotIn("Config.del_script", source)
 
     def test_hooks_delegate_to_existing_maafw_runner(self) -> None:
         source = (MODULE_ROOT / "adapter.py").read_text(encoding="utf-8")
@@ -172,6 +186,48 @@ class ScriptMaaFWManagedContractTest(unittest.TestCase):
         self.assertIn("script_records=script_records", plugin_source)
         self.assertIn("_resolve_and_bind_runtime", plugin_source)
         self.assertIn("project_reference=request[\"projectReference\"]", plugin_source)
+
+    def test_initial_import_honors_activate_override_and_defaults_true(self) -> None:
+        services = self._load_services_module()
+
+        class ProjectStore:
+            def __init__(self) -> None:
+                self.activations: list[bool] = []
+
+            def import_project(
+                self,
+                source_path,
+                project_id,
+                version,
+                *,
+                runtime_constraint,
+                activate,
+                pinned,
+                reference,
+            ):
+                del source_path, runtime_constraint, pinned, reference
+                self.activations.append(activate)
+                return {
+                    "projectId": project_id,
+                    "version": version,
+                    "dataPath": str(ROOT),
+                    "manifest": {},
+                }
+
+        async def scenario():
+            project_store = ProjectStore()
+            gateway = services.ManagedServiceGateway(project_store, object())
+            base = {
+                "sourcePath": str(ROOT),
+                "projectId": "demo",
+                "version": "1.0",
+                "projectReference": "maafw-script:script-one",
+            }
+            await gateway.import_project(base)
+            await gateway.import_project({**base, "version": "2.0", "activate": False})
+            return project_store.activations
+
+        self.assertEqual(asyncio.run(scenario()), [True, False])
 
     def test_missing_bound_runtime_is_rebuilt_from_exact_recorded_version(self) -> None:
         source = (MODULE_ROOT / "services.py").read_text(encoding="utf-8")
@@ -500,6 +556,7 @@ class ScriptMaaFWManagedContractTest(unittest.TestCase):
             "PendingPlanId",
             "UpgradeToken",
             "PendingUpgrade",
+            "ConversionJournal",
             "UpgradePlanStatus",
             "UpgradePlan",
             "Status",
@@ -1476,6 +1533,983 @@ class ManagedUpgradeStateMachineTest(unittest.TestCase):
         sys.modules[module_name] = module
         spec.loader.exec_module(module)
         return module
+
+
+class ManagedInPlaceConversionTest(unittest.TestCase):
+    script_id = "11111111-1111-4111-8111-111111111111"
+    user_ids = (
+        "22222222-2222-4222-8222-222222222222",
+        "33333333-3333-4333-8333-333333333333",
+    )
+
+    def setUp(self) -> None:
+        self.module = ManagedUpgradeStateMachineTest._load_plugin_module()
+
+    def test_capabilities_fail_closed_without_host_primitives(self) -> None:
+        class UnsupportedConfig:
+            pass
+
+        self.module.Config = UnsupportedConfig
+        plugin = self.module.Plugin(self._context())
+        plugin._gateway = lambda: self.fail("fail-closed path must not import")
+        capabilities = asyncio.run(plugin._capabilities(None))
+        self.assertEqual(capabilities["code"], 200)
+        self.assertEqual(
+            capabilities["data"]["apiVersion"],
+            "maafw-managed.v1",
+        )
+        self.assertIsInstance(
+            capabilities["data"]["distributionVersion"],
+            str,
+        )
+        self.assertFalse(
+            capabilities["data"]["features"]["inPlaceConversion"]
+        )
+        self.assertTrue(capabilities["data"]["features"]["pinning"])
+        self.assertTrue(
+            capabilities["data"]["features"]["garbageCollection"]
+        )
+        self.assertTrue(
+            capabilities["data"]["features"]["operationProgress"]
+        )
+
+        response = asyncio.run(
+            plugin._convert_project(self._request({"scriptId": self.script_id}))
+        )
+        self.assertEqual(response["code"], 400)
+        self.assertIn("原子脚本类型转换", response["message"])
+
+    def test_conversion_operation_id_includes_target_identity(self) -> None:
+        build = self.module._conversion_operation_id
+        first = build(self.script_id, "source-hash", "m9a", "1.0", "==5.10.4")
+        retry = build(self.script_id, "source-hash", "m9a", "1.0", "==5.10.4")
+        different_version = build(
+            self.script_id,
+            "source-hash",
+            "m9a",
+            "2.0",
+            "==5.10.4",
+        )
+        different_project = build(
+            self.script_id,
+            "source-hash",
+            "other",
+            "1.0",
+            "==5.10.4",
+        )
+        different_runtime = build(
+            self.script_id,
+            "source-hash",
+            "m9a",
+            "1.0",
+            "==5.11.0",
+        )
+
+        self.assertEqual(first, retry)
+        self.assertEqual(len({first, different_version, different_project, different_runtime}), 4)
+
+    def test_conversion_fails_fast_when_source_project_is_busy(self) -> None:
+        config = self._fake_config()
+        gateway = self._Gateway(config.events)
+        self.module.Config = config
+        plugin = self.module.Plugin(self._context())
+        plugin._gateway = lambda: gateway
+        original_reserve = self.module.try_reserve_project_path
+        original_release = self.module.release_project_path
+        release_calls: list[str | None] = []
+
+        async def reserve(path):
+            self.assertEqual(path, str(ROOT))
+            return None
+
+        async def release(key):
+            release_calls.append(key)
+
+        self.module.try_reserve_project_path = reserve
+        self.module.release_project_path = release
+        try:
+            response = asyncio.run(
+                plugin._convert_project(
+                    self._request({"scriptId": self.script_id})
+                )
+            )
+        finally:
+            self.module.try_reserve_project_path = original_reserve
+            self.module.release_project_path = original_release
+
+        self.assertEqual(response["code"], 400, response)
+        self.assertIn("项目正在运行、准备或更新", response["message"])
+        self.assertEqual(gateway.imports, 0)
+        self.assertEqual(release_calls, [])
+
+    def test_conversion_releases_source_path_after_resource_transaction(self) -> None:
+        config = self._fake_config()
+        gateway = self._Gateway(config.events)
+        self.module.Config = config
+        plugin = self.module.Plugin(self._context())
+        plugin._gateway = lambda: gateway
+        original_reserve = self.module.try_reserve_project_path
+        original_release = self.module.release_project_path
+
+        async def reserve(path):
+            self.assertEqual(path, str(ROOT))
+            config.events.append("path:reserve")
+            return "reserved-project"
+
+        async def release(key):
+            self.assertEqual(key, "reserved-project")
+            config.events.append("path:release")
+
+        self.module.try_reserve_project_path = reserve
+        self.module.release_project_path = release
+        try:
+            response = asyncio.run(
+                plugin._convert_project(
+                    self._request({"scriptId": self.script_id})
+                )
+            )
+        finally:
+            self.module.try_reserve_project_path = original_reserve
+            self.module.release_project_path = original_release
+
+        self.assertEqual(response["code"], 200, response)
+        self.assertLess(
+            config.events.index("resource:exit"),
+            config.events.index("path:release"),
+        )
+
+    def test_conversion_preserves_ids_order_config_and_stable_reference(self) -> None:
+        config = self._fake_config()
+        gateway = self._Gateway(config.events)
+        self.module.Config = config
+        plugin = self.module.Plugin(self._context())
+        plugin._gateway = lambda: gateway
+
+        @asynccontextmanager
+        async def upgrade_lock():
+            config.events.append("upgrade:enter")
+            try:
+                yield
+            finally:
+                config.events.append("upgrade:exit")
+
+        plugin._upgrade_lock = lambda _script_id: upgrade_lock()
+        original_user_objects = list(config.users)
+        original_user_configs = [copy.deepcopy(user.config) for user in config.users]
+
+        response = asyncio.run(
+            plugin._convert_project(self._request({"scriptId": self.script_id}))
+        )
+
+        self.assertEqual(response["code"], 200, response)
+        data = response["data"]
+        self.assertTrue(data["converted"])
+        self.assertEqual(data["scriptId"], self.script_id)
+        self.assertEqual(data["fromType"], "MaaFW")
+        self.assertEqual(data["toType"], "MaaFWManaged")
+        self.assertEqual(data["userIds"], list(self.user_ids))
+        self.assertEqual(config.script.id, self.script_id)
+        self.assertEqual(config.script.type, "MaaFWManaged")
+        self.assertEqual(config.users, original_user_objects)
+        self.assertEqual([user.id for user in config.users], list(self.user_ids))
+        for source, converted in zip(
+            original_user_configs,
+            (user.config for user in config.users),
+            strict=True,
+        ):
+            self.assertEqual(
+                self.module._upgrade_source_config(converted),
+                self.module._upgrade_source_config(source),
+            )
+        self.assertEqual(
+            config.script.config["Info"]["Path"],
+            "C:/store/m9a/1.0",
+        )
+        marker = config.script.config["Managed"]["ConversionJournal"]
+        self.assertEqual(marker["state"], "committed")
+        self.assertEqual(marker["scriptId"], self.script_id)
+        self.assertEqual(
+            gateway.references,
+            [("m9a", "1.0", f"maafw-script:{self.script_id}")],
+        )
+        self.assertLess(
+            config.events.index("config:snapshot:exit"),
+            config.events.index("resource:enter"),
+        )
+        self.assertLess(
+            config.events.index("resource:enter"),
+            config.events.index("upgrade:enter"),
+        )
+        self.assertLess(
+            config.events.index("upgrade:enter"),
+            config.events.index("config:commit:enter"),
+        )
+        self.assertLess(
+            config.events.index("config:commit:enter"),
+            config.events.index("convert"),
+        )
+        self.assertLess(
+            config.events.index("convert"),
+            config.events.index("config:commit:exit"),
+        )
+        self.assertLess(
+            config.events.index("config:commit:exit"),
+            config.events.index("upgrade:exit"),
+        )
+        self.assertLess(
+            config.events.index("upgrade:exit"),
+            config.events.index("resource:exit"),
+        )
+
+        second = asyncio.run(
+            plugin._convert_project(self._request({"scriptId": self.script_id}))
+        )
+        self.assertEqual(second["code"], 200, second)
+        self.assertTrue(second["data"]["idempotent"])
+        self.assertEqual(gateway.imports, 1)
+
+    def test_precommit_failure_releases_project_reference(self) -> None:
+        config = self._fake_config(conversion_mode="fail")
+        gateway = self._Gateway(config.events)
+        self.module.Config = config
+        plugin = self.module.Plugin(self._context())
+        plugin._gateway = lambda: gateway
+
+        response = asyncio.run(
+            plugin._convert_project(self._request({"scriptId": self.script_id}))
+        )
+
+        self.assertEqual(response["code"], 400, response)
+        self.assertIn("已释放项目引用", response["message"])
+        self.assertEqual(config.script.type, "MaaFW")
+        self.assertEqual(
+            gateway.releases,
+            [("m9a", "1.0", f"maafw-script:{self.script_id}")],
+        )
+
+    def test_uncertain_commit_keeps_reference_for_recovery(self) -> None:
+        config = self._fake_config(conversion_mode="uncertain")
+        gateway = self._Gateway(config.events)
+        self.module.Config = config
+        plugin = self.module.Plugin(self._context())
+        plugin._gateway = lambda: gateway
+
+        response = asyncio.run(
+            plugin._convert_project(self._request({"scriptId": self.script_id}))
+        )
+
+        self.assertEqual(response["code"], 400, response)
+        self.assertIn("已保留项目引用", response["message"])
+        self.assertEqual(gateway.releases, [])
+
+    def test_source_changed_cas_releases_inactive_project_reference(self) -> None:
+        config = self._fake_config(conversion_mode="source_changed")
+        gateway = self._Gateway(config.events)
+        self.module.Config = config
+        plugin = self.module.Plugin(self._context())
+        plugin._gateway = lambda: gateway
+
+        response = asyncio.run(
+            plugin._convert_project(self._request({"scriptId": self.script_id}))
+        )
+
+        self.assertEqual(response["code"], 400, response)
+        self.assertIn("配置未提交且已释放项目引用", response["message"])
+        self.assertEqual(config.script.type, "MaaFW")
+        self.assertEqual(gateway.current_version, "existing")
+        self.assertFalse(gateway.import_payloads[0]["activate"])
+        self.assertEqual(
+            gateway.releases,
+            [("m9a", "1.0", f"maafw-script:{self.script_id}")],
+        )
+
+    def test_progress_is_pollable_isolated_and_terminal_once(self) -> None:
+        plugin = self.module.Plugin(self._context())
+        operation_id = f"{self.script_id}:import-local:1:1"
+        other_script_id = "44444444-4444-4444-8444-444444444444"
+        published: list[tuple[str, str, dict]] = []
+
+        class FakePublisher:
+            @staticmethod
+            async def send(*, id, type, data):
+                published.append((id, type, copy.deepcopy(dict(data))))
+                return True
+
+        ws_module = types.ModuleType("app.core.ws")
+        ws_module.Publisher = FakePublisher
+        previous_ws = sys.modules.get("app.core.ws")
+        sys.modules["app.core.ws"] = ws_module
+
+        async def scenario():
+            async def operation():
+                callback = plugin._download_progress_callback()
+                assert callback is not None
+                callback(
+                    {
+                        "stage": "downloading",
+                        "downloaded_bytes": 12,
+                        "total_bytes": 24,
+                        "percent": 50,
+                    }
+                )
+                await plugin._flush_progress_updates()
+                await plugin._progress_stage(
+                    "project-import",
+                    "正在导入不可变项目资源",
+                    percent=70,
+                )
+                return {"imported": True}
+
+            response = await plugin._respond_with_progress(
+                {
+                    "scriptId": self.script_id,
+                    "progressId": operation_id,
+                },
+                "import-local",
+                "正在导入本地项目资源",
+                operation,
+            )
+            progress = await plugin._read_progress(
+                self._request(
+                    {
+                        "scriptId": self.script_id,
+                        "operationId": operation_id,
+                    }
+                )
+            )
+            isolated = await plugin._read_progress(
+                self._request(
+                    {
+                        "scriptId": other_script_id,
+                        "operationId": operation_id,
+                    }
+                )
+            )
+            duplicate = await plugin._respond_with_progress(
+                {
+                    "scriptId": self.script_id,
+                    "progressId": operation_id,
+                },
+                "import-local",
+                "不得覆盖旧操作",
+                operation,
+            )
+            invalid = await plugin._respond_with_progress(
+                {
+                    "scriptId": self.script_id,
+                    "progressId": "../not-safe",
+                },
+                "import-local",
+                "非法进度 ID",
+                operation,
+            )
+            await plugin._finish_progress(
+                {
+                    "scriptId": self.script_id,
+                    "operationId": operation_id,
+                },
+                "error",
+                "不得覆盖 success 终态",
+            )
+            return response, progress, isolated, duplicate, invalid
+
+        try:
+            response, progress, isolated, duplicate, invalid = asyncio.run(
+                scenario()
+            )
+        finally:
+            if previous_ws is None:
+                sys.modules.pop("app.core.ws", None)
+            else:
+                sys.modules["app.core.ws"] = previous_ws
+
+        self.assertEqual(response["code"], 200, response)
+        self.assertEqual(progress["code"], 200, progress)
+        state = progress["data"]
+        self.assertEqual(state["status"], "success")
+        self.assertEqual(state["percent"], 100)
+        self.assertEqual(state["operation"], "import-local")
+        self.assertEqual(state["downloadedBytes"], 12)
+        self.assertEqual(state["totalBytes"], 24)
+        self.assertEqual(isolated["code"], 404)
+        self.assertEqual(duplicate["code"], 400)
+        self.assertEqual(invalid["code"], 400)
+        self.assertEqual(
+            plugin._progress_states[operation_id]["status"],
+            "success",
+        )
+        terminal = [
+            item
+            for item in published
+            if item[2].get("operationId") == operation_id
+            and item[2].get("status") in {"success", "error"}
+        ]
+        self.assertEqual({item[0] for item in terminal}, {self.script_id, operation_id})
+        self.assertTrue(all(item[1] == "maafw.managed.progress" for item in terminal))
+        self.assertTrue(all(item[2]["status"] == "success" for item in terminal))
+
+    def test_failure_terminal_is_published_after_lock_exit(self) -> None:
+        plugin = self.module.Plugin(self._context())
+        operation_id = f"{self.script_id}:upgrade-local:1:2"
+        events: list[str] = []
+
+        class FakePublisher:
+            @staticmethod
+            async def send(*, id, type, data):
+                del id, type
+                if data.get("status") in {"success", "error"}:
+                    events.append(f"terminal:{data['status']}")
+                return True
+
+        ws_module = types.ModuleType("app.core.ws")
+        ws_module.Publisher = FakePublisher
+        previous_ws = sys.modules.get("app.core.ws")
+        sys.modules["app.core.ws"] = ws_module
+
+        @asynccontextmanager
+        async def locked_operation():
+            events.append("lock:enter")
+            try:
+                yield
+            finally:
+                events.append("lock:exit")
+
+        async def operation():
+            async with locked_operation():
+                raise self.module.ManagedServiceError("预期失败")
+
+        try:
+            response = asyncio.run(
+                plugin._respond_with_progress(
+                    {
+                        "scriptId": self.script_id,
+                        "progressId": operation_id,
+                    },
+                    "upgrade-local",
+                    "正在导入升级资源",
+                    operation,
+                )
+            )
+        finally:
+            if previous_ws is None:
+                sys.modules.pop("app.core.ws", None)
+            else:
+                sys.modules["app.core.ws"] = previous_ws
+
+        self.assertEqual(response["code"], 400, response)
+        self.assertLess(events.index("lock:exit"), events.index("terminal:error"))
+        self.assertEqual(events.count("terminal:error"), 2)
+
+    def test_request_cancellation_waits_for_unlock_and_records_success(self) -> None:
+        plugin = self.module.Plugin(self._context())
+        operation_id = f"{self.script_id}:install-runtime:1:3"
+        events: list[str] = []
+
+        class FakePublisher:
+            @staticmethod
+            async def send(*, id, type, data):
+                del id, type
+                if data.get("status") in {"success", "error"}:
+                    events.append(f"terminal:{data['status']}")
+                return True
+
+        ws_module = types.ModuleType("app.core.ws")
+        ws_module.Publisher = FakePublisher
+        previous_ws = sys.modules.get("app.core.ws")
+        sys.modules["app.core.ws"] = ws_module
+
+        @asynccontextmanager
+        async def locked_operation():
+            events.append("lock:enter")
+            try:
+                yield
+            finally:
+                events.append("lock:exit")
+
+        async def scenario():
+            started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def operation():
+                async with locked_operation():
+                    started.set()
+                    await release.wait()
+                    events.append("mutation:done")
+                    return {"installed": True}
+
+            request_task = asyncio.create_task(
+                plugin._respond_with_progress(
+                    {
+                        "scriptId": self.script_id,
+                        "progressId": operation_id,
+                    },
+                    "install-runtime",
+                    "正在安装共享运行时",
+                    operation,
+                )
+            )
+            await started.wait()
+            request_task.cancel()
+            await asyncio.sleep(0)
+            progress_during = await plugin._read_progress(
+                self._request(
+                    {
+                        "scriptId": self.script_id,
+                        "operationId": operation_id,
+                    }
+                )
+            )
+            pending_after_cancel = not request_task.done()
+            release.set()
+            reraised = False
+            try:
+                await request_task
+            except asyncio.CancelledError:
+                reraised = True
+            progress = await plugin._read_progress(
+                self._request(
+                    {
+                        "scriptId": self.script_id,
+                        "operationId": operation_id,
+                    }
+                )
+            )
+            return reraised, pending_after_cancel, progress_during, progress
+
+        try:
+            reraised, pending_after_cancel, progress_during, progress = (
+                asyncio.run(scenario())
+            )
+        finally:
+            if previous_ws is None:
+                sys.modules.pop("app.core.ws", None)
+            else:
+                sys.modules["app.core.ws"] = previous_ws
+
+        self.assertTrue(reraised)
+        self.assertTrue(pending_after_cancel)
+        self.assertEqual(progress_during["data"]["status"], "running")
+        self.assertNotIn("lock:exit", events[: events.index("mutation:done")])
+        self.assertEqual(progress["code"], 200, progress)
+        self.assertEqual(progress["data"]["status"], "success")
+        self.assertLess(events.index("mutation:done"), events.index("lock:exit"))
+        self.assertLess(events.index("lock:exit"), events.index("terminal:success"))
+        self.assertEqual(events.count("terminal:success"), 2)
+
+    def test_sync_mutation_cancellation_keeps_lock_until_worker_finishes(self) -> None:
+        services = ScriptMaaFWManagedContractTest._load_services_module()
+        release = threading.Event()
+        events: list[str] = []
+
+        async def scenario():
+            loop = asyncio.get_running_loop()
+            started = asyncio.Event()
+
+            def mutation():
+                events.append("mutation:start")
+                loop.call_soon_threadsafe(started.set)
+                if not release.wait(timeout=2):
+                    raise TimeoutError("test worker was not released")
+                events.append("mutation:done")
+                return {"mutated": True}
+
+            @asynccontextmanager
+            async def locked_operation():
+                events.append("lock:enter")
+                try:
+                    yield
+                finally:
+                    events.append("lock:exit")
+
+            async def invoke():
+                async with locked_operation():
+                    return await services._invoke(
+                        mutation,
+                        (),
+                        {},
+                        "测试同步变更",
+                    )
+
+            request_task = asyncio.create_task(invoke())
+            await asyncio.wait_for(started.wait(), timeout=1)
+            request_task.cancel()
+            await asyncio.sleep(0)
+            pending_after_cancel = not request_task.done()
+            lock_held_after_cancel = "lock:exit" not in events
+            release.set()
+            reraised = False
+            try:
+                await request_task
+            except asyncio.CancelledError:
+                reraised = True
+            return reraised, pending_after_cancel, lock_held_after_cancel
+
+        reraised, pending_after_cancel, lock_held_after_cancel = asyncio.run(
+            scenario()
+        )
+
+        self.assertTrue(reraised)
+        self.assertTrue(pending_after_cancel)
+        self.assertTrue(lock_held_after_cancel)
+        self.assertLess(events.index("mutation:done"), events.index("lock:exit"))
+
+    def test_running_publish_cancellation_cannot_leak_begin_state(self) -> None:
+        plugin = self.module.Plugin(self._context())
+        operation_id = f"{self.script_id}:import-local:1:4"
+        operation_called = False
+
+        async def publish(state):
+            if state.get("status") == "running":
+                raise asyncio.CancelledError
+
+        plugin._publish_progress = publish
+
+        async def operation():
+            nonlocal operation_called
+            operation_called = True
+            return {"imported": True}
+
+        async def scenario():
+            reraised = False
+            try:
+                await plugin._respond_with_progress(
+                    {
+                        "scriptId": self.script_id,
+                        "progressId": operation_id,
+                    },
+                    "import-local",
+                    "正在导入本地项目资源",
+                    operation,
+                )
+            except asyncio.CancelledError:
+                reraised = True
+            return reraised, copy.deepcopy(plugin._progress_states[operation_id])
+
+        reraised, progress = asyncio.run(scenario())
+
+        self.assertTrue(reraised)
+        self.assertFalse(operation_called)
+        self.assertEqual(progress["status"], "error")
+        self.assertEqual(progress["message"], "操作已取消")
+
+    def test_success_terminal_survives_cancellation_during_publish(self) -> None:
+        plugin = self.module.Plugin(self._context())
+        operation_id = f"{self.script_id}:pin:1:5"
+
+        async def scenario():
+            terminal_publish_started = asyncio.Event()
+            release_terminal_publish = asyncio.Event()
+
+            async def publish(state):
+                if state.get("status") == "success":
+                    terminal_publish_started.set()
+                    await release_terminal_publish.wait()
+
+            plugin._publish_progress = publish
+
+            async def operation():
+                return {"pinned": True}
+
+            request_task = asyncio.create_task(
+                plugin._respond_with_progress(
+                    {
+                        "scriptId": self.script_id,
+                        "progressId": operation_id,
+                    },
+                    "pin",
+                    "正在固定资源",
+                    operation,
+                )
+            )
+            await terminal_publish_started.wait()
+            decided = copy.deepcopy(plugin._progress_states[operation_id])
+            request_task.cancel()
+            await asyncio.sleep(0)
+            pending_after_cancel = not request_task.done()
+            release_terminal_publish.set()
+            reraised = False
+            try:
+                await request_task
+            except asyncio.CancelledError:
+                reraised = True
+            final = copy.deepcopy(plugin._progress_states[operation_id])
+            return reraised, pending_after_cancel, decided, final
+
+        reraised, pending_after_cancel, decided, final = asyncio.run(scenario())
+
+        self.assertTrue(reraised)
+        self.assertTrue(pending_after_cancel)
+        self.assertEqual(decided["status"], "success")
+        self.assertEqual(decided["percent"], 100)
+        self.assertEqual(final["status"], "success")
+        self.assertNotEqual(final["message"], "操作已取消")
+
+    def test_remote_download_forwards_stream_progress_callback(self) -> None:
+        services = ScriptMaaFWManagedContractTest._load_services_module()
+        received: list[dict] = []
+        callback_events: list[dict] = []
+
+        class ProjectUpdate:
+            async def download_package(
+                self,
+                download_root,
+                candidate,
+                *,
+                progress=None,
+            ):
+                received.append(
+                    {
+                        "downloadRoot": download_root,
+                        "candidate": candidate,
+                        "progress": progress,
+                    }
+                )
+                assert progress is not None
+                progress(
+                    {
+                        "stage": "downloading",
+                        "downloaded_bytes": 12,
+                        "total_bytes": 24,
+                        "percent": 50,
+                    }
+                )
+                return {
+                    "path": str(ROOT / "pyproject.toml"),
+                    "size": 24,
+                }
+
+        gateway = services.ManagedServiceGateway(
+            object(),
+            object(),
+            ProjectUpdate(),
+        )
+
+        def marker(event):
+            callback_events.append(dict(event))
+
+        result = asyncio.run(
+            gateway.download_remote_package(
+                ROOT,
+                {"source": "github", "version": "1.0"},
+                progress=marker,
+            )
+        )
+
+        self.assertEqual(result["size"], 24)
+        self.assertIs(received[0]["progress"], marker)
+        self.assertEqual(callback_events[0]["downloaded_bytes"], 12)
+
+    def _fake_config(self, *, conversion_mode: str = "success"):
+        script = SimpleNamespace(
+            id=self.script_id,
+            type="MaaFW",
+            name="M9A ordinary",
+            config={
+                "Info": {
+                    "Name": "M9A ordinary",
+                    "Path": str(ROOT),
+                    "ProjectLabel": "m9a",
+                    "Controller": "ADB",
+                    "Resource": "Official",
+                },
+                "Run": {"RunTimesLimit": 3},
+            },
+        )
+        users = [
+            SimpleNamespace(
+                id=self.user_ids[0],
+                type="MaaFW",
+                name="one",
+                config={
+                    "Info": {"Name": "one", "Status": True},
+                    "Task": {"TaskSnapshot": {"daily": True}},
+                    "Data": {
+                        "LastProxyStatus": "成功",
+                        "PeriodTaskRecords": {"daily": "2026-08-02"},
+                    },
+                },
+            ),
+            SimpleNamespace(
+                id=self.user_ids[1],
+                type="MaaFW",
+                name="two",
+                config={
+                    "Info": {"Name": "two", "Status": False},
+                    "Task": {"TaskSnapshot": {"weekly": True}},
+                    "Data": {
+                        "LastProxyStatus": "失败",
+                        "PeriodTaskRecords": {"weekly": "2026-W31"},
+                    },
+                },
+            ),
+        ]
+
+        def snapshot():
+            return {
+                "script": {
+                    "id": script.id,
+                    "type": script.type,
+                    "name": script.name,
+                    "config": copy.deepcopy(script.config),
+                },
+                "userOrder": [user.id for user in users],
+                "users": {
+                    user.id: {
+                        "id": user.id,
+                        "type": user.type,
+                        "name": user.name,
+                        "config": copy.deepcopy(user.config),
+                    }
+                    for user in users
+                },
+            }
+
+        initial_snapshot = snapshot()
+
+        class FakeConfig:
+            events: list[str] = []
+
+            @classmethod
+            def script_config_transaction(cls, script_id, *, owner):
+                assert script_id == script.id
+                expected_prefix = f"maafw-managed-convert-"
+                assert owner.startswith(expected_prefix)
+                assert owner.endswith(f":{script.id}")
+                phase = (
+                    "snapshot"
+                    if "-snapshot:" in owner
+                    else "commit"
+                    if "-commit:" in owner
+                    else ""
+                )
+                assert phase
+
+                class Transaction:
+                    async def __aenter__(self):
+                        cls.events.append(f"config:{phase}:enter")
+
+                    async def __aexit__(self, exc_type, exc, traceback):
+                        del exc_type, exc, traceback
+                        cls.events.append(f"config:{phase}:exit")
+
+                return Transaction()
+
+            @classmethod
+            async def get_script_records(cls, script_id=None):
+                return [script] if script_id in (None, script.id) else []
+
+            @classmethod
+            async def get_user_records(cls, script_id, user_id=None):
+                assert script_id == script.id
+                return (
+                    users
+                    if user_id is None
+                    else [user for user in users if user.id == user_id]
+                )
+
+            @classmethod
+            async def get_plugin_script_type_conversion_snapshot(cls, script_id):
+                assert script_id == script.id
+                return snapshot()
+
+            @classmethod
+            async def convert_plugin_script_type(
+                cls,
+                script_id,
+                *,
+                source_type,
+                target_type,
+                expected_snapshot,
+                target_script_config,
+                target_user_configs,
+                journal,
+            ):
+                assert script_id == script.id
+                assert source_type == "MaaFW"
+                assert target_type == "MaaFWManaged"
+                assert expected_snapshot == initial_snapshot
+                assert journal["sourceFingerprint"] == self.module._json_hash(
+                    expected_snapshot
+                )
+                cls.events.append("convert")
+                if conversion_mode == "fail":
+                    raise RuntimeError("host rejected before commit")
+                if conversion_mode == "source_changed":
+                    error = RuntimeError("host source-current CAS rejected")
+                    error.conversion_state = "source_changed"
+                    raise error
+                if conversion_mode == "uncertain":
+                    script.type = target_type
+                    raise RuntimeError("host interrupted after replace")
+                script.type = target_type
+                script.config = copy.deepcopy(dict(target_script_config))
+                for user in users:
+                    user.type = target_type
+                    user.config = copy.deepcopy(target_user_configs[user.id])
+                return {
+                    "converted": True,
+                    "idempotent": False,
+                    "recovered": False,
+                }
+
+        FakeConfig.script = script
+        FakeConfig.users = users
+        FakeConfig.snapshot = initial_snapshot
+        return FakeConfig
+
+    def _context(self):
+        return SimpleNamespace(
+            get=lambda _key: None,
+            logger=SimpleNamespace(
+                warning=lambda *_args, **_kwargs: None,
+                error=lambda *_args, **_kwargs: None,
+            ),
+        )
+
+    @staticmethod
+    def _request(payload):
+        return SimpleNamespace(json=payload, query={})
+
+    class _Gateway:
+        def __init__(self, events):
+            self.events = events
+            self.references: list[tuple[str, str, str]] = []
+            self.releases: list[tuple[str, str, str]] = []
+            self.import_payloads: list[dict] = []
+            self.current_version = "existing"
+            self.imports = 0
+
+        @asynccontextmanager
+        async def resource_transaction(self):
+            self.events.append("resource:enter")
+            try:
+                yield
+            finally:
+                self.events.append("resource:exit")
+
+        async def load_interface(self, source_path):
+            assert source_path == str(ROOT)
+            return {"name": "m9a", "version": "1.0"}
+
+        async def import_project(self, payload):
+            self.imports += 1
+            self.import_payloads.append(copy.deepcopy(dict(payload)))
+            assert payload["projectReference"].startswith("maafw-script:")
+            if payload.get("activate", True):
+                self.current_version = "1.0"
+            return {
+                "projectId": "m9a",
+                "version": "1.0",
+                "dataPath": "C:/store/m9a/1.0",
+                "runtimeConstraint": "==5.10.4",
+                "manifest": {"projectId": "m9a", "version": "1.0"},
+            }
+
+        async def add_project_reference(self, project_id, version, reference):
+            self.references.append((project_id, version, reference))
+
+        async def release_project_reference(self, project_id, version, reference):
+            self.releases.append((project_id, version, reference))
 
 
 def _deep_merge(target: dict, update: dict) -> None:

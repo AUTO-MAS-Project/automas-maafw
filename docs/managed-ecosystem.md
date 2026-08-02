@@ -2,13 +2,14 @@
 
 ## 目标
 
-`MaaFWManaged` 用 AUTO-MAS 的声明式脚本编辑器替代项目自带的
-MFAAvalonia、MXU、MFW 等 UI 壳。项目导入后只保存 ProjectInterface、资源
+内部的 `MaaFWManaged` 用 AUTO-MAS 的统一 MaaFW Vue 编辑页和资源管理器替代
+项目自带的 MFAAvalonia、MXU、MFW 等 UI 壳。项目导入后只保存 ProjectInterface、资源
 Bundle、Agent 和无法安全重建的项目文件；MaaFW 与 Python 依赖由共享运行时池
 按版本解析。
 
-原型不改变现有 `MaaFW` 类型。后者继续面向用户自行维护的完整项目目录；
-`MaaFWManaged` 面向由 AUTO-MAS 管理安装、更新、切换和回收的项目版本。
+用户创建时只看到一个 `MaaFW` 类型。它默认直接运行用户自行维护的完整项目目录；
+用户确认后可保持原 script/user UUID 与配置，原地转成由 AUTO-MAS 管理安装、
+更新、切换和回收项目版本的内部 `MaaFWManaged` provider。
 
 ## 三层职责
 
@@ -23,10 +24,14 @@ Bundle、Agent 和无法安全重建的项目文件；MaaFW 与 Python 依赖由
    - 安装后记录 `pip freeze --all` 的 `resolvedRequirements` 供审计。
    - 管理引用、运行租约、固定、显式删除和带宽限期的 GC。
 3. `MaaFWManaged`
-   - 通过 `ScriptAdapterDefinition` 注册，使用宿主通用 SchemaForm，不增加 Vue
-     页面或宿主类型分支。
+   - 通过 `ScriptAdapterDefinition` 注册为不可创建类型，并复用普通 MaaFW 的
+     Vue editor；创建向导和项目列表仍只暴露一个 MaaFW 入口。
+   - 先用短宿主事务读取转换快照，释放全局配置锁后导入资源，再在资源锁内用第二个
+     短事务调用原子换型 API；不通过新增/删除脚本模拟转换。
    - 运行前解析项目版本及 runtime binding，再复用现有 MaaFW hooks、runner、
      controller 和 Agent 环境服务。
+   - 统一资源管理动作提供 HTTP 轮询与 WebSocket 双通道阶段进度；远程下载透传真实
+     字节数，Project Store/Runtime Pool 只报告可验证的外层事务边界。
 
 ## 资源投影边界
 
@@ -107,9 +112,8 @@ binding 对账 `maafw-project:*` runtime 引用。GC 默认先提供 dry-run 结
 
 ## 首版限制
 
-- 声明式编辑器可以承载导入、列出/切换版本、更新、删除、固定和 GC 动作，但目前不能在
-  不改宿主的情况下复刻 MaaFW 专用页面的动态层级任务预览；首版继续持久化
-  `TaskSnapshot` JSON。
+- 统一资源管理器承载导入、列出/切换版本、更新、删除、固定和 GC；任务配置仍由
+  MaaFW Vue 编辑器保存 `TaskSnapshot` JSON。
 - 远程目录发现与发行包下载继续复用 `maafw.project_update.v1`，Project Store
   负责对下载完成的目录做安全投影和版本提交。
 - Runner 会在托管 `dataPath` 下重新创建 `debug/`、`logs/`、`temp/` 并写入

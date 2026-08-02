@@ -62,7 +62,7 @@ class Plugin:
 | `automas-maafw-runtime-pool` | 0.1.4 | `maafw.runtime_pool.v1` | 按 requirement selector 隔离环境并通过 uv cache/hardlink 复用依赖 |
 | `automas-maafw-runner` | 0.3.4 | `maafw.runner.v1` | 运行计划、worker job、runtime 路由、环境预热和结果模型 |
 | `automas-script-maafw` | 0.1.10 | `maafw.registry.v1`、`maafw.configuration_reuse.v1` | MaaFW 脚本适配、能力注册、原生配置导入和用户复制 |
-| `automas-script-maafw-managed` | 0.2.0 | 无 | 声明式本地/远程资源管理、运行绑定与 pack 升级计划 |
+| `automas-script-maafw-managed` | 0.2.0 | 无 | 单一 MaaFW 入口的原地托管转换、本地/远程资源管理、运行绑定与 pack 升级计划 |
 | `automas-script-maafw-pack-m9a` | 0.1.4 | `maafw.pack.m9a.v1` | M9A 默认约定、资源 profile/升级规划和通知翻译 |
 | `automas-m9a` | 0.1.4 | 无 | 聚合安装上述 MaaFW/M9A 插件 |
 
@@ -1394,7 +1394,40 @@ async with project_store.resource_lifecycle_transaction():
     await collect_garbage(dry_run=False)
 ```
 
-### 15.1 `MaaFWManaged` 资源升级事务
+### 15.1 普通 MaaFW 原地转换
+
+`GET`/`POST /plugin/maafw-managed/capabilities` 不需要 `scriptId`，返回
+`apiVersion`、`distributionVersion` 和宿主门控的 `features`。只有宿主同时
+提供 storage 态快照和原子换型 API 时，`inPlaceConversion` 才为 `true`。
+
+`POST /plugin/maafw-managed/convert` 只接受现存普通 `MaaFW` 的 `scriptId`，
+项目目录从该记录的权威 `Info.Path` 读取，不能由 HTTP payload 改写。插件先在短
+`Config.script_config_transaction()` 中读取 source storage 快照并释放宿主全局写锁，
+再按“Project Store 资源生命周期锁 → 单脚本锁”进入资源阶段，短暂复核 snapshot
+未变化后完成 interface 识别、非活动的不可变导入和稳定引用
+`maafw-script:<scriptId>`；转换不会改写 Project Store 的全局 current，托管绑定始终
+使用记录中的确切 projectId/version。进入任何 interface 读取或导入前，转换还必须
+取得普通 MaaFW 运行/准备/更新共用的 source path fail-fast 预留；冲突则拒绝转换，
+并在资源导入、配置提交或补偿完成后才释放；
+最终只在上述资源锁内取得第二个短宿主事务并调用
+`Config.convert_plugin_script_type()` 原地替换整条宿主记录；禁止通过 add/delete
+或复制脚本模拟转换。
+
+宿主以加密 storage 快照做 CAS，并在一次原子 `ScriptConfig.json` replace 中更新
+父记录和全部用户的 `PluginTypeKey`/目标配置。脚本 UUID、用户 UUID/order、名称、
+普通 MaaFW 用户配置和运行历史保持不变。journal 只保存 operationId、hash、项目
+身份和 `project_imported`/`committed` 状态，不保存解密后的用户配置；确切目标
+storage artifact 由宿主整体加密保护。operationId 同时绑定 source snapshot 与目标
+projectId/version/runtimeConstraint：相同目标重试复用完全相同的 storage artifact，
+改变目标身份则得到不同 operationId。明确未提交的失败会释放项目引用；提交结果
+不确定时保留引用与 journal，供同一 operationId 幂等恢复。缺少任一宿主原语时
+capability 为 false，转换动作失败关闭。
+
+`MaaFWManaged` provider 自身标记为 `creatable=false`，不出现在创建/复制入口；
+其 `editor_kind` 复用 `plugin:automas_script_maafw`，因此托管前后仍进入同一个 MaaFW
+Vue 编辑页和统一资源管理器。
+
+### 15.2 `MaaFWManaged` 资源升级事务
 
 `ImportProjectId` 只用于首次导入，成功绑定后清空。`ProjectId` 和 `Version`
 由 Project Store 写入并在配置页只读展示。绑定后的运行、升级校验、运行时安装
@@ -1413,6 +1446,26 @@ async with project_store.resource_lifecycle_transaction():
 因宿主深合并保留旧键。`applying`/`committing` 等中断状态会阻断运行，并在插件
 启动或再次应用时恢复源版本和源配置。规划错误、人工动作、CAS 失配或回滚失败
 都不会把目标版本报告为已生效。
+
+### 15.3 统一管理动作进度
+
+当 capability `features.operationProgress=true` 时，统一资源管理器的 convert、
+本地/远程导入与升级、版本切换/应用/取消、runtime 安装/删除、项目版本删除、pin 和
+GC 动作必须携带新的 `progressId`。`POST /plugin/maafw-managed/progress` 使用
+`{scriptId, operationId}` 读取有界内存快照；二者必须与创建操作时完全匹配，禁止
+跨脚本读取或复用已用 ID。
+
+进度 DTO 至少包含 `operationId`、`scriptId`、`operation`、`status`、`stage`、
+`message`、`percent`、`downloadedBytes`、`totalBytes` 和有界 `logs`。相同快照以
+`maafw.managed.progress` 类型 best-effort 发布到 `id=scriptId` 与
+`id=operationId` 两个 WebSocket 通道；断线或 Publisher 不可用不得影响资源事务。
+远程下载百分比映射为完整操作的子区间，并透传下载器真实字节数；没有内部回调的
+Project Store/Runtime Pool 只发布真实阶段边界。外层操作在全部资源/配置锁退出后
+恰好写入一次 `success` 或 `error` 终态，迟到的内部回调不能覆盖终态。请求 task
+被取消时不得提前释放锁：同步线程 mutation 与受保护的 inner operation 都必须真正
+结束（包括转换提交/补偿），再按真实结果写入终态并向上重抛 `CancelledError`。因此
+请求取消后实际成功的动作仍是 `success`；只有 inner operation 自身被取消时才写入
+“操作已取消”的 `error`，且缓存不能永久留在 `running`。
 
 ## 16. `maafw.runtime_pool.v1`
 
@@ -1498,15 +1551,20 @@ Controller 与 Tasker 前加载这些目录；任一路径越出项目根、缺�
 `MaaFWManaged` 在实际 GC 前从全部脚本配置对账 `maafw-script:*` 项目引用，并从
 现存项目 binding 对账 `maafw-project:*` runtime 引用。dry-run 不删除任何目录，
 但也会修正项目引用 manifest。当前项目版本始终受保护；应先切换到其他版本，再
-删除旧版本。声明式动作同时提供项目版本和 runtime 列表，便于在通用 SchemaForm
-内完成选择、切换与删除。HTTP 动作与运行 Hooks 通过同一个 Project Store 服务
+删除旧版本。资源动作同时提供项目版本和 runtime 列表，供统一 MaaFW 资源管理器
+完成选择、切换与删除。HTTP 动作与运行 Hooks 通过同一个 Project Store 服务
 实例共享资源生命周期事务；各路径按需取得锁时，顺序固定为“资源生命周期 →
 单脚本升级 → 宿主配置事务 → 运行锁”，因此引用快照、对账和回收不会与
-stage/apply/prepare 交错。
+stage/apply/prepare 交错。原地转换的只读 source snapshot 是特例：它先单独取得并
+释放短宿主事务，随后资源导入与最终 CAS 提交仍严格按“资源生命周期 → 宿主配置”
+顺序执行，且不会在全局配置锁内做 Project Store I/O。
 Managed 0.2.0 在 Project Store 缺少该 Python 协调接口时失败关闭，不提供无锁
 兼容路径；它同时要求宿主提供 `Config.script_config_transaction()`、
 `Config.script_config_write_scope()` 和 ScriptConfigStore
-`write_transaction()`，宿主事务改动合入前不得启用或发布。
+`write_transaction()`。原地转换还要求
+`Config.get_plugin_script_type_conversion_snapshot()` 与
+`Config.convert_plugin_script_type()`；宿主事务和原子换型改动合入前不得启用或
+发布。
 
 Managed 的远程检查把“发现新版本”与“存在可安装候选”分开；只有候选带有效
 下载地址时才允许导入/升级。下载发生在宿主配置事务之外，校验后的本地 ZIP 再

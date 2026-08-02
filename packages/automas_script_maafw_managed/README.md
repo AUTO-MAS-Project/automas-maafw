@@ -1,8 +1,23 @@
 # automas-script-maafw-managed
 
-Declarative AUTO-MAS script adapter for resource-only, versioned MaaFW
-projects. It registers `MaaFWManaged` through the host's generic schema editor,
-without a project-specific Vue page.
+AUTO-MAS script adapter for resource-only, versioned MaaFW projects. The
+internal `MaaFWManaged` provider is conversion-only: it is hidden from normal
+script creation and reuses the ordinary MaaFW Vue editor. Users keep one MaaFW
+entry and opt into managed resources from that project's wizard or resource
+manager.
+
+`GET`/`POST /plugin/maafw-managed/capabilities` is script-independent and
+reports the plugin API/distribution versions plus host-gated feature flags.
+`POST /plugin/maafw-managed/convert` converts an existing ordinary `MaaFW`
+record in place. It reads the authoritative `Info.Path`, imports that directory
+into Project Store, and binds the stable `maafw-script:<scriptId>` reference.
+The script UUID, every user UUID/order/config and user run history are retained;
+the action never adds, copies or deletes a script record. Conversion imports
+the immutable version with `activate=false`, so either a failed CAS or a
+successful per-script binding leaves Project Store's global current untouched.
+It also holds the ordinary MaaFW process-wide source-path reservation across
+inspection, import, commit and compensation, and fails fast while that path is
+running, preparing or updating.
 
 The adapter resolves an immutable Project Store version, routes it to a shared
 runtime selector, persists the exact runtime binding, and delegates execution
@@ -13,6 +28,18 @@ Remote archives are validated without overwriting the active project, then
 passed to Project Store through the same immutable import and confirmation
 workflow. Actions also cover capability inspection, version listing/switching,
 project/runtime deletion, pinning and garbage collection.
+
+When `features.operationProgress=true`, every mutating manager action accepts a
+fresh `progressId`. `POST /plugin/maafw-managed/progress` polls the bounded
+in-memory state by the exact `scriptId` + `operationId` pair, while best-effort
+`maafw.managed.progress` WebSocket events are published to both IDs. Remote
+downloads forward the updater's real byte counts; Project Store and Runtime
+Pool operations report only truthful transaction-stage boundaries. A terminal
+`success` or `error` state is published once, after operation locks have exited.
+Request cancellation is deferred until any worker-thread mutation and protected
+inner operation (including commit/compensation) has really finished. Progress
+then records that real result—so a mutation that completed remains `success`—
+before `CancelledError` is re-raised to the caller.
 
 `ImportProjectId` is a first-import input only and is cleared after a successful
 bind. The displayed `ProjectId` and `Version` are read-only. Once bound,
@@ -49,5 +76,20 @@ instead of falling back to an unlocked older service.
 
 It also requires an AUTO-MAS host that provides
 `Config.script_config_transaction()`, `Config.script_config_write_scope()` and
-the ScriptConfigStore `write_transaction()` API. Do not enable or publish
-Managed 0.2.0 for a host before that host transaction change is merged.
+the ScriptConfigStore `write_transaction()` API. In-place conversion additionally
+requires `Config.get_plugin_script_type_conversion_snapshot()` and
+`Config.convert_plugin_script_type()`. Conversion first takes a short host
+transaction to capture the source snapshot, releases the global config gate,
+then enters Project Store lifecycle → per-script locking, rechecks that snapshot,
+and imports. Only the final CAS commit takes a second short host transaction
+while those locks are held. The host
+performs one atomic replacement of the complete script record and protects an
+exact target-storage recovery artifact, while a non-sensitive durable journal
+records `project_imported` and `committed` states. The deterministic operation ID
+includes the source snapshot plus target project/version/runtime identity, so an
+exact retry reuses the artifact but a changed target cannot do so accidentally.
+Failures known to be pre-commit release the project reference; uncertain commit
+states retain the reference for idempotent recovery. Hosts without both
+conversion methods report `inPlaceConversion=false` and the convert action fails
+closed. Do not enable or publish Managed 0.2.0 before these host transaction and
+conversion changes are merged.

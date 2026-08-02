@@ -15,8 +15,9 @@ AUTO-MAS 的通用 MaaFW 插件工作区。仓库统一维护共享运行栈，�
 - `automas-script-maafw`
 - `automas-script-maafw-managed`
 
-`automas-script-maafw-managed` 提供宿主无专用前端登记的
-`MaaFWManaged` 脚本类型。项目发行包会被投影为版本化的脚本资源 Bundle，
+`automas-script-maafw-managed` 在内部保留不可直接创建的 `MaaFWManaged`
+脚本类型，并复用普通 MaaFW 的 Vue 编辑器。用户只从一个 MaaFW 入口创建项目，
+再按需把现有普通项目原地转换为托管项目。项目发行包会被投影为版本化的脚本资源 Bundle，
 不保留第三方 UI、内置 MaaFW runtime、嵌入式 Python 和可重建缓存；执行时再按
 项目依赖清单路由到共享的 MaaFW runtime 环境。原有 `MaaFW` 脚本类型仍可用于
 直接运行用户自行维护的完整项目目录。
@@ -44,8 +45,10 @@ trusted publisher。
 普通 MaaFW 脚本 0.1.10 的配置导入/用户复制与 Managed 0.2.0 都要求目标
 AUTO-MAS `dev_v2` 已提供
 `Config.script_config_transaction()`、`Config.script_config_write_scope()` 和
-ScriptConfigStore 的 `write_transaction()`；宿主事务改动合入前不得发布或启用
-这两个版本的新事务能力。M9A 的最低依赖必须对齐
+ScriptConfigStore 的 `write_transaction()`。Managed 原地转换还要求宿主提供
+`Config.get_plugin_script_type_conversion_snapshot()` 和
+`Config.convert_plugin_script_type()`；宿主事务与原子换型改动合入前不得发布或
+启用这两个版本的新事务能力。M9A 的最低依赖必须对齐
 `automas-maafw-runner>=0.3.4`、`automas-script-maafw>=0.1.10`，不要因本轮功能
 把普通脚本包错误提升到 0.2.0。
 

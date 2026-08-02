@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib.metadata as importlib_metadata
 import inspect
 import json
+import math
+import re
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -15,6 +19,10 @@ from app.plugins import (
     PluginHttpRequest,
     ScriptAdapterDefinition,
     ScriptAdapterPlugin,
+)
+from automas_script_maafw.project_path import (
+    release_project_path,
+    try_reserve_project_path,
 )
 
 from .adapter import MaaFWManagedAdapterHooks
@@ -48,6 +56,17 @@ schema = {
 
 _PENDING_KIND = "maafw.managed-upgrade-pending"
 _USER_PENDING_KIND = "maafw.managed-user-upgrade-pending"
+_CONVERSION_KIND = "maafw.managed-conversion"
+_CONVERSION_API_VERSION = "maafw-managed.v1"
+_DISTRIBUTION_NAME = "automas-script-maafw-managed"
+_DISTRIBUTION_VERSION_FALLBACK = "0.2.0"
+_SOURCE_TYPE = "MaaFW"
+_TARGET_TYPE = "MaaFWManaged"
+_PROGRESS_EVENT_TYPE = "maafw.managed.progress"
+_PROGRESS_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,200}$")
+_PROGRESS_MAX_STATES = 128
+_PROGRESS_MAX_LOGS = 80
+_PROGRESS_TERMINAL_STATES = frozenset({"success", "error"})
 _INTERRUPTED_STATES = {
     "applying",
     "committing",
@@ -82,6 +101,15 @@ class Plugin(ScriptAdapterPlugin):
     def __init__(self, ctx: Any) -> None:
         super().__init__(ctx)
         self._upgrade_locks: dict[str, asyncio.Lock] = {}
+        self._progress_states: dict[str, dict[str, Any]] = {}
+        self._progress_lock = asyncio.Lock()
+        self._progress_tasks: set[asyncio.Task[None]] = set()
+        self._progress_context: ContextVar[dict[str, str] | None] = (
+            ContextVar(
+                f"maafw_managed_progress_{id(self)}",
+                default=None,
+            )
+        )
 
     def _upgrade_lock(self, script_id: str) -> asyncio.Lock:
         lock = self._upgrade_locks.get(script_id)
@@ -133,7 +161,7 @@ class Plugin(ScriptAdapterPlugin):
                 supported_modes=("AutoProxy",),
                 icon="MaaFW",
                 icon_path="automas_script_maafw:assets/maafw.png",
-                editor_kind="schema",
+                editor_kind="plugin:automas_script_maafw",
                 # MaaFWManaged 是 v6 新增类型，没有 r6 遗留配置需要兼容。
                 # 声明 legacy MaaFWConfig/MaaFWUserConfig 会与 automas_script_maafw
                 # 抢占宿主注册表里同一个 legacy 键：后注册者静默覆盖先注册者，
@@ -144,7 +172,9 @@ class Plugin(ScriptAdapterPlugin):
                     "source": "automas_script_maafw_managed",
                     "resource_model": "project-store",
                     "declarative": True,
-                    "create_group": "general",
+                    "creatable": False,
+                    "create_mode": "convert-only",
+                    "editor_reuse_type": "MaaFW",
                     "m9a_standalone": False,
                 },
             )
@@ -152,6 +182,21 @@ class Plugin(ScriptAdapterPlugin):
 
     async def on_start(self) -> None:
         await super().on_start()
+        self.ctx.server.http(
+            "/maafw-managed/capabilities",
+            self._capabilities,
+            methods=("GET", "POST"),
+        )
+        self.ctx.server.http(
+            "/maafw-managed/progress",
+            self._read_progress,
+            methods=("POST",),
+        )
+        self.ctx.server.http(
+            "/maafw-managed/convert",
+            self._convert_project,
+            methods=("POST",),
+        )
         self.ctx.server.http(
             "/maafw-managed/remote/check",
             self._check_remote_project,
@@ -235,6 +280,750 @@ class Plugin(ScriptAdapterPlugin):
         await self._recover_interrupted_upgrades()
         await self._repair_upgrade_artifacts_on_start()
 
+    async def _capabilities(
+        self,
+        _request: PluginHttpRequest,
+    ) -> dict[str, Any]:
+        return {
+            "code": 200,
+            "status": "success",
+            "data": _managed_capabilities(),
+        }
+
+    async def _read_progress(
+        self,
+        request: PluginHttpRequest,
+    ) -> dict[str, Any]:
+        payload = _payload(request)
+        try:
+            script_id = _required_script_id(payload)
+            operation_id = _required_progress_id(payload)
+        except ManagedServiceError as exc:
+            return {
+                "code": 400,
+                "status": "error",
+                "message": str(exc),
+            }
+        async with self._progress_lock:
+            state = self._progress_states.get(operation_id)
+            if state is None or state.get("scriptId") != script_id:
+                return {
+                    "code": 404,
+                    "status": "error",
+                    "message": "未找到与该脚本匹配的 MaaFW 托管操作进度",
+                }
+            snapshot = _json_clone(state)
+        return {
+            "code": 200,
+            "status": "success",
+            "data": snapshot,
+        }
+
+    async def _begin_progress(
+        self,
+        payload: Mapping[str, Any],
+        operation: str,
+        message: str,
+    ) -> dict[str, str]:
+        script_id = _required_script_id(payload)
+        operation_id = _required_progress_id(payload, required=False)
+        if not operation_id:
+            operation_id = str(uuid.uuid4())
+        now = datetime.now(timezone.utc).isoformat()
+        state: dict[str, Any] = {
+            "operationId": operation_id,
+            "scriptId": script_id,
+            "operation": operation,
+            "status": "running",
+            "stage": "queued",
+            "message": message,
+            "percent": 0,
+            "downloadedBytes": None,
+            "totalBytes": None,
+            "logs": [message] if message else [],
+            "createdAt": now,
+            "updatedAt": now,
+        }
+        async with self._progress_lock:
+            if operation_id in self._progress_states:
+                raise ManagedServiceError(
+                    "progressId 已被使用；每次操作必须使用新的 progressId"
+                )
+            if len(self._progress_states) >= _PROGRESS_MAX_STATES:
+                terminal_id = next(
+                    (
+                        key
+                        for key, item in self._progress_states.items()
+                        if item.get("status") in _PROGRESS_TERMINAL_STATES
+                    ),
+                    None,
+                )
+                if terminal_id is None:
+                    raise ManagedServiceError(
+                        "MaaFW 托管操作过多，请等待正在执行的操作完成"
+                    )
+                self._progress_states.pop(terminal_id)
+            self._progress_states[operation_id] = state
+        return {
+            "operationId": operation_id,
+            "scriptId": script_id,
+            "operation": operation,
+        }
+
+    async def _progress_stage(
+        self,
+        stage: str,
+        message: str,
+        *,
+        percent: float | int | None = None,
+        downloaded_bytes: int | None = None,
+        total_bytes: int | None = None,
+        context: Mapping[str, str] | None = None,
+    ) -> None:
+        progress = dict(context or self._progress_context.get() or {})
+        operation_id = str(progress.get("operationId") or "")
+        script_id = str(progress.get("scriptId") or "")
+        if not operation_id or not script_id:
+            return
+        async with self._progress_lock:
+            state = self._progress_states.get(operation_id)
+            if (
+                state is None
+                or state.get("scriptId") != script_id
+                or state.get("status") in _PROGRESS_TERMINAL_STATES
+            ):
+                return
+            next_percent = _progress_number(percent)
+            current_percent = _progress_number(state.get("percent"))
+            if (
+                next_percent is not None
+                and current_percent is not None
+                and next_percent < current_percent
+            ):
+                return
+            state["stage"] = str(stage or state.get("stage") or "running")
+            if message:
+                state["message"] = message
+                logs = list(state.get("logs") or [])
+                if not logs or logs[-1] != message:
+                    logs.append(message)
+                state["logs"] = logs[-_PROGRESS_MAX_LOGS:]
+            if next_percent is not None:
+                state["percent"] = min(99.0, max(0.0, next_percent))
+            if downloaded_bytes is not None:
+                state["downloadedBytes"] = max(0, int(downloaded_bytes))
+            if total_bytes is not None:
+                state["totalBytes"] = max(0, int(total_bytes))
+            state["updatedAt"] = datetime.now(timezone.utc).isoformat()
+            snapshot = _json_clone(state)
+        await self._publish_progress(snapshot)
+
+    async def _finish_progress(
+        self,
+        progress: Mapping[str, str],
+        status: str,
+        message: str,
+    ) -> None:
+        if status not in _PROGRESS_TERMINAL_STATES:
+            raise ValueError(f"invalid progress terminal state: {status}")
+        operation_id = str(progress.get("operationId") or "")
+        script_id = str(progress.get("scriptId") or "")
+        async with self._progress_lock:
+            state = self._progress_states.get(operation_id)
+            if (
+                state is None
+                or state.get("scriptId") != script_id
+                or state.get("status") in _PROGRESS_TERMINAL_STATES
+            ):
+                return
+            state["status"] = status
+            state["stage"] = "completed" if status == "success" else "failed"
+            state["message"] = message
+            if status == "success":
+                state["percent"] = 100
+            logs = list(state.get("logs") or [])
+            if message and (not logs or logs[-1] != message):
+                logs.append(message)
+            state["logs"] = logs[-_PROGRESS_MAX_LOGS:]
+            state["updatedAt"] = datetime.now(timezone.utc).isoformat()
+            snapshot = _json_clone(state)
+        await self._publish_progress(snapshot)
+
+    @staticmethod
+    async def _publish_progress(state: Mapping[str, Any]) -> None:
+        try:
+            from app.core.ws import Publisher
+        except Exception:
+            return
+        identifiers = {
+            str(state.get("scriptId") or ""),
+            str(state.get("operationId") or ""),
+        }
+        for identifier in identifiers:
+            if not identifier:
+                continue
+            try:
+                await Publisher.send(
+                    id=identifier,
+                    type=_PROGRESS_EVENT_TYPE,
+                    data=state,
+                )
+            except Exception:
+                # Progress is observational.  A disconnected or older host
+                # must never abort a resource/configuration transaction.
+                continue
+
+    def _download_progress_callback(
+        self,
+        *,
+        start_percent: float = 15.0,
+        end_percent: float = 65.0,
+    ) -> Callable[[Mapping[str, Any]], None] | None:
+        progress = self._progress_context.get()
+        if progress is None:
+            return None
+        captured = dict(progress)
+        loop = asyncio.get_running_loop()
+
+        def report(event: Mapping[str, Any]) -> None:
+            if not isinstance(event, Mapping):
+                return
+            raw = dict(event)
+            raw_percent = _progress_number(raw.get("percent"))
+            mapped_percent = start_percent
+            if raw_percent is not None:
+                mapped_percent += (
+                    min(100.0, max(0.0, raw_percent))
+                    * (end_percent - start_percent)
+                    / 100.0
+                )
+            stage = str(raw.get("stage") or "downloading")
+            message = str(raw.get("message") or "").strip()
+            if not message:
+                message = (
+                    "正在校验远程 MaaFW 资源包"
+                    if stage == "validating"
+                    else "正在下载远程 MaaFW 资源包"
+                )
+            downloaded = _progress_int(
+                raw.get("downloadedBytes", raw.get("downloaded_bytes"))
+            )
+            total = _progress_int(
+                raw.get("totalBytes", raw.get("total_bytes"))
+            )
+
+            def schedule() -> None:
+                task = asyncio.create_task(
+                    self._progress_stage(
+                        f"download:{stage}",
+                        message,
+                        percent=mapped_percent,
+                        downloaded_bytes=downloaded,
+                        total_bytes=total,
+                        context=captured,
+                    )
+                )
+                self._progress_tasks.add(task)
+                task.add_done_callback(self._progress_tasks.discard)
+
+            try:
+                loop.call_soon_threadsafe(schedule)
+            except RuntimeError:
+                return
+
+        return report
+
+    async def _flush_progress_updates(self) -> None:
+        # A synchronous downloader callback may arrive from another thread.
+        # Yield once so call_soon_threadsafe can materialize its task, then
+        # drain only the plugin's observational progress tasks.
+        await asyncio.sleep(0)
+        pending = tuple(self._progress_tasks)
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    @staticmethod
+    async def _wait_for_progress_task(task: asyncio.Task[Any]) -> bool:
+        """Wait for a protected operation while remembering request cancellation."""
+
+        cancellation_requested = False
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cancellation_requested = True
+            except Exception:
+                # The caller inspects task.result() after the task is done so
+                # it can derive the authoritative progress terminal state.
+                pass
+        return cancellation_requested
+
+    async def _respond_with_progress(
+        self,
+        payload: Mapping[str, Any],
+        operation_name: str,
+        initial_message: str,
+        operation: Callable[[], Awaitable[Any]],
+    ) -> dict[str, Any]:
+        try:
+            progress = await self._begin_progress(
+                payload,
+                operation_name,
+                initial_message,
+            )
+        except ManagedServiceError as exc:
+            return {
+                "code": 400,
+                "status": "error",
+                "message": str(exc),
+            }
+
+        token = self._progress_context.set(progress)
+        terminal_status = "success"
+        terminal_message = "操作已完成"
+        cancellation_requested = False
+
+        async def run_operation() -> Any:
+            await self._progress_stage(
+                "running",
+                initial_message,
+                percent=5,
+            )
+            return await operation()
+
+        operation_task = asyncio.create_task(run_operation())
+        try:
+            cancellation_requested = await self._wait_for_progress_task(
+                operation_task
+            )
+            data = operation_task.result()
+            response = {
+                "code": 200,
+                "status": "success",
+                "data": data,
+            }
+        except asyncio.CancelledError:
+            terminal_status = "error"
+            terminal_message = "操作已取消"
+            cancellation_requested = True
+        except ManagedServiceError as exc:
+            terminal_status = "error"
+            terminal_message = str(exc)
+            response = {
+                "code": 400,
+                "status": "error",
+                "message": terminal_message,
+            }
+        except Exception as exc:
+            terminal_status = "error"
+            terminal_message = f"托管 MaaFW 动作执行失败：{exc}"
+            response = {
+                "code": 500,
+                "status": "error",
+                "message": terminal_message,
+            }
+        finally:
+            self._progress_context.reset(token)
+            finish_task = asyncio.create_task(
+                self._finish_progress(
+                    progress,
+                    terminal_status,
+                    terminal_message,
+                )
+            )
+            cancellation_requested = (
+                await self._wait_for_progress_task(finish_task)
+                or cancellation_requested
+            )
+            try:
+                finish_task.result()
+            except asyncio.CancelledError:
+                cancellation_requested = True
+        if cancellation_requested:
+            raise asyncio.CancelledError
+        return response
+
+    async def _convert_project(
+        self,
+        request: PluginHttpRequest,
+    ) -> dict[str, Any]:
+        payload = _payload(request)
+        return await self._respond_with_progress(
+            payload,
+            "convert",
+            "正在转换为托管项目",
+            lambda: self._convert_project_request(payload),
+        )
+
+    async def _convert_project_request(
+        self,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        script_id = _required_script_id(payload)
+        await self._progress_stage(
+            "locking",
+            "正在锁定项目资源与脚本配置",
+            percent=5,
+        )
+        snapshot_reader = getattr(
+            Config,
+            "get_plugin_script_type_conversion_snapshot",
+            None,
+        )
+        converter = getattr(Config, "convert_plugin_script_type", None)
+        if not callable(snapshot_reader) or not callable(converter):
+            raise ManagedServiceError(
+                "当前 AUTO-MAS 宿主不支持原子脚本类型转换；"
+                "请升级到同时提供 "
+                "Config.get_plugin_script_type_conversion_snapshot() 和 "
+                "Config.convert_plugin_script_type() 的版本。"
+            )
+
+        await self._progress_stage(
+            "snapshot",
+            "正在读取脚本与用户配置快照",
+            percent=10,
+        )
+        async with Config.script_config_transaction(
+            script_id,
+            owner=f"maafw-managed-convert-snapshot:{script_id}",
+        ):
+            records = await Config.get_script_records(script_id)
+            if len(records) != 1:
+                raise ManagedServiceError(
+                    f"scriptId {script_id} 不是唯一脚本"
+                )
+            record = records[0]
+            source_type = str(
+                _record_field(record, "type") or ""
+            ).strip()
+            if source_type == _TARGET_TYPE:
+                await self._progress_stage(
+                    "validating",
+                    "正在核验已完成的托管转换",
+                    percent=90,
+                )
+                return await _committed_conversion_response(
+                    record,
+                    script_id,
+                )
+            if source_type != _SOURCE_TYPE:
+                raise ManagedServiceError(
+                    f"scriptId {script_id} 不是普通 MaaFW 脚本，拒绝转换"
+                )
+
+            raw_snapshot = snapshot_reader(script_id)
+            if inspect.isawaitable(raw_snapshot):
+                raw_snapshot = await raw_snapshot
+            snapshot = _validate_conversion_snapshot(
+                raw_snapshot,
+                script_id,
+            )
+            if _snapshot_script_type(snapshot) != _SOURCE_TYPE:
+                raise ManagedServiceError(
+                    "宿主转换快照中的 source type 不是 MaaFW，拒绝导入资源"
+                )
+
+            source_config = _conversion_form_config(
+                _record_config(record, f"脚本 {script_id}"),
+                virtual_name="script_name",
+            )
+            source_info = _mapping(source_config.get("Info"))
+            source_path = str(source_info.get("Path") or "").strip()
+            if not source_path:
+                raise ManagedServiceError(
+                    "普通 MaaFW 脚本没有配置 Info.Path"
+                )
+            if not Path(source_path).is_dir():
+                raise ManagedServiceError(
+                    f"普通 MaaFW 项目目录不存在或不可读：{source_path}"
+                )
+
+            user_records = await Config.get_user_records(script_id)
+            target_user_configs = _conversion_user_configs(
+                snapshot,
+                user_records,
+            )
+
+        project_reservation = await try_reserve_project_path(source_path)
+        if project_reservation is None:
+            raise ManagedServiceError(
+                "MaaFW 项目正在运行、准备或更新，暂不能转换；请稍后重试"
+            )
+        try:
+            gateway = self._gateway()
+            async with gateway.resource_transaction():
+                async with self._upgrade_lock(script_id):
+                    current_snapshot = snapshot_reader(script_id)
+                    if inspect.isawaitable(current_snapshot):
+                        current_snapshot = await current_snapshot
+                    current_snapshot = _validate_conversion_snapshot(
+                        current_snapshot,
+                        script_id,
+                    )
+                    if current_snapshot != snapshot:
+                        raise ManagedServiceError(
+                            "脚本或用户配置在资源导入前已变化，请刷新后重试"
+                        )
+                    return await self._convert_project_locked(
+                        script_id,
+                        payload,
+                        snapshot=snapshot,
+                        source_config=source_config,
+                        source_path=source_path,
+                        target_user_configs=target_user_configs,
+                        snapshot_reader=snapshot_reader,
+                        converter=converter,
+                        gateway=gateway,
+                    )
+        finally:
+            await release_project_path(project_reservation)
+
+    async def _convert_project_locked(
+        self,
+        script_id: str,
+        payload: Mapping[str, Any],
+        *,
+        snapshot: Mapping[str, Any],
+        source_config: Mapping[str, Any],
+        source_path: str,
+        target_user_configs: Mapping[str, Mapping[str, Any]],
+        snapshot_reader: Callable[..., Any],
+        converter: Callable[..., Any],
+        gateway: ManagedServiceGateway,
+    ) -> dict[str, Any]:
+        source_info = _mapping(source_config.get("Info"))
+        await self._progress_stage(
+            "project-inspection",
+            "正在识别 MaaFW 项目身份",
+            percent=20,
+        )
+        interface = await gateway.load_interface(source_path)
+        project_id = _conversion_project_id(
+            payload,
+            source_info,
+            interface,
+            source_path,
+        )
+        version = str(
+            payload.get("version") or interface.get("version") or ""
+        ).strip()
+        reference = f"maafw-script:{script_id}"
+        import_payload = {
+            "sourcePath": source_path,
+            "projectId": project_id,
+            "version": version,
+            "activate": False,
+            "runtimeConstraint": str(
+                payload.get("runtimeConstraint") or ""
+            ).strip(),
+            "projectReference": reference,
+        }
+        await self._progress_stage(
+            "project-import",
+            "正在导入不可变项目资源",
+            percent=35,
+        )
+        project = await gateway.import_project(import_payload)
+        imported_project_id = str(project.get("projectId") or "").strip()
+        imported_version = str(project.get("version") or "").strip()
+        if not imported_project_id or not imported_version:
+            raise ManagedServiceError(
+                "Project Store 导入结果缺少 projectId/version"
+            )
+        if imported_project_id != project_id:
+            raise ManagedServiceError(
+                "Project Store 返回的 projectId 与转换请求不一致"
+            )
+        # Existing immutable versions may predate this script reference.  The
+        # idempotent add makes the stable reference explicit for both new and
+        # reused versions.
+        await gateway.add_project_reference(
+            imported_project_id,
+            imported_version,
+            reference,
+        )
+        await self._progress_stage(
+            "project-referenced",
+            "项目资源已导入并建立稳定引用",
+            percent=60,
+        )
+
+        source_fingerprint = _json_hash(snapshot)
+        operation_id = _conversion_operation_id(
+            script_id,
+            source_fingerprint,
+            imported_project_id,
+            imported_version,
+            str(
+                project.get("runtimeConstraint")
+                or import_payload.get("runtimeConstraint")
+                or ""
+            ),
+        )
+        journal = {
+            "schemaVersion": 1,
+            "kind": _CONVERSION_KIND,
+            "operationId": operation_id,
+            "scriptId": script_id,
+            "sourceType": _SOURCE_TYPE,
+            "targetType": _TARGET_TYPE,
+            "sourceFingerprint": source_fingerprint,
+            "projectReference": reference,
+            "projectId": imported_project_id,
+            "version": imported_version,
+            "state": "project_imported",
+            "userIds": list(target_user_configs),
+        }
+        committed_marker = {
+            **journal,
+            "state": "committed",
+        }
+        target_script_config = _merge_conversion_target(
+            source_config,
+            _project_form_update(
+                project,
+                import_payload,
+                status="普通 MaaFW 项目已原地转换为托管项目",
+            ),
+        )
+        target_script_config.setdefault("Managed", {})[
+            "ConversionJournal"
+        ] = committed_marker
+
+        await self._progress_stage(
+            "config-commit",
+            "正在原子提交脚本类型与全部用户配置",
+            percent=75,
+        )
+        try:
+            async with Config.script_config_transaction(
+                script_id,
+                owner=f"maafw-managed-convert-commit:{script_id}",
+            ):
+                host_result = converter(
+                    script_id,
+                    source_type=_SOURCE_TYPE,
+                    target_type=_TARGET_TYPE,
+                    expected_snapshot=snapshot,
+                    target_script_config=target_script_config,
+                    target_user_configs=target_user_configs,
+                    journal=journal,
+                )
+                if inspect.isawaitable(host_result):
+                    host_result = await host_result
+                if not isinstance(host_result, Mapping):
+                    raise ManagedServiceError(
+                        "宿主转换原语返回值不是 JSON object"
+                    )
+        except Exception as exc:
+            if getattr(exc, "conversion_state", None) == "source_changed":
+                await gateway.release_project_reference(
+                    imported_project_id,
+                    imported_version,
+                    reference,
+                )
+                raise ManagedServiceError(
+                    "转换失败：脚本或用户配置已变化，配置未提交且已释放项目引用；"
+                    "请刷新后重试"
+                ) from exc
+            commit_state = await _conversion_commit_state(
+                script_id,
+                operation_id,
+                expected_snapshot=snapshot,
+                snapshot_reader=snapshot_reader,
+            )
+            if commit_state == "committed":
+                return await self._validated_conversion_response(
+                    script_id,
+                    project,
+                    source_config,
+                    target_user_configs,
+                    host_result={
+                        "converted": True,
+                        "recovered": True,
+                        "warning": str(exc),
+                    },
+                )
+            if commit_state == "source":
+                await gateway.release_project_reference(
+                    imported_project_id,
+                    imported_version,
+                    reference,
+                )
+                raise ManagedServiceError(
+                    f"转换失败，脚本配置未提交，已释放项目引用：{exc}"
+                ) from exc
+            raise ManagedServiceError(
+                "转换结果不确定，已保留项目引用和 durable journal 供宿主恢复；"
+                f"请勿删除资源并重试同一转换：{exc}"
+            ) from exc
+
+        return await self._validated_conversion_response(
+            script_id,
+            project,
+            source_config,
+            target_user_configs,
+            host_result=dict(host_result),
+        )
+
+    async def _validated_conversion_response(
+        self,
+        script_id: str,
+        project: Mapping[str, Any],
+        source_config: Mapping[str, Any],
+        source_user_configs: Mapping[str, Mapping[str, Any]],
+        *,
+        host_result: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        await self._progress_stage(
+            "validating",
+            "正在核验脚本、用户顺序与运行历史",
+            percent=90,
+        )
+        records = await Config.get_script_records(script_id)
+        if len(records) != 1 or _record_field(records[0], "type") != _TARGET_TYPE:
+            raise ManagedServiceError(
+                "宿主转换返回成功，但脚本尚未成为 MaaFWManaged"
+            )
+        converted_config = _conversion_form_config(
+            _record_config(records[0], f"脚本 {script_id}"),
+            virtual_name="script_name",
+        )
+        _assert_conversion_script_preserved(source_config, converted_config)
+        users = await Config.get_user_records(script_id)
+        converted_user_ids = [
+            str(_record_field(user, "id") or "").strip()
+            for user in users
+        ]
+        if converted_user_ids != list(source_user_configs):
+            raise ManagedServiceError(
+                "转换后用户 UUID 或顺序发生变化，宿主必须恢复 journal"
+            )
+        for user in users:
+            user_id = str(_record_field(user, "id") or "").strip()
+            converted_user = _conversion_form_config(
+                _record_config(user, f"用户 {user_id}"),
+                virtual_name="user_name",
+            )
+            if _upgrade_source_config(converted_user) != _upgrade_source_config(
+                source_user_configs[user_id]
+            ):
+                raise ManagedServiceError(
+                    f"转换后用户 {user_id} 配置或运行历史发生变化"
+                )
+        return {
+            "converted": bool(host_result.get("converted", True)),
+            "idempotent": bool(host_result.get("idempotent", False)),
+            "recovered": bool(host_result.get("recovered", False)),
+            "scriptId": script_id,
+            "fromType": _SOURCE_TYPE,
+            "toType": _TARGET_TYPE,
+            "project": dict(project),
+            "userIds": converted_user_ids,
+            "host": dict(host_result),
+        }
+
     async def _check_remote_project(
         self,
         request: PluginHttpRequest,
@@ -285,6 +1074,8 @@ class Plugin(ScriptAdapterPlugin):
                     initial=True,
                 ),
             ),
+            progress_operation="import-remote",
+            progress_message="正在下载并导入远程资源",
         )
 
     async def _upgrade_remote_project(
@@ -302,6 +1093,8 @@ class Plugin(ScriptAdapterPlugin):
                     initial=False,
                 ),
             ),
+            progress_operation="upgrade-remote",
+            progress_message="正在下载资源并生成升级计划",
         )
 
     async def _download_and_import_remote(
@@ -311,6 +1104,11 @@ class Plugin(ScriptAdapterPlugin):
         *,
         initial: bool,
     ) -> dict[str, Any]:
+        await self._progress_stage(
+            "remote-discovery",
+            "正在发现可安装的远程资源版本",
+            percent=5,
+        )
         discovery = await self._discover_remote_project(script_id, payload)
         candidate = _mapping(discovery.get("candidate"))
         if discovery.get("installable") is not True or not candidate:
@@ -322,9 +1120,23 @@ class Plugin(ScriptAdapterPlugin):
             raise ManagedServiceError(reason)
 
         download_root = Path.cwd() / "data" / "maafw-managed" / "downloads"
+        await self._progress_stage(
+            "download:starting",
+            "正在下载远程 MaaFW 资源包",
+            percent=15,
+        )
         downloaded = await self._gateway().download_remote_package(
             download_root,
             candidate,
+            progress=self._download_progress_callback(),
+        )
+        await self._flush_progress_updates()
+        await self._progress_stage(
+            "download:validated",
+            "远程 MaaFW 资源包已下载并校验",
+            percent=65,
+            downloaded_bytes=_progress_int(downloaded.get("size")),
+            total_bytes=_progress_int(downloaded.get("size")),
         )
         imported_payload = dict(payload)
         imported_payload.update(
@@ -336,6 +1148,11 @@ class Plugin(ScriptAdapterPlugin):
         )
 
         async def persist() -> dict[str, Any]:
+            await self._progress_stage(
+                "project-import",
+                "正在导入不可变项目资源",
+                percent=70,
+            )
             if initial:
                 result = await self._import_initial_project(
                     script_id,
@@ -354,6 +1171,11 @@ class Plugin(ScriptAdapterPlugin):
                 _public_remote_discovery(discovery),
                 status=status,
                 downloaded=downloaded,
+            )
+            await self._progress_stage(
+                "config-persisted",
+                "远程资源状态已写入脚本配置",
+                percent=92,
             )
             return {**result, "download": downloaded}
 
@@ -476,6 +1298,8 @@ class Plugin(ScriptAdapterPlugin):
                     lambda: self._import_initial_project(script_id, payload),
                 ),
             ),
+            progress_operation="import-local",
+            progress_message="正在导入本地项目资源",
         )
 
     async def _upgrade_project(self, request: PluginHttpRequest) -> dict[str, Any]:
@@ -494,6 +1318,8 @@ class Plugin(ScriptAdapterPlugin):
                     ),
                 ),
             ),
+            progress_operation="upgrade-local",
+            progress_message="正在导入资源并生成升级计划",
         )
 
     async def _apply_upgrade(self, request: PluginHttpRequest) -> dict[str, Any]:
@@ -507,6 +1333,8 @@ class Plugin(ScriptAdapterPlugin):
                     payload,
                 ),
             ),
+            progress_operation="apply-upgrade",
+            progress_message="正在校验并应用升级计划",
         )
 
     async def _cancel_upgrade(self, request: PluginHttpRequest) -> dict[str, Any]:
@@ -517,6 +1345,8 @@ class Plugin(ScriptAdapterPlugin):
                 script_id,
                 lambda: self._cancel_pending_upgrade_transaction(script_id),
             ),
+            progress_operation="cancel-upgrade",
+            progress_message="正在取消待确认升级",
         )
 
     async def _switch_version(self, request: PluginHttpRequest) -> dict[str, Any]:
@@ -535,6 +1365,8 @@ class Plugin(ScriptAdapterPlugin):
                     ),
                 ),
             ),
+            progress_operation="switch-version",
+            progress_message="正在生成版本切换计划",
         )
 
     async def _list_versions(self, request: PluginHttpRequest) -> dict[str, Any]:
@@ -560,6 +1392,11 @@ class Plugin(ScriptAdapterPlugin):
         script_id: str,
         payload: Mapping[str, Any],
     ) -> dict[str, Any]:
+        await self._progress_stage(
+            "upgrade-validation",
+            "正在校验当前项目与目标版本",
+            percent=15,
+        )
         record = await _managed_script_record(script_id)
         managed = _mapping(_record_config(record, "脚本").get("Managed"))
         project_id, current_version = _bound_upgrade_target(managed, payload)
@@ -568,9 +1405,19 @@ class Plugin(ScriptAdapterPlugin):
         request = dict(payload)
         request["projectReference"] = pending_reference
         request["currentVersion"] = current_version
+        await self._progress_stage(
+            "project-import",
+            "正在导入不可变升级资源",
+            percent=40,
+        )
         result = await self._gateway().upgrade_project(request)
         if str(_mapping(result.get("project")).get("projectId") or "") != project_id:
             raise ManagedServiceError("Project Store 返回了不同项目的升级版本")
+        await self._progress_stage(
+            "upgrade-plan",
+            "资源已导入，正在生成逐用户升级计划",
+            percent=70,
+        )
         return await self._attach_upgrade_plan(
             script_id,
             result,
@@ -583,6 +1430,11 @@ class Plugin(ScriptAdapterPlugin):
         script_id: str,
         payload: Mapping[str, Any],
     ) -> dict[str, Any]:
+        await self._progress_stage(
+            "import-validation",
+            "正在校验首次导入绑定",
+            percent=15,
+        )
         record = await _managed_script_record(script_id)
         config = _record_config(record, "脚本")
         managed = _mapping(config.get("Managed"))
@@ -610,8 +1462,18 @@ class Plugin(ScriptAdapterPlugin):
                 "首次导入的项目 ID 与脚本中的 ImportProjectId 不一致"
             )
         request = _with_project_reference(payload, script_id)
+        await self._progress_stage(
+            "project-import",
+            "正在导入不可变项目资源",
+            percent=40,
+        )
         result = await self._gateway().import_project(request)
         try:
+            await self._progress_stage(
+                "config-persist",
+                "正在写入项目绑定与可用版本",
+                percent=80,
+            )
             await self._persist_project(
                 script_id,
                 result,
@@ -646,6 +1508,11 @@ class Plugin(ScriptAdapterPlugin):
             if existing_version
             else await self._upgrade_local_with_plan(script_id, payload)
         )
+        await self._progress_stage(
+            "plan-persist",
+            "正在持久化待确认升级计划",
+            percent=85,
+        )
         await self._persist_upgrade_result(script_id, result, payload)
         return result
 
@@ -654,6 +1521,11 @@ class Plugin(ScriptAdapterPlugin):
         script_id: str,
         payload: Mapping[str, Any],
     ) -> dict[str, Any]:
+        await self._progress_stage(
+            "version-validation",
+            "正在校验已安装目标版本",
+            percent=20,
+        )
         record = await _managed_script_record(script_id)
         managed = _mapping(_record_config(record, "脚本").get("Managed"))
         project_id, current_version = _bound_upgrade_target(managed, payload)
@@ -669,6 +1541,11 @@ class Plugin(ScriptAdapterPlugin):
             project_id,
             target_version,
             pending_reference,
+        )
+        await self._progress_stage(
+            "upgrade-plan",
+            "目标版本已引用，正在生成切换计划",
+            percent=70,
         )
         return await self._attach_upgrade_plan(
             script_id,
@@ -959,6 +1836,11 @@ class Plugin(ScriptAdapterPlugin):
         script_id: str,
         payload: Mapping[str, Any],
     ) -> dict[str, Any]:
+        await self._progress_stage(
+            "upgrade-validation",
+            "正在校验升级计划、配置 CAS 与项目版本",
+            percent=15,
+        )
         _record, current_script, pending = await self._load_pending_upgrade(script_id)
         state = str(pending.get("state") or "")
         if state in _INTERRUPTED_STATES:
@@ -1011,6 +1893,11 @@ class Plugin(ScriptAdapterPlugin):
             raise ManagedServiceError("持久化脚本计划缺少 targetConfig")
         public_plan = _public_upgrade_plan(pending)
         applied_users: list[str] = []
+        await self._progress_stage(
+            "upgrade-prepare",
+            "升级计划已通过校验，正在进入可恢复提交阶段",
+            percent=35,
+        )
         await self._set_upgrade_state(script_id, pending, "applying")
         _applying_record, applying_script, _applying_pending = (
             await self._load_pending_upgrade(script_id)
@@ -1036,6 +1923,11 @@ class Plugin(ScriptAdapterPlugin):
             )
             raise
         try:
+            await self._progress_stage(
+                "config-apply",
+                "正在应用脚本与用户配置计划",
+                percent=50,
+            )
             await Config.update_script(
                 script_id,
                 _atomic_json_field_update(script_target),
@@ -1053,6 +1945,11 @@ class Plugin(ScriptAdapterPlugin):
                 )
                 applied_users.append(user_id)
             await self._set_upgrade_state(script_id, pending, "committing")
+            await self._progress_stage(
+                "version-switch",
+                "配置已应用，正在切换项目资源版本",
+                percent=75,
+            )
             activated = await gateway.switch_version(
                 {"projectId": project_id, "version": to_version}
             )
@@ -1078,6 +1975,11 @@ class Plugin(ScriptAdapterPlugin):
             await Config.update_script(script_id, final_update)
         except Exception as exc:
             try:
+                await self._progress_stage(
+                    "rollback",
+                    "升级提交失败，正在恢复旧版本与旧配置",
+                    percent=80,
+                )
                 await self._rollback_pending_upgrade(
                     script_id,
                     pending,
@@ -1092,6 +1994,11 @@ class Plugin(ScriptAdapterPlugin):
             ) from exc
 
         warnings: list[str] = []
+        await self._progress_stage(
+            "reconcile",
+            "资源版本已切换，正在对账引用并收尾",
+            percent=92,
+        )
         try:
             await self._refresh_project_versions_and_references(
                 script_id,
@@ -1141,6 +2048,11 @@ class Plugin(ScriptAdapterPlugin):
             return await self._apply_pending_upgrade(script_id, payload)
 
     async def _cancel_pending_upgrade(self, script_id: str) -> dict[str, Any]:
+        await self._progress_stage(
+            "cancel-validation",
+            "正在读取并校验待确认升级计划",
+            percent=20,
+        )
         _record, _config, pending = await self._load_pending_upgrade(script_id)
         if str(pending.get("state") or "") in _INTERRUPTED_STATES:
             await self._rollback_pending_upgrade(script_id, pending)
@@ -1153,6 +2065,11 @@ class Plugin(ScriptAdapterPlugin):
             script_id,
             pending,
             allow_missing=True,
+        )
+        await self._progress_stage(
+            "cancel-config",
+            "正在清除脚本与用户升级 journal",
+            percent=55,
         )
         await self._clear_user_upgrade_journals(script_id, user_journals)
         await Config.update_script(
@@ -1168,6 +2085,11 @@ class Plugin(ScriptAdapterPlugin):
             },
         )
         try:
+            await self._progress_stage(
+                "cancel-reconcile",
+                "升级计划已取消，正在对账资源引用",
+                percent=85,
+            )
             await self._refresh_project_versions_and_references(
                 script_id,
                 project_id,
@@ -1540,6 +2462,8 @@ class Plugin(ScriptAdapterPlugin):
                     payload,
                 ),
             ),
+            progress_operation="delete-version",
+            progress_message="正在删除项目版本",
         )
 
     async def _install_runtime(self, request: PluginHttpRequest) -> dict[str, Any]:
@@ -1550,6 +2474,8 @@ class Plugin(ScriptAdapterPlugin):
                 script_id,
                 lambda: self._install_runtime_transaction(script_id, payload),
             ),
+            progress_operation="install-runtime",
+            progress_message="正在安装或复用共享运行时",
         )
 
     async def _list_runtimes(self, request: PluginHttpRequest) -> dict[str, Any]:
@@ -1577,6 +2503,8 @@ class Plugin(ScriptAdapterPlugin):
                 script_id,
                 data,
             ),
+            progress_operation="delete-runtime",
+            progress_message="正在删除共享运行时",
         )
 
     async def _pin(self, request: PluginHttpRequest) -> dict[str, Any]:
@@ -1598,6 +2526,12 @@ class Plugin(ScriptAdapterPlugin):
                     }
                 },
             ),
+            progress_operation="pin",
+            progress_message=(
+                "正在固定资源"
+                if _as_bool(payload.get("pinned"), True)
+                else "正在取消固定"
+            ),
         )
 
     async def _collect_garbage(
@@ -1606,18 +2540,24 @@ class Plugin(ScriptAdapterPlugin):
     ) -> dict[str, Any]:
         payload = _payload(request)
         dry_run = _as_bool(payload.get("dryRun"), True)
-        if not dry_run and str(payload.get("confirmation") or "") != "DELETE UNUSED":
-            return {
-                "code": 400,
-                "status": "error",
-                "message": "实际回收前请在确认字段中输入 DELETE UNUSED",
-            }
-        return await self._respond_for_script(
-            payload,
-            lambda _script_id: self._collect_garbage_with_script_references(
+
+        async def collect(_script_id: str) -> dict[str, Any]:
+            if (
+                not dry_run
+                and str(payload.get("confirmation") or "")
+                != "DELETE UNUSED"
+            ):
+                raise ManagedServiceError(
+                    "实际回收前请在确认字段中输入 DELETE UNUSED"
+                )
+            return await self._collect_garbage_with_script_references(
                 payload,
                 dry_run=dry_run,
-            ),
+            )
+
+        return await self._respond_for_script(
+            payload,
+            collect,
             after_success=lambda script_id, data: Config.update_script(
                 script_id,
                 {
@@ -1630,6 +2570,12 @@ class Plugin(ScriptAdapterPlugin):
                     }
                 },
             ),
+            progress_operation="gc-preview" if dry_run else "gc-apply",
+            progress_message=(
+                "正在预览空间回收"
+                if dry_run
+                else "正在回收过期资源"
+            ),
         )
 
     async def _resolve_and_bind_runtime(
@@ -1639,6 +2585,11 @@ class Plugin(ScriptAdapterPlugin):
     ) -> dict[str, Any]:
         request = dict(payload)
         request["projectReference"] = f"maafw-script:{script_id}"
+        await self._progress_stage(
+            "runtime-resolve",
+            "正在解析项目依赖并安装或复用共享运行时",
+            percent=25,
+        )
         resolution = await self._gateway().resolve_execution(request)
         project = _mapping(resolution.get("project"))
         expected_project_id = str(request.get("projectId") or "").strip()
@@ -1648,6 +2599,11 @@ class Plugin(ScriptAdapterPlugin):
         if str(project.get("version") or "").strip() != expected_version:
             raise ManagedServiceError("运行时解析返回了不同的项目版本")
         binding = _mapping(resolution.get("runtime"))
+        await self._progress_stage(
+            "runtime-bind",
+            "共享运行时已就绪，正在绑定项目资源",
+            percent=75,
+        )
         resolution["project"] = await self._gateway().bind_project_runtime(
             expected_project_id,
             expected_version,
@@ -1665,12 +2621,22 @@ class Plugin(ScriptAdapterPlugin):
             script_id,
             owner=f"maafw-runtime-install:{script_id}",
         ):
+            await self._progress_stage(
+                "runtime-validation",
+                "正在校验项目绑定与运行时约束",
+                percent=10,
+            )
             record = await _managed_script_record(script_id)
             config = _record_config(record, f"脚本 {script_id}")
             request = _runtime_install_request(config, payload)
             resolution = await self._resolve_and_bind_runtime(
                 script_id,
                 request,
+            )
+            await self._progress_stage(
+                "runtime-persist",
+                "正在写入共享运行时绑定",
+                percent=90,
             )
             await self._persist_resolution(script_id, resolution, request)
             return resolution
@@ -1750,6 +2716,8 @@ class Plugin(ScriptAdapterPlugin):
         operation: Callable[[str], Awaitable[Any]],
         *,
         after_success: Callable[[str, Any], Awaitable[None]] | None = None,
+        progress_operation: str | None = None,
+        progress_message: str = "",
     ) -> dict[str, Any]:
         async def validated_operation() -> Any:
             script_id = await self._require_managed_script(payload)
@@ -1758,13 +2726,18 @@ class Plugin(ScriptAdapterPlugin):
                 await after_success(script_id, data)
             return data
 
+        if progress_operation:
+            return await self._respond_with_progress(
+                payload,
+                progress_operation,
+                progress_message or "正在执行 MaaFW 托管资源操作",
+                validated_operation,
+            )
         return await self._respond(validated_operation)
 
     @staticmethod
     async def _require_managed_script(payload: Mapping[str, Any]) -> str:
-        script_id = str(payload.get("scriptId") or payload.get("script_id") or "").strip()
-        if not script_id:
-            raise ManagedServiceError("动作请求缺少 scriptId")
+        script_id = _required_script_id(payload)
         try:
             records = await Config.get_script_records(script_id)
         except Exception as exc:
@@ -2037,6 +3010,353 @@ def _payload(request: PluginHttpRequest) -> dict[str, Any]:
     if isinstance(request.query, Mapping):
         return dict(request.query)
     return {}
+
+
+def _managed_capabilities() -> dict[str, Any]:
+    snapshot_available = callable(
+        getattr(Config, "get_plugin_script_type_conversion_snapshot", None)
+    )
+    conversion_available = callable(
+        getattr(Config, "convert_plugin_script_type", None)
+    )
+    in_place_conversion = snapshot_available and conversion_available
+    return {
+        "apiVersion": _CONVERSION_API_VERSION,
+        "distributionVersion": _distribution_version(),
+        "features": {
+            "singleEntry": True,
+            "inPlaceConversion": in_place_conversion,
+            "conversionRecovery": in_place_conversion,
+            "projectOverview": True,
+            "localImport": True,
+            "remoteImport": True,
+            "upgradePlans": True,
+            "runtimeManagement": True,
+            "pinning": True,
+            "garbageCollection": True,
+            "operationProgress": True,
+        },
+        "hostApis": {
+            "conversionSnapshot": snapshot_available,
+            "atomicTypeConversion": conversion_available,
+        },
+    }
+
+
+def _distribution_version() -> str:
+    try:
+        return importlib_metadata.version(_DISTRIBUTION_NAME)
+    except importlib_metadata.PackageNotFoundError:
+        return _DISTRIBUTION_VERSION_FALLBACK
+
+
+def _required_script_id(payload: Mapping[str, Any]) -> str:
+    script_id = str(
+        payload.get("scriptId") or payload.get("script_id") or ""
+    ).strip()
+    if not script_id:
+        raise ManagedServiceError("动作请求缺少 scriptId")
+    try:
+        return str(uuid.UUID(script_id))
+    except ValueError as exc:
+        raise ManagedServiceError("scriptId 不是有效 UUID") from exc
+
+
+def _required_progress_id(
+    payload: Mapping[str, Any],
+    *,
+    required: bool = True,
+) -> str:
+    operation_value = str(payload.get("operationId") or "").strip()
+    progress_value = str(payload.get("progressId") or "").strip()
+    if operation_value and progress_value and operation_value != progress_value:
+        raise ManagedServiceError("operationId 与 progressId 不一致")
+    operation_id = operation_value or progress_value
+    if not operation_id:
+        if required:
+            raise ManagedServiceError("动作请求缺少 operationId/progressId")
+        return ""
+    if _PROGRESS_ID_PATTERN.fullmatch(operation_id) is None:
+        raise ManagedServiceError(
+            "progressId 只能包含字母、数字、点、下划线、冒号和连字符，"
+            "且长度不能超过 200"
+        )
+    return operation_id
+
+
+def _progress_number(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _progress_int(value: Any) -> int | None:
+    number = _progress_number(value)
+    if number is None:
+        return None
+    return max(0, int(number))
+
+
+def _conversion_operation_id(
+    script_id: str,
+    source_fingerprint: str,
+    project_id: str,
+    version: str,
+    runtime_constraint: str,
+) -> str:
+    target_identity = json.dumps(
+        {
+            "projectId": str(project_id).strip(),
+            "version": str(version).strip(),
+            "runtimeConstraint": str(runtime_constraint).strip(),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return str(
+        uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            (
+                f"{_CONVERSION_KIND}:{script_id}:{source_fingerprint}:"
+                f"{target_identity}"
+            ),
+        )
+    )
+
+
+def _validate_conversion_snapshot(
+    value: Any,
+    script_id: str,
+) -> dict[str, Any]:
+    snapshot = _json_clone(value)
+    if not isinstance(snapshot, dict):
+        raise ManagedServiceError("宿主转换快照不是 JSON object")
+    script = snapshot.get("script")
+    users = snapshot.get("users")
+    user_order = snapshot.get("userOrder")
+    if not isinstance(script, Mapping):
+        raise ManagedServiceError("宿主转换快照缺少 script")
+    if str(script.get("id") or "").strip() != script_id:
+        raise ManagedServiceError("宿主转换快照 scriptId 不一致")
+    if not isinstance(script.get("config"), Mapping):
+        raise ManagedServiceError("宿主转换快照 script.config 不是 JSON object")
+    if not isinstance(users, Mapping) or not isinstance(user_order, list):
+        raise ManagedServiceError("宿主转换快照缺少 users/userOrder")
+    normalized_order = [str(item).strip() for item in user_order]
+    if any(not item for item in normalized_order):
+        raise ManagedServiceError("宿主转换快照包含空 userId")
+    if len(normalized_order) != len(set(normalized_order)):
+        raise ManagedServiceError("宿主转换快照包含重复 userId")
+    normalized_users = {str(key).strip(): item for key, item in users.items()}
+    if normalized_order != list(normalized_users):
+        raise ManagedServiceError(
+            "宿主转换快照 users 必须按 userOrder 顺序提供"
+        )
+    for user_id in normalized_order:
+        user = normalized_users[user_id]
+        if not isinstance(user, Mapping):
+            raise ManagedServiceError(
+                f"宿主转换快照用户 {user_id} 不是 JSON object"
+            )
+        if str(user.get("id") or "").strip() != user_id:
+            raise ManagedServiceError(
+                f"宿主转换快照用户 {user_id} 身份不一致"
+            )
+        if str(user.get("type") or "").strip() != str(
+            script.get("type") or ""
+        ).strip():
+            raise ManagedServiceError(
+                f"宿主转换快照用户 {user_id} 与脚本类型不一致"
+            )
+        if not isinstance(user.get("config"), Mapping):
+            raise ManagedServiceError(
+                f"宿主转换快照用户 {user_id} config 不是 JSON object"
+            )
+    snapshot["userOrder"] = normalized_order
+    snapshot["users"] = normalized_users
+    return snapshot
+
+
+def _snapshot_script_type(snapshot: Mapping[str, Any]) -> str:
+    return str(_mapping(snapshot.get("script")).get("type") or "").strip()
+
+
+def _conversion_form_config(
+    config: Mapping[str, Any],
+    *,
+    virtual_name: str,
+) -> dict[str, Any]:
+    result = _json_clone(config)
+    if not isinstance(result, dict):
+        raise ManagedServiceError("转换配置不是 JSON object")
+    result.pop(virtual_name, None)
+    return result
+
+
+def _conversion_user_configs(
+    snapshot: Mapping[str, Any],
+    records: list[Any],
+) -> dict[str, dict[str, Any]]:
+    user_order = [str(item) for item in snapshot.get("userOrder") or []]
+    record_ids = [
+        str(_record_field(record, "id") or "").strip()
+        for record in records
+    ]
+    if record_ids != user_order:
+        raise ManagedServiceError(
+            "脚本用户 UUID/order 与宿主原始快照不一致，拒绝转换"
+        )
+    result: dict[str, dict[str, Any]] = {}
+    for record, user_id in zip(records, user_order, strict=True):
+        if str(_record_field(record, "type") or "").strip() != _SOURCE_TYPE:
+            raise ManagedServiceError(
+                f"用户 {user_id} 不是 MaaFW 配置，拒绝混合类型转换"
+            )
+        result[user_id] = _conversion_form_config(
+            _record_config(record, f"用户 {user_id}"),
+            virtual_name="user_name",
+        )
+    return result
+
+
+def _conversion_project_id(
+    payload: Mapping[str, Any],
+    source_info: Mapping[str, Any],
+    interface: Mapping[str, Any],
+    source_path: str,
+) -> str:
+    project_id = str(
+        payload.get("projectId")
+        or interface.get("name")
+        or source_info.get("ProjectLabel")
+        or Path(source_path).name
+        or ""
+    ).strip()
+    if not project_id:
+        raise ManagedServiceError(
+            "无法从请求、ProjectInterface 或项目路径确定 projectId"
+        )
+    return project_id
+
+
+def _merge_conversion_target(
+    source: Mapping[str, Any],
+    update: Mapping[str, Any],
+) -> dict[str, Any]:
+    result = _conversion_form_config(source, virtual_name="script_name")
+
+    def merge(target: dict[str, Any], patch: Mapping[str, Any]) -> None:
+        for key, value in patch.items():
+            if isinstance(value, Mapping) and isinstance(target.get(key), dict):
+                merge(target[key], value)
+            else:
+                target[key] = _json_clone(value)
+
+    merge(result, update)
+    return result
+
+
+def _assert_conversion_script_preserved(
+    source: Mapping[str, Any],
+    converted: Mapping[str, Any],
+) -> None:
+    source_base = _upgrade_source_config(source)
+    converted_base = _upgrade_source_config(converted)
+    for value in (source_base, converted_base):
+        info = value.get("Info")
+        if isinstance(info, dict):
+            # A managed project authoritatively binds these two fields to its
+            # immutable Project Store identity.  Every other ordinary MaaFW
+            # setting must survive byte-for-byte at the JSON value level.
+            info.pop("Path", None)
+            info.pop("ProjectLabel", None)
+    if converted_base != source_base:
+        raise ManagedServiceError(
+            "转换后普通 MaaFW 脚本配置发生了非资源身份变更"
+        )
+
+
+async def _committed_conversion_response(
+    record: Any,
+    script_id: str,
+) -> dict[str, Any]:
+    config = _record_config(record, f"脚本 {script_id}")
+    managed = _mapping(config.get("Managed"))
+    journal = _mapping(managed.get("ConversionJournal"))
+    if (
+        journal.get("schemaVersion") != 1
+        or journal.get("kind") != _CONVERSION_KIND
+        or journal.get("state") != "committed"
+        or str(journal.get("scriptId") or "") != script_id
+    ):
+        raise ManagedServiceError(
+            f"scriptId {script_id} 已是 MaaFWManaged，且没有可验证的转换 marker"
+        )
+    users = await Config.get_user_records(script_id)
+    return {
+        "converted": False,
+        "idempotent": True,
+        "recovered": False,
+        "scriptId": script_id,
+        "fromType": _SOURCE_TYPE,
+        "toType": _TARGET_TYPE,
+        "project": {
+            "projectId": str(managed.get("ProjectId") or ""),
+            "version": str(managed.get("Version") or ""),
+            "dataPath": str(_mapping(config.get("Info")).get("Path") or ""),
+            "manifest": _mapping(managed.get("ProjectManifest")),
+        },
+        "userIds": [str(_record_field(user, "id") or "") for user in users],
+        "host": {"idempotent": True, "journal": journal},
+    }
+
+
+async def _conversion_commit_state(
+    script_id: str,
+    operation_id: str,
+    *,
+    expected_snapshot: Mapping[str, Any],
+    snapshot_reader: Callable[..., Any],
+) -> str:
+    try:
+        records = await Config.get_script_records(script_id)
+    except Exception:
+        return "unknown"
+    if len(records) != 1:
+        return "unknown"
+    record = records[0]
+    record_type = str(_record_field(record, "type") or "").strip()
+    if record_type == _TARGET_TYPE:
+        try:
+            config = _record_config(record, f"脚本 {script_id}")
+            journal = _mapping(
+                _mapping(config.get("Managed")).get("ConversionJournal")
+            )
+        except ManagedServiceError:
+            return "unknown"
+        if (
+            journal.get("schemaVersion") == 1
+            and journal.get("kind") == _CONVERSION_KIND
+            and journal.get("operationId") == operation_id
+            and journal.get("state") == "committed"
+        ):
+            return "committed"
+        return "unknown"
+    if record_type != _SOURCE_TYPE:
+        return "unknown"
+    try:
+        current = snapshot_reader(script_id)
+        if inspect.isawaitable(current):
+            current = await current
+        current_snapshot = _validate_conversion_snapshot(current, script_id)
+    except Exception:
+        return "unknown"
+    return "source" if current_snapshot == expected_snapshot else "unknown"
 
 
 def _remote_source_config(payload: Mapping[str, Any]) -> dict[str, Any]:
