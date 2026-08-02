@@ -177,32 +177,49 @@ class MaaFWAdapterHooks(ScriptAdapterHooks):
                     send_log=lambda message: self._emit_log(runtime, message),
                     source_config=source_config,
                 )
-                if update_result.updated:
-                    refreshed_interface = await asyncio.to_thread(
-                        MaaFWInterfaceService().load,
-                        project_path,
-                        force_reload=True,
-                    )
-                    self._emit_log(
-                        runtime,
-                        "MaaFW project updated, preparing agent Python env",
-                    )
-                    agent_prepare_logs: list[str] = []
-                    try:
-                        await asyncio.to_thread(
-                            _prepare_maafw_agent_python_envs,
-                            project_path,
-                            refreshed_interface,
-                            send_log=agent_prepare_logs.append,
-                        )
-                    finally:
-                        for log_line in agent_prepare_logs:
-                            self._emit_log(runtime, log_line)
             except Exception as exc:
                 self._emit_log(
                     runtime,
                     f"MaaFW 项目更新失败，继续使用当前目录: {exc}",
                 )
+                return
+
+            if update_result.updated:
+                try:
+                    refreshed_interface = await asyncio.to_thread(
+                        MaaFWInterfaceService().load,
+                        project_path,
+                        force_reload=True,
+                    )
+                except Exception as exc:
+                    self._emit_log(
+                        runtime,
+                        "MaaFW 项目资源已更新，但新版 interface 重新读取失败；"
+                        f"本次运行继续尝试当前目录: {exc}",
+                    )
+                    return
+
+                self._emit_log(
+                    runtime,
+                    "MaaFW project updated, preparing agent Python env",
+                )
+                agent_prepare_logs: list[str] = []
+                try:
+                    await asyncio.to_thread(
+                        _prepare_maafw_agent_python_envs,
+                        project_path,
+                        refreshed_interface,
+                        send_log=agent_prepare_logs.append,
+                    )
+                except Exception as exc:
+                    self._emit_log(
+                        runtime,
+                        "MaaFW 项目资源已更新，但运行环境预热未完成；"
+                        f"本次运行继续尝试当前目录: {exc}",
+                    )
+                finally:
+                    for log_line in agent_prepare_logs:
+                        self._emit_log(runtime, log_line)
         finally:
             await release_project_path(project_reservation)
 
@@ -232,11 +249,12 @@ def _prepare_maafw_agent_python_envs(
     *,
     send_log: Any = None,
 ) -> None:
-    from automas_maafw_agent_env.service import MaaFWAgentEnvService
+    from automas_maafw_runner.service import MaaFWRunnerService
 
-    MaaFWAgentEnvService().prepare_env(
+    MaaFWRunnerService().prepare_project_environment(
         project_path,
         interface_model,
+        runtime_pool_root=Path.cwd() / "config" / "maafw_runtime_pool",
         send_log=send_log,
     )
 

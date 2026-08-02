@@ -26,7 +26,7 @@ class _Logger:
 
 
 class _InterfaceService:
-    def load(self, _path: Path) -> Any:
+    def load(self, _path: Path, **_kwargs: Any) -> Any:
         return SimpleNamespace(controller=[object()], resource=[object()], task=[object()])
 
 
@@ -94,6 +94,10 @@ class _BoundStorage:
 
     async def load_user_collection(self) -> dict[Any, Any]:
         return {}
+
+    async def read_script_data(self) -> dict[str, Any]:
+        raw = self.backend.records[self.script_id]["PluginData"]["Config"]
+        return json.loads(raw)
 
 
 class _Runtime:
@@ -260,6 +264,64 @@ class ScriptMaaFWConfigIsolationContractTest(unittest.TestCase):
                 "正在运行或更新",
                 "".join(runtime.extra["maafw_project_update_logs"]),
             )
+
+    def test_post_update_prewarm_failure_is_reported_as_warning(self) -> None:
+        module = _load_adapter_module()
+
+        class _Updater:
+            async def update_if_needed(self, *_args: Any, **_kwargs: Any) -> Any:
+                return SimpleNamespace(updated=True)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            project_path = Path(temporary_directory) / "project"
+            project_path.mkdir()
+            backend = _ConfigBackend(
+                {
+                    "script-a": self._form(
+                        "A",
+                        str(project_path),
+                        project_label="a",
+                    )
+                }
+            )
+            runtime = _Runtime(backend, "script-a")
+            script_config = backend.load_model("script-a")
+            script_config.payload["Update"]["IfAutoUpdate"] = True
+            hooks = module.MaaFWAdapterHooks()
+            module.MaaFWProjectUpdateService = _Updater
+            module.Config = SimpleNamespace(
+                get=lambda *_args: "",
+                proxy=None,
+            )
+
+            with (
+                mock.patch.object(
+                    module,
+                    "try_reserve_project_path",
+                    new=mock.AsyncMock(return_value="reserved"),
+                ),
+                mock.patch.object(
+                    module,
+                    "release_project_path",
+                    new=mock.AsyncMock(),
+                ),
+                mock.patch.object(
+                    module,
+                    "_prepare_maafw_agent_python_envs",
+                    side_effect=RuntimeError("prewarm boom"),
+                ),
+            ):
+                asyncio.run(
+                    hooks._update_project_before_run(
+                        runtime,
+                        script_config,
+                    )
+                )
+
+            logs = "".join(runtime.extra["maafw_project_update_logs"])
+            self.assertIn("项目资源已更新，但运行环境预热未完成", logs)
+            self.assertIn("prewarm boom", logs)
+            self.assertNotIn("项目更新失败，继续使用当前目录", logs)
 
     @staticmethod
     def _form(name: str, path: str, *, project_label: str) -> dict[str, Any]:

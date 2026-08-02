@@ -378,6 +378,8 @@ class MaaFWConfigurationReuseController:
             return
         if self.registry.get_project_pack(type_key.casefold()) is not None:
             return
+        if _registered_script_framework(type_key).casefold() == "maafw":
+            return
         raise MaaFWConfigurationReuseError("当前脚本不是 MaaFW 项目或已注册 project pack")
 
     def _store_plan(
@@ -481,7 +483,83 @@ def _record_id(record: Mapping[str, Any]) -> str:
 
 
 def _record_type(record: Mapping[str, Any]) -> str:
-    return str(record.get("type") or record.get("typeKey") or "").strip()
+    outer_type = str(record.get("type") or "").strip()
+    type_key = str(record.get("typeKey") or "").strip()
+    plugin_type_key = _record_plugin_type_key(record)
+
+    # Older/current host DTOs do not all expose plugin scripts the same way.
+    # Some return the resolved adapter key directly in ``type`` (for example
+    # ``M9A``), while the plugin-container shape reports ``type=Plugin`` and
+    # keeps the authoritative adapter key in PluginTypeKey.  Treating the
+    # container name as the adapter key makes project-pack validation reject a
+    # perfectly valid M9A record before configuration discovery starts.
+    generic_plugin_types = {
+        "plugin",
+        "pluginscript",
+        "pluginscriptconfig",
+        "plugin-script-config",
+        "plugin_script_config",
+    }
+    if outer_type.casefold() in generic_plugin_types:
+        if plugin_type_key:
+            return plugin_type_key
+        if type_key and type_key.casefold() not in generic_plugin_types:
+            return type_key
+        return outer_type
+
+    if outer_type:
+        return outer_type
+    if type_key and type_key.casefold() not in generic_plugin_types:
+        return type_key
+    return plugin_type_key or type_key
+
+
+def _record_plugin_type_key(record: Mapping[str, Any]) -> str:
+    for key in ("plugin_type_key", "pluginTypeKey", "PluginTypeKey"):
+        value = str(record.get(key) or "").strip()
+        if value:
+            return value
+
+    for container in (record, _mapping(record.get("config"))):
+        for key in ("Meta", "meta"):
+            meta = container.get(key)
+            if not isinstance(meta, Mapping):
+                continue
+            for field in ("PluginTypeKey", "pluginTypeKey", "plugin_type_key"):
+                value = str(meta.get(field) or "").strip()
+                if value:
+                    return value
+    return ""
+
+
+def _registered_script_framework(type_key: str) -> str:
+    """Resolve the host adapter framework without trusting a stale pack registry.
+
+    MaaFW's project-pack registry is owned by this plugin instance and is
+    therefore recreated when the base MaaFW plugin is hot-reloaded.  A pack
+    plugin that remains active can still have its host script provider
+    registered while its one-shot project-pack registration points at the old
+    registry.  The host provider is the authority that decoded the ScriptRecord
+    in the first place, so its explicit ``framework=maafw`` metadata is a safe
+    fallback for the generic configuration importer.
+    """
+
+    normalized = str(type_key or "").strip()
+    if not normalized:
+        return ""
+    try:
+        from app.core.script_types import script_type_registry
+
+        provider = script_type_registry.get(normalized)
+    except Exception:
+        # Provider lookup is an eligibility check.  During plugin reloads any
+        # unavailable or transient host registry state must fail closed rather
+        # than turn configuration discovery into a 500 response.
+        return ""
+    metadata = getattr(provider, "metadata", None)
+    if not isinstance(metadata, Mapping):
+        return ""
+    return str(metadata.get("framework") or "").strip()
 
 
 def _record_config(record: Mapping[str, Any]) -> dict[str, Any]:

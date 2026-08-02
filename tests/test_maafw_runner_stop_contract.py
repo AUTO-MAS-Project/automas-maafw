@@ -184,6 +184,15 @@ class MaaFWRunnerStopContractTest(unittest.TestCase):
 
         self.assertIn("worker_id = service.register_worker(process)", source)
         self.assertGreaterEqual(source.count("service.unregister_worker(worker_id)"), 2)
+        self.assertIn(
+            'native_debug_log_path = self.project_path / "debug" / "maafw.log"',
+            source,
+        )
+        self.assertIn('f"{local_started_at.strftime(\'%H-%M-%S\')}.maafw.log"', source)
+        self.assertIn('native_debug_log_file.seek(start_offset)', source)
+        self.assertIn('write_framework_log("worker-stderr", line)', source)
+        self.assertIn("MaaFW 框架调试日志已保存", source)
+        self.assertIn("await self._save_user_logs()", source)
 
         script_project = tomllib.loads(
             (
@@ -193,9 +202,17 @@ class MaaFWRunnerStopContractTest(unittest.TestCase):
                 / "pyproject.toml"
             ).read_text(encoding="utf-8")
         )
-        self.assertEqual(script_project["project"]["version"], "0.1.9")
+        self.assertEqual(script_project["project"]["version"], "0.1.10")
         self.assertIn(
-            "automas-maafw-runner>=0.3.3",
+            "automas-maafw-runner>=0.3.4",
+            script_project["project"]["dependencies"],
+        )
+        self.assertIn(
+            "automas-maafw-agent-env>=0.1.3",
+            script_project["project"]["dependencies"],
+        )
+        self.assertIn(
+            "automas-maafw-project-update>=0.2.1",
             script_project["project"]["dependencies"],
         )
 

@@ -12,6 +12,7 @@ import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -404,6 +405,145 @@ class MaaFWConfigurationReuseControllerTest(unittest.TestCase):
             SimpleNamespace(get=lambda _key: None, server=SimpleNamespace(http=lambda *_a, **_k: None)),
             SimpleNamespace(get_project_pack=lambda _key: None),
         )
+
+    def test_plugin_container_record_resolves_authoritative_adapter_type_key(self) -> None:
+        record_type = self.controller_module._record_type
+
+        self.assertEqual(
+            record_type({"type": "Plugin", "PluginTypeKey": "M9A"}),
+            "M9A",
+        )
+        self.assertEqual(
+            record_type(
+                {
+                    "type": "PluginScriptConfig",
+                    "config": {"Meta": {"PluginTypeKey": "M9A"}},
+                }
+            ),
+            "M9A",
+        )
+        self.assertEqual(record_type({"type": "M9A"}), "M9A")
+
+    def test_m9a_host_provider_falls_back_when_project_pack_registry_is_lost(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            self.config.scripts[self.script_id] = {
+                "id": self.script_id,
+                "type": "M9A",
+                "name": "M9A",
+                "config": {"Info": {"Name": "M9A", "Path": str(root)}},
+            }
+
+            interface_path = root / "interface.json"
+            interface_path.write_text(
+                json.dumps(INTERFACE, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            source = root / "config" / "instances" / "profile.json"
+            source.parent.mkdir(parents=True)
+            source.write_text(
+                json.dumps(
+                    {
+                        "InstanceName": "M9A 配置",
+                        "TaskItems": [],
+                        "AdbDevice": {},
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            class InterfaceService:
+                @staticmethod
+                def load(project_path):
+                    return json.loads(
+                        (Path(project_path) / "interface.json").read_text(
+                            encoding="utf-8"
+                        )
+                    )
+
+            self.controller.ctx = SimpleNamespace(
+                get=lambda key: (
+                    InterfaceService()
+                    if key == self.controller_module.INTERFACE_SERVICE
+                    else None
+                ),
+                server=SimpleNamespace(http=lambda *_a, **_k: None),
+            )
+            # Model the real stale-HMR state: the MaaFW-local project-pack
+            # registry is empty, while the host provider that decoded the live
+            # ScriptRecord still explicitly declares framework=maafw.
+            self.controller.registry = SimpleNamespace(
+                get_project_pack=lambda _key: None
+            )
+
+            class HostScriptTypeRegistry:
+                @staticmethod
+                def get(key):
+                    if key != "M9A":
+                        raise KeyError(key)
+                    return SimpleNamespace(metadata={"framework": "maafw"})
+
+            host_registry = HostScriptTypeRegistry()
+            script_types = types.ModuleType("app.core.script_types")
+            script_types.script_type_registry = host_registry
+
+            with patch.dict(
+                sys.modules,
+                {"app.core.script_types": script_types},
+            ):
+                for selected_path in (root, source):
+                    discovered = asyncio.run(
+                        self.controller._discover_sources(
+                            {
+                                "scriptId": self.script_id,
+                                "sourcePath": str(selected_path),
+                            }
+                        )
+                    )
+                    self.assertEqual(discovered["count"], 1)
+                    self.assertEqual(discovered["sources"][0]["kind"], "mfaa-v1")
+                    self.assertEqual(
+                        discovered["sources"][0]["label"],
+                        "M9A 配置",
+                    )
+
+                planned = asyncio.run(
+                    self.controller._plan_external(
+                        {
+                            "scriptId": self.script_id,
+                            "source": discovered["sources"][0],
+                            "target": "new-user",
+                        }
+                    )
+                )
+
+            self.assertEqual(planned["target"], "new-user")
+            self.assertEqual(planned["preview"]["format"], "mfaa-v1")
+
+    def test_non_maafw_host_provider_does_not_bypass_missing_project_pack(self) -> None:
+        self.config.scripts[self.script_id]["type"] = "OtherAdapter"
+        host_registry = SimpleNamespace(
+            get=lambda _key: SimpleNamespace(
+                metadata={"framework": "script_adapter"}
+            )
+        )
+        script_types = types.ModuleType("app.core.script_types")
+        script_types.script_type_registry = host_registry
+
+        with patch.dict(sys.modules, {"app.core.script_types": script_types}):
+            with self.assertRaisesRegex(
+                MaaFWConfigurationReuseError,
+                "不是 MaaFW 项目",
+            ):
+                asyncio.run(
+                    self.controller._discover_sources(
+                        {
+                            "scriptId": self.script_id,
+                            "sourcePath": "C:/external",
+                        }
+                    )
+                )
 
     def test_internal_copy_is_planned_then_applied_in_one_host_transaction(self) -> None:
         planned = asyncio.run(

@@ -568,7 +568,20 @@ class MaaFWRunner:
             )
 
         if device_config.type == "Adb":
+            adb_path_source = "上游配置"
+            if not device_config.adbPath:
+                adb_path_source = "MaaFW Toolkit 自动发现"
             self._resolve_adb_device(device_config)
+            connection_mode = (
+                "TCP/IP"
+                if _is_network_adb_address(device_config.address or "")
+                else "本地/USB serial"
+            )
+            self.send_log(
+                "ADB 连接方式: "
+                f"{connection_mode}; 地址={device_config.address}; "
+                f"ADB 路径={device_config.adbPath}; 路径来源={adb_path_source}"
+            )
             self._wait_adb_device_ready(device_config)
 
         self._log_controller_config(device_config)
@@ -578,7 +591,27 @@ class MaaFWRunner:
         if not self.tasker.bind(self.resource, self.controller):
             raise RuntimeError("无法绑定 MaaFW resource/controller/tasker")
         self._install_tasker_sink()
-        self.send_log(f"已连接 controller: {self.plan.controllerName}")
+        if device_config.type == "Adb":
+            screencap_methods = (
+                device_config.screencapMethods
+                or MaaAdbScreencapMethodEnum.Default
+            )
+            input_methods = (
+                device_config.inputMethods or MaaAdbInputMethodEnum.Default
+            )
+            self.send_log(
+                "ADB controller 最终连接: "
+                f"controller={self.plan.controllerName}; "
+                f"地址={device_config.address}; ADB 路径={device_config.adbPath}; "
+                "传入截图候选集合="
+                f"{_format_enum_methods(MaaAdbScreencapMethodEnum, screencap_methods)}; "
+                "传入输入候选集合="
+                f"{_format_enum_methods(MaaAdbInputMethodEnum, input_methods)}; "
+                "MaaFW Python binding 未公开测速后实际选中的单项方法，"
+                "如原生层有输出，可在本次运行的 MaaFW 框架日志中查看"
+            )
+        else:
+            self.send_log(f"已连接 controller: {self.plan.controllerName}")
 
     def _resolve_adb_device(self, device_config: MaaFWDeviceConfig) -> None:
         """Fill a missing ADB path through the active MaaFW Toolkit."""
@@ -655,10 +688,17 @@ class MaaFWRunner:
 
     def _log_controller_config(self, device_config: MaaFWDeviceConfig) -> None:
         if device_config.type == "Adb":
+            screencap_methods = (
+                device_config.screencapMethods
+                or MaaAdbScreencapMethodEnum.Default
+            )
+            input_methods = (
+                device_config.inputMethods or MaaAdbInputMethodEnum.Default
+            )
             self.send_log(
-                "ADB controller 配置: "
-                f"截图方式={_format_enum_methods(MaaAdbScreencapMethodEnum, device_config.screencapMethods)}; "
-                f"触控方式={_format_enum_methods(MaaAdbInputMethodEnum, device_config.inputMethods)}; "
+                "ADB controller 传入候选集合: "
+                f"截图={_format_enum_methods(MaaAdbScreencapMethodEnum, screencap_methods)}; "
+                f"输入={_format_enum_methods(MaaAdbInputMethodEnum, input_methods)}; "
                 f"地址={device_config.address}"
             )
             if device_config.config:
@@ -713,10 +753,12 @@ class MaaFWRunner:
                 state = (result.stdout or "").strip()
                 detail = (result.stderr or state or "").strip()
                 if result.returncode == 0 and state == "device":
+                    latency = self._measure_adb_latency(device_config)
                     self.send_log(
-                        f"ADB 设备已就绪: {device_config.address}; "
-                        f"延迟={self._measure_adb_latency(device_config)}"
+                        f"ADB 连接测速: {device_config.address}; "
+                        f"往返延迟={latency}"
                     )
+                    self.send_log(f"ADB 设备已就绪: {device_config.address}")
                     return
                 last_detail = detail or f"exit={result.returncode}"
             except subprocess.TimeoutExpired:
