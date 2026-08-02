@@ -11,6 +11,8 @@ from typing import Any
 
 MAX_CONFIGURATION_BYTES = 32 * 1024 * 1024
 MAX_CONFIGURATION_SOURCES = 200
+UINT64_SIGN_BIT = 1 << 63
+UINT64_MODULUS = 1 << 64
 
 
 class MaaFWConfigurationReuseError(RuntimeError):
@@ -457,8 +459,10 @@ def _map_mfaa_v1(
         {
             "AdbPath": adb.get("AdbPath"),
             "AdbAddress": adb.get("AdbSerial"),
-            "AdbScreencapMethods": _integer_or_none(adb.get("ScreencapMethods")),
-            "AdbInputMethods": _integer_or_none(adb.get("InputMethods")),
+            "AdbScreencapMethods": _method_mask_or_none(
+                adb.get("ScreencapMethods")
+            ),
+            "AdbInputMethods": _method_mask_or_none(adb.get("InputMethods")),
         }
     )
     game = _compact_mapping(
@@ -696,10 +700,12 @@ def _map_mfaa_v2_control_details(
             {
                 "AdbPath": details.get("adb_path"),
                 "AdbAddress": details.get("address"),
-                "AdbScreencapMethods": _integer_or_none(
+                "AdbScreencapMethods": _method_mask_or_none(
                     details.get("screencap_methods")
                 ),
-                "AdbInputMethods": _integer_or_none(details.get("input_methods")),
+                "AdbInputMethods": _method_mask_or_none(
+                    details.get("input_methods")
+                ),
             }
         )
         mapped_fields.update(
@@ -730,13 +736,13 @@ def _map_mfaa_v2_control_details(
         device.update(
             _compact_mapping(
                 {
-                    "Win32ScreencapMethod": _integer_or_none(
+                    "Win32ScreencapMethod": _method_mask_or_none(
                         details.get("win32_screencap_methods")
                     ),
-                    "Win32MouseMethod": _integer_or_none(
+                    "Win32MouseMethod": _method_mask_or_none(
                         details.get("mouse_input_methods")
                     ),
-                    "Win32KeyboardMethod": _integer_or_none(
+                    "Win32KeyboardMethod": _method_mask_or_none(
                         details.get("keyboard_input_methods")
                     ),
                 }
@@ -1249,9 +1255,23 @@ def _integer_or_none(value: Any) -> int | None:
     if value is None or value == "":
         return None
     try:
-        return int(float(value))
+        return int(value)
     except (TypeError, ValueError, OverflowError):
+        try:
+            return int(float(value))
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+
+def _method_mask_or_none(value: Any) -> int | None:
+    """Normalize MaaFramework uint64 JSON masks to the signed host form."""
+
+    parsed = _integer_or_none(value)
+    if parsed is None:
         return None
+    if UINT64_SIGN_BIT <= parsed < UINT64_MODULUS:
+        return parsed - UINT64_MODULUS
+    return parsed
 
 
 def _parse_json_value(value: Any) -> Any:

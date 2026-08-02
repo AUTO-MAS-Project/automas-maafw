@@ -83,7 +83,9 @@ class MaaFWConfigurationReuseMappingTest(unittest.TestCase):
                             "AdbPath": "C:/adb.exe",
                             "AdbSerial": "127.0.0.1:5555",
                             "ScreencapMethods": 8,
-                            "InputMethods": 4,
+                            # MFAAvalonia persists MaaFramework uint64 masks;
+                            # this is MaaAdbInputMethodEnum.Default (-9).
+                            "InputMethods": 18446744073709551607,
                         },
                         "TaskItems": [
                             {
@@ -120,6 +122,10 @@ class MaaFWConfigurationReuseMappingTest(unittest.TestCase):
             self.assertEqual(
                 plan["scriptTargetConfig"]["Game"]["Path"],
                 "C:/Games/Demo/game.exe",
+            )
+            self.assertEqual(
+                plan["scriptTargetConfig"]["Device"]["AdbInputMethods"],
+                -9,
             )
             self.assertEqual(plan["summary"]["enabledTaskCount"], 1)
             snapshot = json.loads(

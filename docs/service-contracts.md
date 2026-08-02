@@ -985,9 +985,10 @@ POST /plugin/maafw/config-reuse/plan/copy
 POST /plugin/maafw/config-reuse/apply
 ```
 
-外部来源必须由用户显式选择，当前识别 MFAAvalonia 旧 `instances/*.json`、新
-`multi_config.json + configs/*.json` 与 MXU `mxu-*.json`。导入计划按当前
-ProjectInterface 归一化 controller、resource、游戏路径、ADB/Win32 控制参数、
+外部来源必须由用户显式选择，当前识别 MFAAvalonia 旧 `instances/*.json`、
+MFAAvalonia 与 MFW/CFA 共用的 `multi_config.json + configs/*.json`，以及 MXU
+`mxu-*.json`。导入计划按当前 ProjectInterface 归一化 controller、resource、
+游戏路径、ADB/Win32 控制参数、
 任务顺序与 option；外部模拟器名称、路径和实例索引不冒充宿主稳定 UUID，向导
 会把 ADB 提示带到下一步要求用户确认宿主模拟器/实例。旧窗口句柄也不会复制。
 
