@@ -71,12 +71,14 @@ class MaaFWProjectUpdateService:
         *,
         proxy: httpx.Proxy | None = None,
         send_log: Any = None,
+        progress: Any = None,
     ) -> None:
         await apply_maafw_project_update(
             Path(project_path).resolve(),
             self._coerce_candidate(candidate),
             proxy=proxy,
             send_log=send_log,
+            progress=progress,
         )
 
     async def download_package(
@@ -87,6 +89,7 @@ class MaaFWProjectUpdateService:
         proxy: httpx.Proxy | None = None,
         send_log: Any = None,
         max_download_bytes: int = DOWNLOAD_MAX_BYTES,
+        progress: Any = None,
     ) -> dict[str, Any]:
         """Download a validated ZIP for an immutable-store consumer."""
 
@@ -96,6 +99,7 @@ class MaaFWProjectUpdateService:
             proxy=proxy,
             send_log=send_log,
             max_download_bytes=max_download_bytes,
+            progress=progress,
         )
         return self._downloaded_package_dict(downloaded)
 
@@ -109,6 +113,7 @@ class MaaFWProjectUpdateService:
         proxy: httpx.Proxy | None = None,
         send_log: Any = None,
         source_config: dict[str, Any] | None = None,
+        progress: Any = None,
     ) -> MaaFWProjectUpdateResult:
         return await update_maafw_project_if_needed(
             Path(project_path).resolve(),
@@ -118,6 +123,7 @@ class MaaFWProjectUpdateService:
             proxy=proxy,
             send_log=send_log,
             source_config=source_config,
+            progress=progress,
         )
 
     @staticmethod

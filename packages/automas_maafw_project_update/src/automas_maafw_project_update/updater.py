@@ -10,9 +10,10 @@ import shutil
 import uuid
 import zipfile
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import quote, urljoin, urlsplit
 
 import aiofiles
 import httpx
@@ -24,11 +25,19 @@ UPDATE_WORK_DIR = ".mas-update"
 DOWNLOAD_FILE_NAME = "download.zip"
 DOWNLOAD_TEMP_NAME = "download.tmp"
 DOWNLOAD_RETRY_TIMES = 3
+DOWNLOAD_RETRY_DELAY_SECONDS = 1.0
+DOWNLOAD_TIMEOUT_SECONDS = 300
 DOWNLOAD_MAX_BYTES = 4 * 1024 * 1024 * 1024
 DOWNLOAD_REDIRECT_LIMIT = 10
 DOWNLOAD_CHUNK_SIZE = 64 * 1024
 DOWNLOAD_ERROR_HINT_BYTES = 4096
+DOWNLOAD_PROGRESS_INTERVAL_SECONDS = 0.2
+DOWNLOAD_PROGRESS_PERCENT_STEP = 1.0
+DOWNLOAD_PROGRESS_UNKNOWN_INTERVAL_SECONDS = 0.25
+DOWNLOAD_PROGRESS_UNKNOWN_BYTES_STEP = 1024 * 1024
 HTTP_HEADERS = {"User-Agent": "AutoMasGui"}
+
+ProgressCallback = Callable[[dict[str, Any]], None]
 
 MIRROR_ERROR_INFO = {
     1001: "MirrorChyan URL parameters are invalid",
@@ -113,6 +122,14 @@ class MaaFWProjectUpdateError(RuntimeError):
     """Raised when a MaaFW project package cannot be checked or applied."""
 
 
+class _MaaFWProjectDownloadError(MaaFWProjectUpdateError):
+    """Carry a stable outer-workflow progress status without emitting a terminal."""
+
+    def __init__(self, message: str, *, progress_status: str = "") -> None:
+        super().__init__(message)
+        self.progress_status = progress_status
+
+
 def list_update_providers() -> list[MaaFWUpdateProviderInfo]:
     return [
         MaaFWUpdateProviderInfo(
@@ -128,6 +145,72 @@ def list_update_providers() -> list[MaaFWUpdateProviderInfo]:
     ]
 
 
+def _report_progress(
+    callback: ProgressCallback | None,
+    stage: str,
+    **payload: Any,
+) -> None:
+    """Publish best-effort JSON-friendly progress without affecting updates."""
+
+    if callback is None:
+        return
+    event = {"stage": stage, **payload}
+    try:
+        callback(event)
+    except Exception:
+        # Progress is observational. A disconnected UI must never corrupt or
+        # abort a download/apply transaction.
+        return
+
+
+@dataclass
+class _DownloadProgressThrottle:
+    callback: ProgressCallback | None
+    total_bytes: int | None
+    clock: Callable[[], float]
+    last_time: float | None = None
+    last_bytes: int = 0
+    last_percent: float | None = None
+
+    def report(self, downloaded_bytes: int, *, force: bool = False) -> None:
+        now = self.clock()
+        percent = (
+            min(100.0, downloaded_bytes * 100.0 / self.total_bytes)
+            if self.total_bytes
+            else None
+        )
+        if force and self.last_time is not None and downloaded_bytes == self.last_bytes:
+            return
+        should_emit = force or self.last_time is None
+        if not should_emit and self.last_time is not None:
+            elapsed = now - self.last_time
+            if self.total_bytes:
+                percent_delta = percent - (self.last_percent or 0.0)
+                should_emit = (
+                    elapsed >= DOWNLOAD_PROGRESS_INTERVAL_SECONDS
+                    or percent_delta >= DOWNLOAD_PROGRESS_PERCENT_STEP
+                )
+            else:
+                should_emit = (
+                    elapsed >= DOWNLOAD_PROGRESS_UNKNOWN_INTERVAL_SECONDS
+                    or downloaded_bytes - self.last_bytes
+                    >= DOWNLOAD_PROGRESS_UNKNOWN_BYTES_STEP
+                )
+        if not should_emit:
+            return
+
+        self.last_time = now
+        self.last_bytes = downloaded_bytes
+        self.last_percent = percent
+        _report_progress(
+            self.callback,
+            "downloading",
+            downloaded_bytes=downloaded_bytes,
+            total_bytes=self.total_bytes,
+            percent=percent,
+        )
+
+
 async def update_maafw_project_if_needed(
     project_path: Path,
     interface_model: MaaFWInterface,
@@ -137,6 +220,7 @@ async def update_maafw_project_if_needed(
     proxy: httpx.Proxy | None = None,
     send_log: Callable[[str], None] | None = None,
     source_config: dict[str, Any] | None = None,
+    progress: ProgressCallback | None = None,
 ) -> MaaFWProjectUpdateResult:
     send_update_log = send_log or (lambda _: None)
     current_version = interface_model.version or ""
@@ -145,6 +229,13 @@ async def update_maafw_project_if_needed(
     if not current_version:
         message = "interface does not declare version, skip MaaFW project update"
         send_update_log(message)
+        _report_progress(
+            progress,
+            "completed",
+            status="version_missing",
+            message=message,
+            final=True,
+        )
         return MaaFWProjectUpdateResult(
             checked=False,
             updated=False,
@@ -157,25 +248,70 @@ async def update_maafw_project_if_needed(
     send_update_log(f"update channel: {update_channel}")
 
     merged_source_config = dict(source_config or {})
-    merged_source_config.setdefault("mirror_cdk", mirror_cdk)
+    configured_cdk = str(
+        merged_source_config.get("mirror_cdk")
+        or merged_source_config.get("cdk")
+        or ""
+    ).strip()
+    inherited_cdk = str(mirror_cdk or "").strip()
+    if not configured_cdk and inherited_cdk:
+        # Script-local blank means "inherit the host CDK".  ``setdefault``
+        # cannot express this because the schema deliberately serializes an
+        # empty local value.
+        merged_source_config["mirror_cdk"] = inherited_cdk
     merged_source_config.setdefault("channel", update_channel)
-    discovery = await discover_maafw_project_update(
-        interface_model,
-        current_version=current_version,
-        source_config=merged_source_config,
-        proxy=proxy,
-        send_log=send_update_log,
-    )
+    if not str(merged_source_config.get("project_shell_hint") or "").strip():
+        project_shell_hint = _detect_project_shell_hint(project_path)
+        if project_shell_hint:
+            merged_source_config["project_shell_hint"] = project_shell_hint
+    _report_progress(progress, "checking", message="checking for project updates")
+    try:
+        discovery = await discover_maafw_project_update(
+            interface_model,
+            current_version=current_version,
+            source_config=merged_source_config,
+            proxy=proxy,
+            send_log=send_update_log,
+        )
+    except Exception as exc:
+        message = f"MaaFW project update failed: {_sanitize_log_message(str(exc))}"
+        send_update_log(message)
+        _report_progress(
+            progress,
+            "failed",
+            status="check_failed",
+            message=message,
+            final=True,
+        )
+        raise
 
     if discovery is None:
         message = f"MaaFW project is up to date: {current_version}"
         send_update_log(message)
+        _report_progress(
+            progress,
+            "completed",
+            status="no_update",
+            message=message,
+            final=True,
+        )
         return MaaFWProjectUpdateResult(
             checked=True,
             updated=False,
             current_version=current_version,
             message=message,
         )
+
+    _report_progress(
+        progress,
+        "checking",
+        status="version_discovered",
+        version=discovery.version,
+        metadata_source=discovery.source,
+        package_source=(
+            discovery.candidate.source if discovery.candidate is not None else None
+        ),
+    )
 
     if not discovery.installable:
         reason = (
@@ -187,6 +323,13 @@ async def update_maafw_project_if_needed(
             f"({discovery.source}), but it is not installable: {reason}"
         )
         send_update_log(message)
+        _report_progress(
+            progress,
+            "completed",
+            status="no_installable_candidate",
+            message=message,
+            final=True,
+        )
         return MaaFWProjectUpdateResult(
             checked=True,
             updated=False,
@@ -200,22 +343,59 @@ async def update_maafw_project_if_needed(
 
     candidate = discovery.candidate
     if candidate is None:
-        raise MaaFWProjectUpdateError(
-            "update discovery is marked installable but has no candidate"
+        message = "update discovery is marked installable but has no candidate"
+        _report_progress(
+            progress,
+            "failed",
+            status="invalid_candidate",
+            message=message,
+            final=True,
         )
+        raise MaaFWProjectUpdateError(message)
 
     send_update_log(
         f"found MaaFW project update: {current_version} -> {candidate.version} ({candidate.source})"
     )
-    await apply_maafw_project_update(
-        project_path.resolve(),
-        candidate,
-        proxy=proxy,
-        send_log=send_update_log,
-    )
+    try:
+        await apply_maafw_project_update(
+            project_path.resolve(),
+            candidate,
+            proxy=proxy,
+            send_log=send_update_log,
+            progress=progress,
+        )
+    except Exception as exc:
+        detail = _sanitize_log_message(str(exc))
+        message = (
+            detail
+            if detail.startswith("MaaFW project update failed:")
+            else f"MaaFW project update failed: {detail}"
+        )
+        if message != detail:
+            send_update_log(message)
+        status = (
+            getattr(exc, "progress_status", "")
+            if isinstance(exc, MaaFWProjectUpdateError)
+            else "apply_failed"
+        ) or "apply_failed"
+        _report_progress(
+            progress,
+            "failed",
+            status=status,
+            message=message,
+            final=True,
+        )
+        raise
 
     message = f"MaaFW project update applied: {candidate.version}"
     send_update_log(message)
+    _report_progress(
+        progress,
+        "completed",
+        status="updated",
+        message=message,
+        final=True,
+    )
     return MaaFWProjectUpdateResult(
         checked=True,
         updated=True,
@@ -238,11 +418,96 @@ async def discover_maafw_project_update(
 ) -> MaaFWProjectUpdateDiscovery | None:
     config = dict(source_config or {})
     provider = str(config.get("source") or "").strip().lower()
-    if not provider:
-        provider = "mirrorchyan" if interface_model.mirrorchyan_rid else "github_release"
-
     current = current_version if current_version is not None else (interface_model.version or "")
     send_update_log = send_log or (lambda _: None)
+
+    if not provider:
+        # Automatic mode keeps MirrorChyan as the version-metadata authority.
+        # A CDK-less Mirror response may still discover a newer version; only
+        # the package acquisition falls back to a same-version GitHub asset.
+        if interface_model.mirrorchyan_rid:
+            mirror_cdk = str(
+                config.get("mirror_cdk") or config.get("cdk") or ""
+            ).strip()
+            send_update_log(f"MirrorChyan RID: {interface_model.mirrorchyan_rid}")
+            if interface_model.mirrorchyan_multiplatform:
+                send_update_log("MirrorChyan platform: win/x64")
+            mirror_discovery = await _check_mirrorchyan_update(
+                interface_model,
+                current_version=current,
+                mirror_cdk=mirror_cdk,
+                channel=str(config.get("channel") or "stable"),
+                proxy=proxy,
+            )
+            if mirror_discovery is None:
+                return None
+            send_update_log(
+                "version metadata source: MirrorChyan; "
+                f"latest={mirror_discovery.version}"
+            )
+            if mirror_discovery.installable or mirror_cdk:
+                if mirror_discovery.installable:
+                    send_update_log(
+                        "install package source: MirrorChyan; "
+                        f"version={mirror_discovery.version}"
+                    )
+                return mirror_discovery
+
+            send_update_log(
+                "MirrorChyan discovered a newer version without a download URL; "
+                "checking GitHub for an unambiguous package of the same version"
+            )
+            github_discovery = await _check_github_release_update(
+                interface_model,
+                current_version=current,
+                source_config=config,
+                proxy=proxy,
+                target_version=mirror_discovery.version,
+            )
+            if (
+                github_discovery is not None
+                and _normalize_version(github_discovery.version)
+                == _normalize_version(mirror_discovery.version)
+                and github_discovery.installable
+                and github_discovery.candidate is not None
+            ):
+                send_update_log(
+                    "install package source: GitHub Release; "
+                    f"version={github_discovery.version}"
+                )
+                return MaaFWProjectUpdateDiscovery(
+                    source="mirrorchyan",
+                    version=mirror_discovery.version,
+                    candidate=MaaFWProjectUpdateCandidate(
+                        source=github_discovery.candidate.source,
+                        version=mirror_discovery.version,
+                        download_url=github_discovery.candidate.download_url,
+                        sha256=github_discovery.candidate.sha256,
+                    ),
+                )
+
+            reason = "GitHub did not provide an unambiguous asset for the MirrorChyan version"
+            if github_discovery is not None:
+                if (
+                    _normalize_version(github_discovery.version)
+                    != _normalize_version(mirror_discovery.version)
+                ):
+                    reason = (
+                        "GitHub latest version does not match MirrorChyan metadata: "
+                        f"github={github_discovery.version}, "
+                        f"mirrorchyan={mirror_discovery.version}"
+                    )
+                elif github_discovery.unavailable_reason:
+                    reason = github_discovery.unavailable_reason
+            return MaaFWProjectUpdateDiscovery(
+                source="mirrorchyan",
+                version=mirror_discovery.version,
+                unavailable_reason=(
+                    f"{mirror_discovery.unavailable_reason}; GitHub fallback blocked: {reason}"
+                ),
+            )
+
+        provider = "github_release"
 
     if provider == "mirrorchyan":
         if not interface_model.mirrorchyan_rid:
@@ -251,21 +516,43 @@ async def discover_maafw_project_update(
         send_update_log(f"MirrorChyan RID: {interface_model.mirrorchyan_rid}")
         if interface_model.mirrorchyan_multiplatform:
             send_update_log("MirrorChyan platform: win/x64")
-        return await _check_mirrorchyan_update(
+        discovery = await _check_mirrorchyan_update(
             interface_model,
             current_version=current,
             mirror_cdk=str(config.get("mirror_cdk") or config.get("cdk") or ""),
             channel=str(config.get("channel") or "stable"),
             proxy=proxy,
         )
+        if discovery is not None:
+            send_update_log(
+                "version metadata source: MirrorChyan; "
+                f"latest={discovery.version}"
+            )
+            if discovery.installable:
+                send_update_log(
+                    "install package source: MirrorChyan; "
+                    f"version={discovery.version}"
+                )
+        return discovery
 
     if provider == "github_release":
-        return await _check_github_release_update(
+        discovery = await _check_github_release_update(
             interface_model,
             current_version=current,
             source_config=config,
             proxy=proxy,
         )
+        if discovery is not None:
+            send_update_log(
+                "version metadata source: GitHub Release; "
+                f"latest={discovery.version}"
+            )
+            if discovery.installable:
+                send_update_log(
+                    "install package source: GitHub Release; "
+                    f"version={discovery.version}"
+                )
+        return discovery
 
     raise MaaFWProjectUpdateError(f"unsupported MaaFW project update provider: {provider}")
 
@@ -311,6 +598,7 @@ async def apply_maafw_project_update(
     *,
     proxy: httpx.Proxy | None = None,
     send_log: Callable[[str], None] | None = None,
+    progress: ProgressCallback | None = None,
 ) -> None:
     send_update_log = send_log or (lambda _: None)
     download_url = str(candidate.download_url or "").strip()
@@ -323,8 +611,14 @@ async def apply_maafw_project_update(
         expected_sha256=candidate.sha256,
         proxy=proxy,
         send_log=send_update_log,
+        progress=progress,
     )
-    await _apply_update_package(project_path.resolve(), package_path, send_update_log)
+    await _apply_update_package(
+        project_path.resolve(),
+        package_path,
+        send_update_log,
+        progress=progress,
+    )
 
 
 async def download_maafw_project_package(
@@ -334,6 +628,7 @@ async def download_maafw_project_package(
     proxy: httpx.Proxy | None = None,
     send_log: Callable[[str], None] | None = None,
     max_download_bytes: int = DOWNLOAD_MAX_BYTES,
+    progress: ProgressCallback | None = None,
 ) -> MaaFWDownloadedProjectPackage:
     """Download and validate one candidate without mutating a project tree.
 
@@ -380,6 +675,7 @@ async def download_maafw_project_package(
             proxy=proxy,
             send_log=send_update_log,
             max_download_bytes=max_download_bytes,
+            progress=progress,
         )
         package_sha256 = await asyncio.to_thread(
             _calculate_sha256,
@@ -392,6 +688,14 @@ async def download_maafw_project_package(
             package_sha256,
         )
         package_size = package_path.stat().st_size
+        _report_progress(
+            progress,
+            "downloaded",
+            status="downloaded",
+            downloaded_bytes=package_size,
+            total_bytes=package_size,
+            percent=100.0,
+        )
     except Exception:
         await asyncio.to_thread(_remove_path, provisional_path)
         raise
@@ -471,6 +775,7 @@ async def _check_github_release_update(
     current_version: str,
     source_config: dict[str, Any],
     proxy: httpx.Proxy | None,
+    target_version: str = "",
 ) -> MaaFWProjectUpdateDiscovery | None:
     repo = _normalize_github_repo(
         str(
@@ -486,11 +791,23 @@ async def _check_github_release_update(
     tag = str(
         source_config.get("tag") or source_config.get("github_tag") or ""
     ).strip()
-    api_url = (
-        f"https://api.github.com/repos/{repo}/releases/tags/{tag}"
-        if tag
-        else f"https://api.github.com/repos/{repo}/releases/latest"
-    )
+    if target_version:
+        # MirrorChyan remains the version/channel authority in automatic mode.
+        # Resolve that exact release instead of GitHub's stable-only ``latest``
+        # endpoint so prereleases and an older same-version package stay
+        # reachable.  A stale GitHubTag from a previous explicit-GitHub setup
+        # must not override the Mirror-selected version in automatic mode.
+        # Only the conventional optional leading ``v`` differs.
+        api_urls = [
+            f"https://api.github.com/repos/{repo}/releases/tags/{quote(candidate, safe='')}"
+            for candidate in _github_tag_candidates(target_version)
+        ]
+    elif tag:
+        api_urls = [
+            f"https://api.github.com/repos/{repo}/releases/tags/{quote(tag, safe='')}"
+        ]
+    else:
+        api_urls = [f"https://api.github.com/repos/{repo}/releases/latest"]
     token = str(
         source_config.get("token") or source_config.get("github_token") or ""
     ).strip()
@@ -499,10 +816,16 @@ async def _check_github_release_update(
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
+    response: httpx.Response | None = None
     async with httpx.AsyncClient(proxy=proxy, follow_redirects=True, timeout=30.0) as client:
-        response = await client.get(api_url, headers=headers)
+        for api_url in api_urls:
+            candidate_response = await client.get(api_url, headers=headers)
+            if candidate_response.status_code == 404:
+                continue
+            response = candidate_response
+            break
 
-    if response.status_code == 404:
+    if response is None:
         return None
     data = _load_response_json(response)
     if response.status_code >= 400:
@@ -514,17 +837,44 @@ async def _check_github_release_update(
     latest_version = str(data.get("tag_name") or data.get("name") or "").strip()
     if not latest_version:
         raise MaaFWProjectUpdateError("GitHub release did not return version")
+    if target_version and _normalize_version(latest_version) != _normalize_version(
+        target_version
+    ):
+        return _build_update_discovery(
+            source="github_release",
+            version=latest_version,
+            download_url=None,
+            sha256=None,
+            unavailable_reason=(
+                "GitHub tag lookup returned a different version: "
+                f"github={latest_version}, target={target_version}"
+            ),
+        )
     if not _is_remote_newer(latest_version, current_version):
         return None
+    if target_version and data.get("draft") is True:
+        return _build_update_discovery(
+            source="github_release",
+            version=latest_version,
+            download_url=None,
+            sha256=None,
+            unavailable_reason="GitHub matching release is a draft",
+        )
 
-    asset_pattern = str(
+    configured_asset_pattern = str(
         source_config.get("asset_pattern")
         or source_config.get("github_asset_pattern")
-        or r"\.zip$"
+        or ""
     ).strip()
-    download_url = _select_github_release_asset(data, asset_pattern)
-    if not download_url:
-        download_url = str(data.get("zipball_url") or "").strip() or None
+    asset_pattern = configured_asset_pattern or r"\.zip$"
+    download_url, selection_reason = _select_github_release_asset(
+        data,
+        asset_pattern,
+        project_name=interface_model.name,
+        project_shell_hint=str(source_config.get("project_shell_hint") or ""),
+        require_explicit_match=bool(configured_asset_pattern),
+        prefer_windows_x64=interface_model.mirrorchyan_multiplatform,
+    )
 
     return _build_update_discovery(
         source="github_release",
@@ -532,7 +882,8 @@ async def _check_github_release_update(
         download_url=download_url,
         sha256=str(source_config.get("sha256") or "").strip() or None,
         unavailable_reason=(
-            "GitHub release has no matching asset or source archive download URL"
+            selection_reason
+            or "GitHub release has no unambiguous matching package asset"
         ),
     )
 
@@ -571,6 +922,7 @@ async def _download_update_package(
     expected_sha256: str | None = None,
     proxy: httpx.Proxy | None,
     send_log: Callable[[str], None],
+    progress: ProgressCallback | None,
 ) -> Path:
     update_dir = project_path / UPDATE_WORK_DIR
     temp_path = update_dir / DOWNLOAD_TEMP_NAME
@@ -590,6 +942,7 @@ async def _download_update_package(
         proxy=proxy,
         send_log=send_log,
         max_download_bytes=DOWNLOAD_MAX_BYTES,
+        progress=progress,
     )
     return package_path
 
@@ -603,6 +956,7 @@ async def _download_candidate_to_paths(
     proxy: httpx.Proxy | None,
     send_log: Callable[[str], None],
     max_download_bytes: int,
+    progress: ProgressCallback | None,
 ) -> int:
     validated_url = _validate_download_url(download_url)
 
@@ -610,15 +964,38 @@ async def _download_candidate_to_paths(
         "start downloading MaaFW update package: "
         f"{_sanitize_log_message(validated_url)}"
     )
+    _report_progress(
+        progress,
+        "downloading",
+        downloaded_bytes=0,
+        total_bytes=None,
+        percent=None,
+    )
     last_error: Exception | None = None
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + DOWNLOAD_TIMEOUT_SECONDS
     for attempt in range(1, DOWNLOAD_RETRY_TIMES + 1):
         await asyncio.to_thread(_remove_path, temp_path)
         try:
-            await _stream_update_package(
-                temp_path,
-                validated_url,
-                proxy=proxy,
-                max_download_bytes=max_download_bytes,
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise TimeoutError
+            downloaded_bytes, total_bytes = await asyncio.wait_for(
+                _stream_update_package(
+                    temp_path,
+                    validated_url,
+                    proxy=proxy,
+                    max_download_bytes=max_download_bytes,
+                    progress=progress,
+                ),
+                timeout=remaining,
+            )
+            _report_progress(
+                progress,
+                "validating",
+                downloaded_bytes=downloaded_bytes,
+                total_bytes=total_bytes,
+                percent=100.0 if total_bytes else None,
             )
             package_size = await asyncio.to_thread(
                 _validate_and_publish_download,
@@ -628,23 +1005,54 @@ async def _download_candidate_to_paths(
             )
             send_log(f"MaaFW update package downloaded: {package_size} bytes")
             return package_size
+        except TimeoutError:
+            await asyncio.to_thread(_remove_path, temp_path)
+            raise _download_timeout_failure(send_log) from None
         except Exception as exc:
             last_error = exc
             await asyncio.to_thread(_remove_path, temp_path)
             if attempt >= DOWNLOAD_RETRY_TIMES:
                 break
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise _download_timeout_failure(send_log) from None
             send_log(
                 "download failed, retrying "
                 f"({attempt}/{DOWNLOAD_RETRY_TIMES}): {_sanitize_log_message(str(exc))}"
             )
-            await asyncio.sleep(1)
+            await asyncio.sleep(min(DOWNLOAD_RETRY_DELAY_SECONDS, remaining))
+            if loop.time() >= deadline:
+                raise _download_timeout_failure(send_log) from None
 
+    detail = _sanitize_log_message(str(last_error))
     if isinstance(last_error, MaaFWProjectUpdateError):
-        raise MaaFWProjectUpdateError(_sanitize_log_message(str(last_error))) from None
-    raise MaaFWProjectUpdateError(
-        "download MaaFW update package failed: "
-        f"{_sanitize_log_message(str(last_error))}"
-    ) from None
+        message = detail
+    else:
+        message = f"download MaaFW update package failed: {detail}"
+    terminal_message = (
+        message
+        if message.startswith("MaaFW project update failed:")
+        else f"MaaFW project update failed: {message}"
+    )
+    send_log(terminal_message)
+    raise _MaaFWProjectDownloadError(
+        terminal_message,
+        progress_status="download_failed",
+    )
+
+
+def _download_timeout_failure(
+    send_log: Callable[[str], None],
+) -> MaaFWProjectUpdateError:
+    message = (
+        "MaaFW project update failed: download timed out after "
+        f"{DOWNLOAD_TIMEOUT_SECONDS} seconds"
+    )
+    send_log(message)
+    return _MaaFWProjectDownloadError(
+        message,
+        progress_status="download_timeout",
+    )
 
 
 def _prepare_download_paths(
@@ -676,7 +1084,8 @@ async def _stream_update_package(
     *,
     proxy: httpx.Proxy | None,
     max_download_bytes: int = DOWNLOAD_MAX_BYTES,
-) -> None:
+    progress: ProgressCallback | None = None,
+) -> tuple[int, int | None]:
     current_url = _validate_download_url(download_url)
     async with httpx.AsyncClient(
         proxy=proxy,
@@ -728,6 +1137,12 @@ async def _stream_update_package(
                     )
 
                 downloaded_bytes = 0
+                progress_throttle = _DownloadProgressThrottle(
+                    callback=progress,
+                    total_bytes=content_length,
+                    clock=asyncio.get_running_loop().time,
+                )
+                progress_throttle.report(0, force=True)
                 async with aiofiles.open(temp_path, "wb") as file:
                     async for chunk in response.aiter_bytes(
                         chunk_size=DOWNLOAD_CHUNK_SIZE
@@ -741,7 +1156,9 @@ async def _stream_update_package(
                                 f"> {max_download_bytes}"
                             )
                         await file.write(chunk)
-                return
+                        progress_throttle.report(downloaded_bytes)
+                progress_throttle.report(downloaded_bytes, force=True)
+                return downloaded_bytes, content_length
 
     raise MaaFWProjectUpdateError("download update package redirect failed")
 
@@ -909,11 +1326,18 @@ async def _apply_update_package(
     project_path: Path,
     package_path: Path,
     send_log: Callable[[str], None],
+    *,
+    progress: ProgressCallback | None = None,
 ) -> None:
     loop = asyncio.get_running_loop()
 
     def send_thread_log(message: str) -> None:
         loop.call_soon_threadsafe(send_log, message)
+
+    def send_thread_progress(stage: str, **payload: Any) -> None:
+        loop.call_soon_threadsafe(
+            partial(_report_progress, progress, stage, **payload)
+        )
 
     try:
         await asyncio.to_thread(
@@ -921,6 +1345,7 @@ async def _apply_update_package(
             project_path,
             package_path,
             send_thread_log,
+            send_thread_progress,
         )
     finally:
         # Flush progress callbacks queued by the worker before returning or
@@ -932,6 +1357,7 @@ def _apply_update_package_sync(
     project_path: Path,
     package_path: Path,
     send_log: Callable[[str], None],
+    send_progress: Callable[..., None] | None = None,
 ) -> None:
     update_dir = project_path / UPDATE_WORK_DIR
     extract_dir = update_dir / "extract"
@@ -942,10 +1368,14 @@ def _apply_update_package_sync(
     extract_dir.mkdir(parents=True, exist_ok=True)
 
     try:
+        if send_progress is not None:
+            send_progress("extracting", message="extracting MaaFW update package")
         _safe_extract_zip(package_path, extract_dir)
         package_root = _find_package_root(extract_dir)
         changes_path = _find_changes_file(package_root, extract_dir)
 
+        if send_progress is not None:
+            send_progress("switching", message="applying MaaFW update package")
         if changes_path is None:
             send_log("applying full MaaFW update package")
             _apply_full_package(project_path, package_root, backup_dir)
@@ -1249,16 +1679,41 @@ def _normalize_github_repo(raw_value: str) -> str:
     return f"{parts[0]}/{parts[1]}"
 
 
-def _select_github_release_asset(data: dict[str, Any], asset_pattern: str) -> str | None:
+def _github_tag_candidates(raw_version: str) -> list[str]:
+    """Return exact version tag spellings without broad release enumeration."""
+
+    value = raw_version.strip()
+    if not value:
+        return []
+    candidates = [value]
+    if value.startswith(("v", "V")) and len(value) > 1:
+        candidates.append(value[1:])
+        if value.startswith("V"):
+            candidates.append(f"v{value[1:]}")
+    else:
+        candidates.append(f"v{value}")
+    return list(dict.fromkeys(candidates))
+
+
+def _select_github_release_asset(
+    data: dict[str, Any],
+    asset_pattern: str,
+    *,
+    project_name: str = "",
+    project_shell_hint: str = "",
+    require_explicit_match: bool = False,
+    prefer_windows_x64: bool = False,
+) -> tuple[str | None, str]:
     assets = data.get("assets")
     if not isinstance(assets, list):
-        return None
+        return None, "GitHub release assets are missing"
 
     try:
         pattern = re.compile(asset_pattern)
     except re.error as exc:
         raise MaaFWProjectUpdateError(f"invalid GitHub asset pattern: {exc}") from exc
 
+    matches: list[tuple[str, str]] = []
     for asset in assets:
         if not isinstance(asset, dict):
             continue
@@ -1267,12 +1722,115 @@ def _select_github_release_asset(data: dict[str, Any], asset_pattern: str) -> st
             continue
         url = str(asset.get("browser_download_url") or "").strip()
         if url:
-            return url
-    return None
+            matches.append((name, url))
+
+    if not matches:
+        return None, f"GitHub release has no matching asset for {asset_pattern!r}"
+    if len(matches) == 1:
+        return matches[0][1], ""
+
+    if require_explicit_match:
+        names = ", ".join(name for name, _ in matches[:5])
+        return None, f"GitHub asset pattern is ambiguous: {names}"
+
+    narrowed = matches
+    shell_token = re.sub(r"[^a-z0-9]+", "", project_shell_hint.casefold())
+    shell_aliases = {
+        "mfaavalonia": ("mfaavalonia", "mfavalonia", "mfaa"),
+        "mxu": ("mxu",),
+        "cfa": ("cfa",),
+        "mfw": ("mfw",),
+    }.get(shell_token, (shell_token,) if shell_token else ())
+    if shell_aliases:
+        shell_patterns = [
+            re.compile(
+                rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])",
+                re.IGNORECASE,
+            )
+            for token in shell_aliases
+        ]
+        shell_matches = [
+            item
+            for item in narrowed
+            if any(pattern.search(item[0]) for pattern in shell_patterns)
+        ]
+        if shell_matches:
+            narrowed = shell_matches
+            if len(narrowed) == 1:
+                return narrowed[0][1], ""
+
+    project_token = re.sub(r"[^a-z0-9]+", "", project_name.casefold())
+    if project_token:
+        token_pattern = re.compile(
+            rf"(?<![a-z0-9]){re.escape(project_token)}(?![a-z0-9])",
+            re.IGNORECASE,
+        )
+        project_matches = [item for item in narrowed if token_pattern.search(item[0])]
+        if project_matches:
+            narrowed = project_matches
+            if len(narrowed) == 1:
+                return narrowed[0][1], ""
+
+    if prefer_windows_x64:
+        windows_pattern = re.compile(
+            r"(?<![a-z0-9])(?:win|windows)(?![a-z0-9])",
+            re.IGNORECASE,
+        )
+        windows_matches = [item for item in narrowed if windows_pattern.search(item[0])]
+        if windows_matches:
+            narrowed = windows_matches
+        arch_pattern = re.compile(
+            r"(?<![a-z0-9])(?:x86[-_]?64|x64|amd64)(?![a-z0-9])",
+            re.IGNORECASE,
+        )
+        arch_matches = [item for item in narrowed if arch_pattern.search(item[0])]
+        if arch_matches:
+            narrowed = arch_matches
+        if len(narrowed) == 1:
+            return narrowed[0][1], ""
+
+    names = ", ".join(name for name, _ in narrowed[:5])
+    return None, f"GitHub release package selection is ambiguous: {names}"
+
+
+def _detect_project_shell_hint(project_path: Path) -> str:
+    """Identify a local UI shell only from strong root-level file markers."""
+
+    try:
+        file_names = {
+            item.name.casefold()
+            for item in project_path.iterdir()
+            if item.is_file()
+        }
+    except OSError:
+        return ""
+
+    markers = {
+        "MFAAvalonia": {
+            "mfaavalonia.exe",
+            "mfaavalonia.dll",
+            "mfaavalonia.desktop",
+            "mfaavalonia.runtimeconfig.json",
+        },
+        "MXU": {"mxu.exe", "mxu.dll", "mxu.py", "mxu.pyw"},
+        "CFA": {"cfa.exe", "cfa.py", "cfa.pyw"},
+        "MFW": {"mfw.exe", "mfw.py", "mfw.pyw"},
+    }
+    detected = [
+        shell_name
+        for shell_name, shell_markers in markers.items()
+        if file_names.intersection(shell_markers)
+    ]
+    return detected[0] if len(detected) == 1 else ""
 
 
 def _sanitize_log_message(message: str) -> str:
     sensitive_patterns = [
+        (
+            r"((?:https?://)?(?:www\.)?mirrorchyan\.com/api/resources/download/)"
+            r"[^/?#\s\"']+",
+            r"\1***",
+        ),
         (r"(cdk=)[^&\s]+", r"\1***"),
         (r"(password=)[^&\s]+", r"\1***"),
         (r"(token=)[^&\s]+", r"\1***"),
