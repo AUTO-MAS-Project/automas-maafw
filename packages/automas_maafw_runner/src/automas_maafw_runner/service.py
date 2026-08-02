@@ -7,6 +7,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
+from automas_maafw_agent_env.service import MaaFWAgentEnvService
 from automas_maafw_interface.models import MaaFWInterface
 from automas_maafw_runtime_pool import MaaFWRuntimePool, RuntimeInstaller
 
@@ -23,6 +24,34 @@ from .worker_registry import (
     MaaFWWorkerRegistry,
     MaaFWWorkerShutdownReport,
 )
+
+
+ProjectEnvironmentProgressCallback = Callable[[dict[str, Any]], None]
+
+
+def _report_project_progress(
+    callback: ProjectEnvironmentProgressCallback | None,
+    stage: str,
+    status: str,
+    message: str,
+    *,
+    percent: float | None = None,
+    **payload: Any,
+) -> None:
+    if callback is None:
+        return
+    event: dict[str, Any] = {
+        "stage": stage,
+        "status": status,
+        "message": message,
+        **payload,
+    }
+    if percent is not None:
+        event["percent"] = percent
+    try:
+        callback(event)
+    except Exception:
+        return
 
 
 class MaaFWRunnerService:
@@ -96,6 +125,7 @@ class MaaFWRunnerService:
         lease_ttl_seconds: float | None = DEFAULT_RUNTIME_LEASE_TTL_SECONDS,
         import_paths: list[str | Path] | None = None,
         send_log: Callable[[str], None] | None = None,
+        progress: ProjectEnvironmentProgressCallback | None = None,
     ) -> MaaFWRunnerEnvironment:
         return prepare_runner_environment(
             project_path,
@@ -109,6 +139,7 @@ class MaaFWRunnerService:
             lease_ttl_seconds=lease_ttl_seconds,
             import_paths=import_paths or [],
             send_log=send_log,
+            progress=progress,
         )
 
     def release_environment(
@@ -121,6 +152,120 @@ class MaaFWRunnerService:
             environment,
             runtime_pool=runtime_pool,
         )
+
+    def prepare_project_environment(
+        self,
+        project_path: str | Path,
+        interface: MaaFWInterface | dict[str, Any] | None,
+        *,
+        runtime_pool_root: str | Path | None = None,
+        runtime_pool: MaaFWRuntimePool | None = None,
+        runtime_installer: RuntimeInstaller | None = None,
+        runtime_requirement: str | None = None,
+        runtime_id: str | None = None,
+        agent_env_root: str | Path | None = None,
+        import_paths: list[str | Path] | None = None,
+        send_log: Callable[[str], None] | None = None,
+        bootstrap_python: str | None = None,
+        install_agent_dependencies: bool = True,
+        progress: ProjectEnvironmentProgressCallback | None = None,
+    ) -> dict[str, Any]:
+        """Prewarm the exact Runner pool identity and project Agent runtimes.
+
+        The preflight lease is always released before returning. A later run
+        resolves the same canonical requirements, reuses the prepared runtime,
+        and acquires its own execution-scoped lease.
+        """
+
+        environment: MaaFWRunnerEnvironment | None = None
+        try:
+            environment = self.prepare_environment(
+                project_path,
+                runtime_pool_root=runtime_pool_root,
+                runtime_pool=runtime_pool,
+                runtime_installer=runtime_installer,
+                runtime_requirement=runtime_requirement,
+                runtime_id=runtime_id,
+                lease_owner=f"automas-maafw-preflight:{uuid.uuid4().hex}",
+                lease_ttl_seconds=600,
+                import_paths=import_paths,
+                send_log=send_log,
+                progress=progress,
+            )
+            _report_project_progress(
+                progress,
+                "preparing_agents",
+                "running",
+                "正在准备 MaaFW Agent 环境",
+                percent=75.0,
+                runtime_id=environment.runtime_id,
+            )
+
+            def report_agent_progress(event: dict[str, object]) -> None:
+                raw_percent = event.get("percent")
+                agent_percent: float | None = None
+                overall_percent: float | None = None
+                if isinstance(raw_percent, (int, float)):
+                    agent_percent = min(100.0, max(0.0, float(raw_percent)))
+                    overall_percent = 75.0 + agent_percent * 0.2
+                details = {
+                    key: event[key]
+                    for key in ("completed", "total")
+                    if key in event
+                }
+                if agent_percent is not None:
+                    details["agent_percent"] = agent_percent
+                _report_project_progress(
+                    progress,
+                    "preparing_agents",
+                    str(event.get("status") or "running"),
+                    str(event.get("message") or "正在准备 MaaFW Agent 环境"),
+                    percent=overall_percent,
+                    runtime_id=environment.runtime_id,
+                    **details,
+                )
+
+            agent_result = MaaFWAgentEnvService().prepare_env(
+                project_path,
+                interface,
+                managed_env_root=agent_env_root,
+                send_log=send_log,
+                bootstrap_python=bootstrap_python,
+                install_dependencies=install_agent_dependencies,
+                progress=report_agent_progress,
+            )
+            result = {
+                "status": "ready",
+                "runtime": {
+                    "runtimeId": environment.runtime_id,
+                    "pythonExecutable": str(environment.python_executable),
+                    "venvPath": str(environment.venv_path),
+                    "packages": list(environment.packages),
+                    "maafwRequirement": environment.maafw_requirement,
+                    "maafwVersion": environment.maafw_version,
+                },
+                "agents": agent_result.model_dump(mode="json"),
+            }
+            _report_project_progress(
+                progress,
+                "completed",
+                "ready",
+                "MaaFW 项目运行环境准备完成",
+                percent=100.0,
+                runtime_id=environment.runtime_id,
+            )
+            return result
+        except Exception as exc:
+            _report_project_progress(
+                progress,
+                "failed",
+                "failed",
+                f"MaaFW 项目运行环境准备失败: {exc}",
+            )
+            raise
+        finally:
+            if environment is not None:
+                self.release_environment(environment, runtime_pool=runtime_pool)
 
     def write_job_file(
         self,

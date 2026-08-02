@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Callable
 
@@ -17,10 +18,14 @@ AGENT_BOOTSTRAP_PACKAGE = "json-with-comments"
 AGENT_ENV_MANIFEST_NAME = ".auto_mas_agent_env.json"
 AGENT_COMPAT_SHIM_DIR_NAME = ".auto_mas_shims"
 PIP_HEALTH_CHECK_TIMEOUT = 15
+PROJECT_PYTHON_HEALTH_TIMEOUT = 15
 PIP_INSTALL_TIMEOUT = 120
 VENV_PROBE_TIMEOUT = 30
 # uv 兜底可能需要下载 managed Python,给足余量
 UV_VENV_TIMEOUT = 300
+
+_ISOLATED_VENV_LOCKS_GUARD = threading.Lock()
+_ISOLATED_VENV_LOCKS: dict[str, threading.RLock] = {}
 
 
 def prepare_agent_envs(
@@ -30,6 +35,7 @@ def prepare_agent_envs(
     send_log: Callable[[str], None] | None = None,
     bootstrap_python: str | None = None,
     install_dependencies: bool = True,
+    progress: Callable[[dict[str, object]], None] | None = None,
 ) -> MaaFWAgentEnvPrepareResult:
     resolved_project_path = Path(project_path).resolve()
     messages: list[str] = []
@@ -45,34 +51,77 @@ def prepare_agent_envs(
         (resolved_project_path / path_name).mkdir(exist_ok=True)
 
     checked_python: set[str] = set()
-    for plan in plans:
+    total_plans = len(plans)
+    _report_agent_progress(
+        progress,
+        status="running",
+        message=f"准备 {total_plans} 个 MaaFW Agent 环境",
+        percent=0.0,
+        completed=0,
+        total=total_plans,
+    )
+
+    def report_plan_complete(index: int, plan: MaaFWAgentCommandPlan) -> None:
+        _report_agent_progress(
+            progress,
+            status="running",
+            message=f"Agent 环境准备完成: {plan.childExec}",
+            percent=((index + 1) * 100.0 / total_plans if total_plans else 100.0),
+            completed=index + 1,
+            total=total_plans,
+        )
+
+    for index, plan in enumerate(plans):
+        _report_agent_progress(
+            progress,
+            status="running",
+            message=f"正在准备 Agent: {plan.childExec}",
+            percent=(index * 100.0 / total_plans if total_plans else 100.0),
+            completed=index,
+            total=total_plans,
+        )
         python_exe = plan.command[0] if plan.command else plan.executable
         resolved_python = _safe_resolve_python(python_exe)
         if resolved_python in checked_python:
             log(f"[Python环境] 已检查过该 Python，跳过重复检查: {python_exe}")
+            report_plan_complete(index, plan)
             continue
 
         runtime_kind = plan.runtimeKind or "external"
         log(f"[Python环境] Agent {plan.childExec} 使用 {runtime_kind}: {python_exe}")
         if runtime_kind == "isolated_venv":
-            prepared_path = _prepare_isolated_venv_env(
-                plan,
-                resolved_project_path,
-                log,
-                bootstrap_python=bootstrap_python,
-                install_dependencies=install_dependencies,
-            )
+            with _isolated_venv_lock(Path(plan.isolatedVenvPath or python_exe)):
+                prepared_path = _prepare_isolated_venv_env(
+                    plan,
+                    resolved_project_path,
+                    log,
+                    bootstrap_python=bootstrap_python,
+                    install_dependencies=install_dependencies,
+                )
             prepared_venvs.append(str(prepared_path))
             checked_python.add(resolved_python)
+            report_plan_complete(index, plan)
             continue
 
         if runtime_kind == "project_python":
             _prepare_project_python_env(python_exe, resolved_project_path, log)
             checked_python.add(resolved_python)
+            report_plan_complete(index, plan)
             continue
 
         skipped.append(plan.childExec)
         log(f"[Python环境] 跳过外部或非 Python 环境检测: {python_exe}")
+
+        report_plan_complete(index, plan)
+
+    _report_agent_progress(
+        progress,
+        status="ready",
+        message="MaaFW Agent 环境准备完成",
+        percent=100.0,
+        completed=total_plans,
+        total=total_plans,
+    )
 
     return MaaFWAgentEnvPrepareResult(
         projectPath=str(resolved_project_path),
@@ -126,17 +175,55 @@ def _prepare_project_python_env(
 ) -> None:
     log(f"[Python环境] 检测项目 Python: {python_exe}")
     test_env = _build_agent_env_for_pip(project_path)
-    if _check_pip_health(python_exe, cwd=str(project_path), env=test_env, log=log):
+    if _check_project_python_health(
+        python_exe,
+        cwd=str(project_path),
+        env=test_env,
+        log=log,
+    ):
         return
 
     raise MaaFWAgentEnvError(
-        "项目 Python 环境 pip 不可用，请手动修复后重试：\n"
+        "项目 Python 或 MaaFW Agent 模块不可用，请修复项目包后重试：\n"
         f"  Python 路径: {python_exe}\n"
         "  处理建议:\n"
         "    方法1: 重新下载并解压完整 MaaFW 项目包\n"
-        "    方法2: 在项目目录中手动修复该项目自带 Python 的 pip 环境\n"
-        "  AUTO-MAS 不会自动修改项目 release 目录。"
+        "    方法2: 检查项目自带 Python 是否能导入 maa.agent.agent_server\n"
+        "  项目 Python 属于 release 内容，AUTO-MAS 不要求其提供 pip，"
+        "也不会自动修改该目录。"
     )
+
+
+def _isolated_venv_lock(path: Path) -> threading.RLock:
+    key = os.path.normcase(str(path.resolve())).casefold()
+    with _ISOLATED_VENV_LOCKS_GUARD:
+        return _ISOLATED_VENV_LOCKS.setdefault(key, threading.RLock())
+
+
+def _report_agent_progress(
+    callback: Callable[[dict[str, object]], None] | None,
+    *,
+    status: str,
+    message: str,
+    percent: float,
+    completed: int,
+    total: int,
+) -> None:
+    if callback is None:
+        return
+    try:
+        callback(
+            {
+                "stage": "preparing_agents",
+                "status": status,
+                "message": message,
+                "percent": percent,
+                "completed": completed,
+                "total": total,
+            }
+        )
+    except Exception:
+        return
 
 
 def _prepare_isolated_venv_env(
@@ -432,6 +519,54 @@ def _check_pip_health(
     except Exception as exc:
         log(f"[Python环境] pip 检测异常: {exc}")
         return False
+
+
+def _check_project_python_health(
+    python_exe: str,
+    *,
+    cwd: str | None,
+    env: dict[str, str],
+    log: Callable[[str], None],
+) -> bool:
+    """Probe a project-owned Agent runtime without requiring or invoking pip."""
+
+    probe = (
+        "import sys; "
+        "from maa.agent.agent_server import AgentServer; "
+        "print(f'Python {sys.version_info.major}.{sys.version_info.minor}; MaaFW Agent OK')"
+    )
+    try:
+        result = subprocess.run(
+            [python_exe, "-c", probe],
+            capture_output=True,
+            timeout=PROJECT_PYTHON_HEALTH_TIMEOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=cwd,
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        log(
+            "[Python环境] 项目 Python/Agent 健康检查超时 "
+            f"({PROJECT_PYTHON_HEALTH_TIMEOUT}s)"
+        )
+        return False
+    except Exception as exc:
+        log(f"[Python环境] 项目 Python/Agent 健康检查异常: {exc}")
+        return False
+
+    if result.returncode == 0:
+        detail = (result.stdout or "").strip()
+        log(f"[Python环境] 项目 Python/Agent 健康: {detail or python_exe}")
+        return True
+
+    detail = (result.stderr or result.stdout or "").strip()
+    log(
+        "[Python环境] 项目 Python/Agent 健康检查失败 "
+        f"(exit={result.returncode}): {detail[:500]}"
+    )
+    return False
 
 
 def _try_ensurepip(

@@ -10,3 +10,9 @@ project, the planner selects `isolated_venv` if `child_args` names an existing
 Python entry point inside the project (including `agent/bootstrap.py`). Paths
 that escape the project remain external and are never treated as managed
 Python entries.
+
+A project-owned Python runtime is release content: preparation only checks that
+the interpreter starts and imports `maa.agent.agent_server.AgentServer`. It is
+not required to contain pip or ensurepip and AUTO-MAS never mutates it. Only an
+AUTO-MAS-owned `isolated_venv` is bootstrapped and dependency-managed. The
+optional progress callback reports deterministic per-Agent completion.

@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "automas-maafw-runner"
-version = "0.3.3"
+version = "0.3.4"
 description = "Isolated MaaFW runner service plugin for AUTO-MAS"
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.10"
 dependencies = [
-    "automas-maafw-agent-env>=0.1.2",
+    "automas-maafw-agent-env>=0.1.3",
     "automas-maafw-interface>=0.2.0",
     "automas-maafw-runtime-pool>=0.1.4",
     "json5>=0.9",

@@ -6,8 +6,11 @@ import json
 import os
 import sys
 import tempfile
+import threading
+import time
 import tomllib
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from unittest import mock
 from types import SimpleNamespace
 from pathlib import Path
@@ -18,12 +21,18 @@ ROOT = Path(__file__).resolve().parents[1]
 RUNTIME_POOL_PACKAGE = ROOT / "packages" / "automas_maafw_runtime_pool"
 RUNTIME_POOL_SOURCE = RUNTIME_POOL_PACKAGE / "src"
 RUNNER_PACKAGE = ROOT / "packages" / "automas_maafw_runner"
+RUNNER_PACKAGE_SOURCE = RUNNER_PACKAGE / "src"
 RUNNER_SOURCE = RUNNER_PACKAGE / "src" / "automas_maafw_runner"
 AGENT_ENV_PACKAGE = ROOT / "packages" / "automas_maafw_agent_env"
 AGENT_ENV_SOURCE = AGENT_ENV_PACKAGE / "src"
 INTERFACE_SOURCE = ROOT / "packages" / "automas_maafw_interface" / "src"
 
-for source_path in (RUNTIME_POOL_SOURCE, AGENT_ENV_SOURCE, INTERFACE_SOURCE):
+for source_path in (
+    RUNTIME_POOL_SOURCE,
+    AGENT_ENV_SOURCE,
+    INTERFACE_SOURCE,
+    RUNNER_PACKAGE_SOURCE,
+):
     if str(source_path) not in sys.path:
         sys.path.insert(0, str(source_path))
 
@@ -36,6 +45,9 @@ from automas_maafw_runtime_pool import (  # noqa: E402
 from automas_maafw_agent_env.planner import (  # noqa: E402
     build_maafw_agent_command_plans,
 )
+from automas_maafw_agent_env.env import prepare_agent_envs  # noqa: E402
+from automas_maafw_agent_env.models import MaaFWAgentCommandPlan  # noqa: E402
+from automas_maafw_runner.service import MaaFWRunnerService  # noqa: E402
 
 
 class MaaFWRuntimePoolContractTest(unittest.TestCase):
@@ -283,6 +295,217 @@ class MaaFWRuntimePoolContractTest(unittest.TestCase):
         released = module.release_runner_environment(environment)
         self.assertEqual(released["activeLeaseIds"], [])
         self.assertTrue(self.service.delete(environment.runtime_id)["deleted"])
+
+    def test_project_python_health_does_not_require_pip(self) -> None:
+        project_path = Path(self.temporary_directory.name) / "project-python-agent"
+        project_path.mkdir()
+        plan = MaaFWAgentCommandPlan(
+            childExec="python/python.exe",
+            executable=sys.executable,
+            executableExists=True,
+            runtimeKind="project_python",
+            command=[sys.executable, "-u", "agent/main.py", "<socket_id>"],
+            childArgs=["-u", "agent/main.py"],
+            cwd=str(project_path),
+        )
+        logs: list[str] = []
+        progress_events: list[dict[str, object]] = []
+        with (
+            mock.patch(
+                "automas_maafw_agent_env.env._check_project_python_health",
+                return_value=True,
+            ) as health_check,
+            mock.patch(
+                "automas_maafw_agent_env.env._check_pip_health",
+                side_effect=AssertionError("project Python must not probe pip"),
+            ) as pip_check,
+        ):
+            result = prepare_agent_envs(
+                project_path,
+                [plan],
+                send_log=logs.append,
+                progress=progress_events.append,
+            )
+
+        health_check.assert_called_once()
+        pip_check.assert_not_called()
+        self.assertEqual(result.preparedVenvs, [])
+        self.assertTrue(any("project_python" in line for line in logs))
+        self.assertEqual(progress_events[-1]["status"], "ready")
+        self.assertEqual(progress_events[-1]["percent"], 100.0)
+        self.assertEqual(progress_events[-1]["completed"], 1)
+        self.assertTrue(
+            all(
+                {"stage", "status", "message", "percent", "completed", "total"}
+                <= event.keys()
+                for event in progress_events
+            )
+        )
+
+    def test_isolated_agent_venv_preparation_is_serialized_by_path(self) -> None:
+        project_path = Path(self.temporary_directory.name) / "isolated-agent-project"
+        project_path.mkdir()
+        venv_path = Path(self.temporary_directory.name) / "maafw_agent_venvs" / "shared"
+        plan = MaaFWAgentCommandPlan(
+            childExec="python/python.exe",
+            executable=str(venv_path / "Scripts" / "python.exe"),
+            executableExists=False,
+            runtimeKind="isolated_venv",
+            isolatedVenvPath=str(venv_path),
+            command=[str(venv_path / "Scripts" / "python.exe"), "agent.py"],
+            childArgs=["agent.py"],
+            cwd=str(project_path),
+        )
+        state_lock = threading.Lock()
+        active = 0
+        maximum_active = 0
+
+        def fake_prepare(*_args: Any, **_kwargs: Any) -> Path:
+            nonlocal active, maximum_active
+            with state_lock:
+                active += 1
+                maximum_active = max(maximum_active, active)
+            time.sleep(0.05)
+            with state_lock:
+                active -= 1
+            return venv_path
+
+        with (
+            mock.patch(
+                "automas_maafw_agent_env.env._prepare_isolated_venv_env",
+                side_effect=fake_prepare,
+            ),
+            ThreadPoolExecutor(max_workers=2) as executor,
+        ):
+            futures = [
+                executor.submit(prepare_agent_envs, project_path, [plan])
+                for _ in range(2)
+            ]
+            for future in futures:
+                future.result(timeout=5)
+
+        self.assertEqual(maximum_active, 1)
+
+    def test_project_preflight_and_first_run_share_runtime_identity(self) -> None:
+        project_path = Path(self.temporary_directory.name) / "prewarm-project"
+        project_path.mkdir()
+        (project_path / "requirements.txt").write_text(
+            "maafw==4.3.0\nrequests==2.34.2\n",
+            encoding="utf-8",
+        )
+        (project_path / "interface.json").write_text(
+            '{"interface_version":2,"name":"demo","version":"1.0.0"}',
+            encoding="utf-8",
+        )
+        runner = MaaFWRunnerService()
+        first_progress: list[dict[str, Any]] = []
+
+        first = runner.prepare_project_environment(
+            project_path,
+            None,
+            runtime_pool=self.service.pool,
+            runtime_installer=self._fake_installer,
+            runtime_requirement="maafw==4.3.0",
+            progress=first_progress.append,
+        )
+        runtime_id = first["runtime"]["runtimeId"]
+        self.assertEqual(len(self.install_calls), 1)
+        self.assertEqual(self.service.pool.get(runtime_id)["activeLeaseIds"], [])
+        first_stages = [event["stage"] for event in first_progress]
+        self.assertTrue(
+            {
+                "resolving",
+                "runtime_check",
+                "creating_runtime",
+                "installing_runtime",
+                "runtime_ready",
+                "preparing_agents",
+                "completed",
+            }.issubset(first_stages)
+        )
+        self.assertEqual(first_progress[-1]["status"], "ready")
+        self.assertEqual(first_progress[-1]["percent"], 100.0)
+        self.assertTrue(
+            all(
+                {"stage", "status", "message"} <= event.keys()
+                for event in first_progress
+            )
+        )
+
+        # Project metadata/version alone is not part of the canonical runtime
+        # identity and must not rebuild an unchanged dependency environment.
+        (project_path / "interface.json").write_text(
+            '{"interface_version":2,"name":"demo","version":"1.0.0"}',
+            encoding="utf-8",
+        )
+        second_progress: list[dict[str, Any]] = []
+        second = runner.prepare_project_environment(
+            project_path,
+            None,
+            runtime_pool=self.service.pool,
+            runtime_installer=self._fake_installer,
+            runtime_requirement="maafw==4.3.0",
+            progress=second_progress.append,
+        )
+        self.assertEqual(second["runtime"]["runtimeId"], runtime_id)
+        self.assertEqual(len(self.install_calls), 1)
+        second_stages = [event["stage"] for event in second_progress]
+        self.assertNotIn("creating_runtime", second_stages)
+        self.assertNotIn("installing_runtime", second_stages)
+        self.assertTrue(
+            any(
+                event["stage"] == "runtime_ready"
+                and event["status"] == "reused"
+                for event in second_progress
+            )
+        )
+
+        execution = runner.prepare_environment(
+            project_path,
+            runtime_pool=self.service.pool,
+            runtime_installer=self._fake_installer,
+            runtime_requirement="maafw==4.3.0",
+        )
+        try:
+            self.assertEqual(execution.runtime_id, runtime_id)
+            self.assertEqual(len(self.install_calls), 1)
+            self.assertTrue(execution.lease_id)
+        finally:
+            runner.release_environment(execution, runtime_pool=self.service.pool)
+
+    def test_project_preflight_failure_reports_and_releases_lease(self) -> None:
+        project_path = Path(self.temporary_directory.name) / "failed-prewarm-project"
+        project_path.mkdir()
+        (project_path / "requirements.txt").write_text(
+            "maafw==4.3.0\n",
+            encoding="utf-8",
+        )
+        progress_events: list[dict[str, Any]] = []
+        runner = MaaFWRunnerService()
+
+        with (
+            mock.patch(
+                "automas_maafw_runner.service.MaaFWAgentEnvService.prepare_env",
+                side_effect=RuntimeError("agent preparation failed"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "agent preparation failed"),
+        ):
+            runner.prepare_project_environment(
+                project_path,
+                None,
+                runtime_pool=self.service.pool,
+                runtime_installer=self._fake_installer,
+                runtime_requirement="maafw==4.3.0",
+                progress=progress_events.append,
+            )
+
+        runtimes = self.service.pool.list()
+        self.assertEqual(len(runtimes), 1)
+        self.assertEqual(runtimes[0]["activeLeaseIds"], [])
+        self.assertEqual(progress_events[-1]["stage"], "failed")
+        self.assertEqual(progress_events[-1]["status"], "failed")
+        self.assertIn("agent preparation failed", progress_events[-1]["message"])
+        self.assertNotIn("percent", progress_events[-1])
 
     def test_runner_collects_stale_runtime_after_current_lease_is_acquired(
         self,
@@ -808,13 +1031,13 @@ class MaaFWRuntimePoolStaticContractTest(unittest.TestCase):
         pyproject = tomllib.loads(
             (RUNNER_PACKAGE / "pyproject.toml").read_text(encoding="utf-8")
         )
-        self.assertEqual(pyproject["project"]["version"], "0.3.3")
+        self.assertEqual(pyproject["project"]["version"], "0.3.4")
         self.assertIn(
             "automas-maafw-runtime-pool>=0.1.4",
             pyproject["project"]["dependencies"],
         )
         self.assertIn(
-            "automas-maafw-agent-env>=0.1.2",
+            "automas-maafw-agent-env>=0.1.3",
             pyproject["project"]["dependencies"],
         )
         self.assertIn(
@@ -824,7 +1047,7 @@ class MaaFWRuntimePoolStaticContractTest(unittest.TestCase):
         agent_env_pyproject = tomllib.loads(
             (AGENT_ENV_PACKAGE / "pyproject.toml").read_text(encoding="utf-8")
         )
-        self.assertEqual(agent_env_pyproject["project"]["version"], "0.1.2")
+        self.assertEqual(agent_env_pyproject["project"]["version"], "0.1.3")
 
         environment_source = (RUNNER_SOURCE / "environment.py").read_text(
             encoding="utf-8"
@@ -864,6 +1087,14 @@ class MaaFWRuntimePoolStaticContractTest(unittest.TestCase):
         self.assertIn("json-with-comments", environment_source)
         self.assertIn("child_args=child_args", agent_planner_source)
         self.assertIn("_is_safe_existing_python_entry", agent_planner_source)
+        self.assertIn('"ADB 连接方式: "', runner_source)
+        self.assertIn('"ADB 连接测速: ', runner_source)
+        self.assertIn('"ADB controller 传入候选集合: "', runner_source)
+        self.assertIn('"ADB controller 最终连接: "', runner_source)
+        self.assertIn(
+            '"MaaFW Python binding 未公开测速后实际选中的单项方法，"',
+            runner_source,
+        )
 
 
 if __name__ == "__main__":

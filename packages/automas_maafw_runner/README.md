@@ -14,11 +14,18 @@ canonical requirement selector rather than by project path. The returned
 environment holds a lease for the worker lifetime; callers must invoke
 `MaaFWRunnerService.release_environment()` in their worker cleanup path.
 Runtime Pool keeps selector venvs isolated while uv reuses a pool-local package
-cache with hardlinks. Runner 0.3.3 requires Runtime Pool 0.1.4+, which records
+cache with hardlinks. Runner 0.3.4 requires Runtime Pool 0.1.4+, which records
 installer/cache/link metadata, never composes environments through
 `PYTHONPATH`, and prunes the pool-local uv cache after collecting stale
 runtimes. Successful reclaim statistics and explicit unavailable/unsafe/error
 states are written to the runner log.
+
+`MaaFWRunnerService.prepare_project_environment()` prewarms both the exact
+canonical Runtime Pool identity used by the first real run and the project
+Agent environments. Its short preflight lease is always released; the later
+worker run reacquires the same runtime without reinstalling unchanged
+requirements. Optional progress events expose deterministic runtime/Agent
+stages and do not invent dependency-download byte counts.
 
 Managed projects may declare `runtime.constraint`, `runtime.binding`, and
 `nativePluginPaths` in `.auto_mas_maafw_project.json`. An isolated Python Agent

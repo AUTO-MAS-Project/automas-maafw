@@ -45,6 +45,33 @@ REQUIREMENT_NAME_RE = re.compile(
 _AUTOMATIC_GC_ROOTS: set[str] = set()
 _AUTOMATIC_GC_LOCK = threading.Lock()
 
+EnvironmentProgressCallback = Callable[[dict[str, Any]], None]
+
+
+def _report_environment_progress(
+    callback: EnvironmentProgressCallback | None,
+    stage: str,
+    status: str,
+    message: str,
+    *,
+    percent: float | None = None,
+    **payload: Any,
+) -> None:
+    if callback is None:
+        return
+    event: dict[str, Any] = {
+        "stage": stage,
+        "status": status,
+        "message": message,
+        **payload,
+    }
+    if percent is not None:
+        event["percent"] = percent
+    try:
+        callback(event)
+    except Exception:
+        return
+
 
 @dataclass(frozen=True)
 class MaaFWRunnerEnvironment:
@@ -72,6 +99,7 @@ def prepare_runner_environment(
     lease_ttl_seconds: float | None = DEFAULT_RUNTIME_LEASE_TTL_SECONDS,
     import_paths: Iterable[str | Path] = (),
     send_log: Callable[[str], None] | None = None,
+    progress: EnvironmentProgressCallback | None = None,
 ) -> MaaFWRunnerEnvironment:
     """Prepare or reuse a runner selected by canonical requirements.
 
@@ -80,6 +108,13 @@ def prepare_runner_environment(
     same canonical requirements therefore share one worker environment.
     """
 
+    _report_environment_progress(
+        progress,
+        "resolving",
+        "running",
+        "正在解析 MaaFW Runner 依赖",
+        percent=5.0,
+    )
     project = Path(project_path).resolve()
     route = _load_project_runtime_route(project)
     managed_project = (
@@ -142,10 +177,41 @@ def prepare_runner_environment(
         )
     )
     expected_runtime_id = build_runtime_id(packages)
+    _report_environment_progress(
+        progress,
+        "runtime_check",
+        "running",
+        "正在检查共享 MaaFW Runtime",
+        percent=15.0,
+        runtime_id=expected_runtime_id,
+    )
     if bound_runtime_id and bound_runtime_id != expected_runtime_id:
         raise RuntimeError(
             "MaaFW runtime binding 与当前 canonical requirement selector 不匹配: "
             f"binding={bound_runtime_id}, expected={expected_runtime_id}"
+        )
+
+    existing_runtime = (
+        bound_runtime
+        if bound_runtime_id == expected_runtime_id
+        else pool.get(expected_runtime_id)
+    )
+    if existing_runtime is None:
+        _report_environment_progress(
+            progress,
+            "creating_runtime",
+            "running",
+            "正在创建共享 MaaFW Runtime",
+            percent=25.0,
+            runtime_id=expected_runtime_id,
+        )
+        _report_environment_progress(
+            progress,
+            "installing_runtime",
+            "running",
+            "正在安装 MaaFW Runner 依赖",
+            percent=30.0,
+            runtime_id=expected_runtime_id,
         )
 
     def install(
@@ -170,6 +236,18 @@ def prepare_runner_environment(
         metadata={"component": "automas-maafw-runner"},
     )
     resolved_runtime_id = str(runtime["runtimeId"])
+    _report_environment_progress(
+        progress,
+        "runtime_ready",
+        "reused" if existing_runtime is not None else "created",
+        (
+            "已复用共享 MaaFW Runtime"
+            if existing_runtime is not None
+            else "共享 MaaFW Runtime 已创建"
+        ),
+        percent=70.0,
+        runtime_id=resolved_runtime_id,
+    )
     lease_id = f"runner-{uuid.uuid4().hex}"
     runtime = pool.acquire_lease(
         resolved_runtime_id,
