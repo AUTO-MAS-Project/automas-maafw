@@ -36,11 +36,11 @@ class ScriptMaaFWManagedContractTest(unittest.TestCase):
             },
         )
         dependencies = project["project"]["dependencies"]
-        self.assertIn("automas-script-maafw>=0.1.9", dependencies)
-        self.assertIn("automas-maafw-runner>=0.3.3", dependencies)
+        self.assertIn("automas-script-maafw>=0.1.10", dependencies)
+        self.assertIn("automas-maafw-runner>=0.3.4", dependencies)
         self.assertIn("automas-maafw-project-store>=0.2.0", dependencies)
         self.assertIn("automas-maafw-runtime-pool>=0.1.4", dependencies)
-        self.assertIn("automas-maafw-project-update>=0.2.0", dependencies)
+        self.assertIn("automas-maafw-project-update>=0.2.1", dependencies)
 
     def test_adapter_registration_is_declarative_and_reuses_icon(self) -> None:
         tree = ast.parse((MODULE_ROOT / "plugin.py").read_text(encoding="utf-8"))

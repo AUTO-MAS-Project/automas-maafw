@@ -54,17 +54,34 @@ class Plugin:
 | PyPI 包 | 当前版本 | 服务名 | 主要职责 |
 |---|---:|---|---|
 | `automas-maafw-interface` | 0.2.0 | `maafw.interface.v1` | PI 加载、校验、预览、任务快照和 option 归一化 |
-| `automas-maafw-project-update` | 0.2.0 | `maafw.project_update.v1` | MirrorChyan/GitHub Release 版本发现、受限下载、可安装候选与更新 |
-| `automas-maafw-agent-env` | 0.1.2 | `maafw.agent_env.v1` | agent 运行方式识别、命令规划和 Python 环境准备 |
+| `automas-maafw-project-update` | 0.2.1 | `maafw.project_update.v1` | MirrorChyan/GitHub Release 版本发现、受限下载、可安装候选与更新 |
+| `automas-maafw-agent-env` | 0.1.3 | `maafw.agent_env.v1` | agent 运行方式识别、命令规划和 Python 环境准备 |
 | `automas-maafw-controller-adb` | 0.1.1 | `maafw.controller.adb` | ADB provider 与设备参数构建 |
 | `automas-maafw-controller-win32` | 0.1.2 | `maafw.controller.win32` | Win32 provider、窗口扫描与设备参数构建 |
 | `automas-maafw-project-store` | 0.2.0 | `maafw.project_store.v1` | 本地目录/ZIP 资源导入、不可变版本、能力摘要、引用和 GC |
 | `automas-maafw-runtime-pool` | 0.1.4 | `maafw.runtime_pool.v1` | 按 requirement selector 隔离环境并通过 uv cache/hardlink 复用依赖 |
-| `automas-maafw-runner` | 0.3.3 | `maafw.runner.v1` | 运行计划、worker job、runtime 路由和结果模型 |
-| `automas-script-maafw` | 0.1.9 | `maafw.registry.v1`、`maafw.configuration_reuse.v1` | MaaFW 脚本适配、能力注册、原生配置导入和用户复制 |
+| `automas-maafw-runner` | 0.3.4 | `maafw.runner.v1` | 运行计划、worker job、runtime 路由、环境预热和结果模型 |
+| `automas-script-maafw` | 0.1.10 | `maafw.registry.v1`、`maafw.configuration_reuse.v1` | MaaFW 脚本适配、能力注册、原生配置导入和用户复制 |
 | `automas-script-maafw-managed` | 0.2.0 | 无 | 声明式本地/远程资源管理、运行绑定与 pack 升级计划 |
 | `automas-script-maafw-pack-m9a` | 0.1.4 | `maafw.pack.m9a.v1` | M9A 默认约定、资源 profile/升级规划和通知翻译 |
 | `automas-m9a` | 0.1.4 | 无 | 聚合安装上述 MaaFW/M9A 插件 |
+
+### 3.1 发布依赖顺序
+
+`publish.yml` 每次只发布一个 distribution。当前版本按以下层级发布；同层可并行，
+下一层必须等待依赖版本已经可从 PyPI 安装：
+
+1. `automas-maafw-interface` 0.2.0、`automas-maafw-project-store` 0.2.0、
+   `automas-maafw-runtime-pool` 0.1.4。
+2. `automas-maafw-agent-env` 0.1.3、`automas-maafw-project-update` 0.2.1。
+3. `automas-maafw-runner` 0.3.4。
+4. `automas-script-maafw` 0.1.10。
+5. `automas-script-maafw-managed` 0.2.0。
+
+首次发布 Project Store、Runtime Pool 和 Managed 前，仍须创建
+`pypi-project-store`、`pypi-runtime-pool`、`pypi-script-maafw-managed` GitHub
+Environments，并为三个包配置与仓库、workflow、environment 精确匹配的 PyPI
+pending trusted publishers；这些是外部发布前置，不由本地代码或构建代替。
 
 ## 4. `maafw.interface.v1`
 
@@ -270,6 +287,7 @@ await apply_update(
     *,
     proxy=None,
     send_log=None,
+    progress=None,
 ) -> None
 
 await download_package(
@@ -279,6 +297,7 @@ await download_package(
     proxy=None,
     send_log=None,
     max_download_bytes=4 * 1024 * 1024 * 1024,
+    progress=None,
 ) -> dict[str, Any]
 
 await update_if_needed(
@@ -290,6 +309,7 @@ await update_if_needed(
     proxy=None,
     send_log=None,
     source_config=None,
+    progress=None,
 ) -> MaaFWProjectUpdateResult
 ```
 
@@ -298,7 +318,7 @@ await update_if_needed(
 `source_config` 常用字段：
 
 ```text
-source: mirrorchyan | github_release
+source: ""（自动） | mirrorchyan | github_release
 channel
 mirror_cdk / cdk
 github_repo
@@ -350,11 +370,31 @@ MaaFWProjectUpdateResult:
 但没有给出可安装下载地址。`check_update()` 仅兼容旧的 candidate-only 调用，
 遇到这种状态会抛出可诊断错误，绝不会返回伪 candidate。
 
+省略 `source` 或传空字符串表示自动模式。PI 有 MirrorChyan RID 时，MirrorChyan
+始终是版本元数据权威；即使 CDK 为空、响应没有下载地址，也会保留已发现版本。
+只有 GitHub Release 给出相同规范化版本且 ZIP asset 选择唯一时，安装包才回退到
+GitHub。显式 `mirrorchyan` 不回退，显式 `github_release` 不查询 MirrorChyan；PI
+没有 RID 的自动模式直接使用 GitHub。脚本级空 `cdk`/`mirror_cdk` 会继承宿主传入
+的非空 `mirror_cdk`。
+
+GitHub 包选择只接受 Release assets，不把仓库 `zipball` 当作发行包。显式
+`github_asset_pattern` 命中多个文件或按项目名、Windows/x64 约定仍无法得到唯一
+ZIP 时，发现结果保持不可安装，绝不会拿列表中的第一个 ZIP 猜测。
+
 `download_package()` 只接受 HTTPS，逐跳校验重定向，流式限制下载大小，并在
 ZIP/SHA256 校验后以内容哈希文件名原子发布到调用方管理的目录。并发下载不共享
 可变临时文件；相同内容复用同一归档，不同内容不会因版本名相同而互相覆盖。
 该方法不解压、不修改活动项目，Project Store 仍是安全解包与不可变导入的唯一
 权威。
+
+`progress(event)` 是 best-effort、JSON-friendly 的观察回调；回调异常不会中断
+更新事务。`event.stage` 可能为 `checking`、`downloading`、`validating`、
+`extracting`、`switching`、`completed` 或 `failed`。下载事件提供真实
+`downloaded_bytes`、`total_bytes` 和 `percent`：已知总长按 200 ms 或 1% 节流，
+未知总长按 250 ms 或 1 MiB 节流。整个下载（含重试）共用 300 秒墙钟 deadline；
+超时会删除临时文件并发出 `failed/download_timeout`，不会进入校验、解压或切换。
+版本发现事件同时给出 `metadata_source` 和 `package_source`，用于区分 MirrorChyan
+元数据与 GitHub 安装包回退。
 
 ### 5.4 调用示例：检查并应用更新
 
@@ -419,6 +459,7 @@ prepare_env(
     send_log=None,
     bootstrap_python=None,
     install_dependencies=True,
+    progress=None,
 ) -> MaaFWAgentEnvPrepareResult
 ```
 
@@ -455,6 +496,14 @@ MaaFWAgentEnvPrepareResult:
   skipped: list[str]
   messages: list[str]
 ```
+
+`progress(event)` 为 best-effort 回调。Agent 环境事件始终包含 `stage`、`status`、
+`message`、`percent`、`completed`、`total`；当前 `stage` 为
+`preparing_agents`，百分比是按已完成计划数计算的确定值。回调异常不会影响环境
+准备。项目发行包自带的 `project_python` 只检查解释器能否启动并导入
+`maa.agent.agent_server.AgentServer`，不要求提供 pip/ensurepip，也不会由 AUTO-MAS
+修改；缺模块时应重新取得完整发行包。只有 AUTO-MAS 自建的 `isolated_venv` 才会
+执行依赖安装和 pip 健康检查。
 
 `interface_or_agent` 可以传完整 `MaaFWInterface`，也可以传单个 agent 或 agent 列表。单个 `MaaFWAgent` 的标准字段为：
 
@@ -655,9 +704,40 @@ prepare_environment(
     project_path,
     *,
     managed_env_root=None,
+    runtime_pool_root=None,
+    runtime_pool=None,
+    runtime_installer=None,
+    runtime_requirement=None,
+    runtime_id=None,
+    lease_owner="automas-maafw-runner",
+    lease_ttl_seconds=86400,
     import_paths=None,
     send_log=None,
+    progress=None,
 ) -> MaaFWRunnerEnvironment
+
+release_environment(
+    environment,
+    *,
+    runtime_pool=None,
+) -> dict | None
+
+prepare_project_environment(
+    project_path,
+    interface,
+    *,
+    runtime_pool_root=None,
+    runtime_pool=None,
+    runtime_installer=None,
+    runtime_requirement=None,
+    runtime_id=None,
+    agent_env_root=None,
+    import_paths=None,
+    send_log=None,
+    bootstrap_python=None,
+    install_agent_dependencies=True,
+    progress=None,
+) -> dict[str, Any]
 
 write_job_file(
     payload,
@@ -767,7 +847,41 @@ MaaFWRunnerEnvironment:
   env: dict[str, str]
   packages: tuple[str, ...]
   maafw_version: str | None
+  runtime_id: str | None
+  maafw_requirement: str | None
+  runtime_pool_root: Path | None
+  lease_id: str | None
+
+prepare_project_environment result:
+  status: "ready"
+  runtime:
+    runtimeId: str
+    pythonExecutable: str
+    venvPath: str
+    packages: list[str]
+    maafwRequirement: str | None
+    maafwVersion: str | None
+  agents:
+    projectPath: str
+    plans: list[MaaFWAgentCommandPlan]
+    preparedVenvs: list[str]
+    skipped: list[str]
+    messages: list[str]
 ```
+
+`prepare_project_environment()` 是安装/升级后可直接调用的完整预热入口。它与实际
+运行调用同一个 `prepare_environment()`，因此 canonical requirement selector、
+Python ABI 和 Runtime Pool fingerprint 完全一致；项目名、PI 版本等元数据不会
+制造另一套 runtime。预热只持有短期独立 lease，并在成功或失败的 `finally` 中
+释放；后续实际运行重新取得同一个 `runtimeId` 的执行 lease，已安装依赖不会重装。
+
+预热 `progress(event)` 始终含 `stage`、`status`、`message`，可选 `percent` 和
+`runtime_id`。阶段依次为 `resolving`、`runtime_check`、仅首次创建时出现的
+`creating_runtime`/`installing_runtime`、`runtime_ready`、`preparing_agents`、
+`completed`；失败终态为 `failed` 且不伪造百分比。`runtime_ready.status` 为
+`created` 或 `reused`。Agent 阶段映射到总进度 75–95%，附带 `agent_percent`、
+`completed`、`total`；完成态为 100%。依赖安装器目前没有可信字节级回调，因此
+Runtime 只报告确定阶段里程碑，不虚构下载字节或细分安装百分比。
 
 ### 9.3 调用示例：构建并执行 worker job
 
@@ -1120,8 +1234,8 @@ python -m pip install automas-m9a
 
 ```text
 automas-maafw-interface >= 0.2.0
-automas-maafw-runner >= 0.3.3
-automas-script-maafw >= 0.1.9
+automas-maafw-runner >= 0.3.4
+automas-script-maafw >= 0.1.10
 ```
 
 ## 14. 完整调用示例
@@ -1146,7 +1260,6 @@ async def run_maafw_project() -> None:
 
     interface_service = require_service("maafw.interface.v1")
     update_service = require_service("maafw.project_update.v1")
-    agent_service = require_service("maafw.agent_env.v1")
     adb_service = require_service("maafw.controller.adb")
     runner_service = require_service("maafw.runner.v1")
 
@@ -1168,12 +1281,14 @@ async def run_maafw_project() -> None:
             force_reload=True,
         )
 
-    agent_service.prepare_env(
+    prewarm = runner_service.prepare_project_environment(
         project_path,
         interface,
-        install_dependencies=True,
+        install_agent_dependencies=True,
         send_log=print,
+        progress=lambda event: print("env progress", event),
     )
+    print("prepared runtime", prewarm["runtime"]["runtimeId"])
 
     snapshot = interface_service.build_default_snapshot(interface)
     plan = runner_service.build_plan(
@@ -1355,6 +1470,7 @@ runtime_requirement=None
 runtime_id=None
 lease_owner="automas-maafw-runner"
 lease_ttl_seconds=86400
+progress=None
 ```
 
 托管项目未显式传参时，Runner 会读取项目根
@@ -1399,8 +1515,8 @@ Managed 的远程检查把“发现新版本”与“存在可安装候选”分
 和活动 ProjectInterface。下载 URL（可能包含短期签名或凭据）不会写入脚本配置，
 持久化发现结果只保留来源、版本、hash 与是否可下载。
 
-普通脚本 0.1.9 的配置复用同样依赖上述宿主事务 API。M9A 集成下限保持
-`automas-maafw-runner>=0.3.3` 与 `automas-script-maafw>=0.1.9`。
+普通脚本 0.1.10 的配置复用同样依赖上述宿主事务 API。M9A 集成下限必须为
+`automas-maafw-runner>=0.3.4` 与 `automas-script-maafw>=0.1.10`。
 
 ## 18. 变更规则
 
