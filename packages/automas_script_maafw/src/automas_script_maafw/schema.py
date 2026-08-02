@@ -3,6 +3,13 @@ from __future__ import annotations
 from typing import Any
 
 from app.plugins.fields import PluginField
+from pydantic import BaseModel, ConfigDict
+
+
+class Config(BaseModel):
+    """Host-level plugin instance configuration."""
+
+    model_config = ConfigDict(extra="allow")
 
 
 schema = {

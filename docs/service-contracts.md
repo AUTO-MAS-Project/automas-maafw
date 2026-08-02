@@ -56,15 +56,15 @@ class Plugin:
 | `automas-maafw-interface` | 0.2.0 | `maafw.interface.v1` | PI 加载、校验、预览、任务快照和 option 归一化 |
 | `automas-maafw-project-update` | 0.2.0 | `maafw.project_update.v1` | MirrorChyan/GitHub Release 版本发现、受限下载、可安装候选与更新 |
 | `automas-maafw-agent-env` | 0.1.2 | `maafw.agent_env.v1` | agent 运行方式识别、命令规划和 Python 环境准备 |
-| `automas-maafw-controller-adb` | 0.1.0 | `maafw.controller.adb` | ADB provider 与设备参数构建 |
-| `automas-maafw-controller-win32` | 0.1.1 | `maafw.controller.win32` | Win32 provider、窗口扫描与设备参数构建 |
+| `automas-maafw-controller-adb` | 0.1.1 | `maafw.controller.adb` | ADB provider 与设备参数构建 |
+| `automas-maafw-controller-win32` | 0.1.2 | `maafw.controller.win32` | Win32 provider、窗口扫描与设备参数构建 |
 | `automas-maafw-project-store` | 0.2.0 | `maafw.project_store.v1` | 本地目录/ZIP 资源导入、不可变版本、能力摘要、引用和 GC |
 | `automas-maafw-runtime-pool` | 0.1.4 | `maafw.runtime_pool.v1` | 按 requirement selector 隔离环境并通过 uv cache/hardlink 复用依赖 |
 | `automas-maafw-runner` | 0.3.3 | `maafw.runner.v1` | 运行计划、worker job、runtime 路由和结果模型 |
 | `automas-script-maafw` | 0.1.9 | `maafw.registry.v1`、`maafw.configuration_reuse.v1` | MaaFW 脚本适配、能力注册、原生配置导入和用户复制 |
 | `automas-script-maafw-managed` | 0.2.0 | 无 | 声明式本地/远程资源管理、运行绑定与 pack 升级计划 |
-| `automas-script-maafw-pack-m9a` | 0.1.0 | `maafw.pack.m9a.v1` | M9A 默认约定、通知翻译和旧配置迁移草稿 |
-| `automas-m9a` | 0.1.0 | 无 | 聚合安装上述 MaaFW/M9A 插件 |
+| `automas-script-maafw-pack-m9a` | 0.1.4 | `maafw.pack.m9a.v1` | M9A 默认约定、资源 profile/升级规划和通知翻译 |
+| `automas-m9a` | 0.1.4 | 无 | 聚合安装上述 MaaFW/M9A 插件 |
 
 ## 4. `maafw.interface.v1`
 

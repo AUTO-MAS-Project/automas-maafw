@@ -8,6 +8,13 @@ from automas_script_maafw.schema import (
     SCRIPT_GROUPS as MAAFW_SCRIPT_GROUPS,
     USER_GROUPS as MAAFW_USER_GROUPS,
 )
+from pydantic import BaseModel, ConfigDict
+
+
+class Config(BaseModel):
+    """Host-level plugin instance configuration."""
+
+    model_config = ConfigDict(extra="allow")
 
 
 schema = {
