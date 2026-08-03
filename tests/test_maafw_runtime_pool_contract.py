@@ -40,8 +40,11 @@ from automas_maafw_runtime_pool import (  # noqa: E402
     MaaFWRuntimeIdentityError,
     MaaFWRuntimePoolError,
     MaaFWRuntimePoolService,
+    POOL_MARKER_NAME,
+    POOL_SCHEMA_VERSION,
     build_runtime_identity,
 )
+from automas_maafw_runtime_pool import installer as runtime_installer  # noqa: E402
 from automas_maafw_agent_env.planner import (  # noqa: E402
     build_maafw_agent_command_plans,
 )
@@ -103,6 +106,215 @@ class MaaFWRuntimePoolContractTest(unittest.TestCase):
             },
             "link": {"mode": "hardlink"},
         }
+
+    def test_uv_discovery_honors_host_configured_executable(self) -> None:
+        configured_uv = self.pool_root.parent / "host-tools" / "uv.exe"
+        configured_uv.parent.mkdir(parents=True)
+        configured_uv.write_bytes(b"test uv")
+
+        with mock.patch.dict(
+            os.environ,
+            {"AUTO_MAS_UV_EXE": str(configured_uv)},
+        ):
+            resolved = runtime_installer._find_uv_executable(sys.executable)
+
+        self.assertEqual(resolved, str(configured_uv.resolve()))
+
+    def test_root_marker_identity_is_stable_and_json_friendly(self) -> None:
+        first = self.service.storage_info()
+        marker = json.loads(
+            (self.pool_root / POOL_MARKER_NAME).read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(marker["schemaVersion"], POOL_SCHEMA_VERSION)
+        self.assertEqual(marker["kind"], "auto-mas-maafw-runtime-pool")
+        self.assertEqual(first["poolId"], marker["poolId"])
+        self.assertEqual(first["root"], str(self.pool_root.resolve()))
+        self.assertFalse(first["isDefault"])
+        self.assertEqual(first["rootIdentity"], self.service.rootIdentity)
+
+        reopened = MaaFWRuntimePoolService(
+            self.pool_root,
+            installer=self._fake_installer,
+        )
+        self.assertEqual(reopened.storage_info()["poolId"], first["poolId"])
+
+    def test_configured_root_rejects_unknown_non_empty_directory(self) -> None:
+        unknown = Path(self.temporary_directory.name) / "unknown-pool"
+        unknown.mkdir()
+        sentinel = unknown / "sentinel.txt"
+        sentinel.write_text("keep", encoding="utf-8")
+
+        with self.assertRaisesRegex(
+            MaaFWRuntimePoolError,
+            "non-empty directory without a valid runtime-pool marker",
+        ):
+            MaaFWRuntimePoolService(unknown, installer=self._fake_installer)
+
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep")
+        self.assertFalse((unknown / POOL_MARKER_NAME).exists())
+
+    def test_legacy_marker_is_upgraded_in_place(self) -> None:
+        legacy = Path(self.temporary_directory.name) / "legacy-pool"
+        legacy.mkdir()
+        marker_path = legacy / POOL_MARKER_NAME
+        marker_path.write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "kind": "auto-mas-maafw-runtime-pool",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        migrated = MaaFWRuntimePoolService(legacy, installer=self._fake_installer)
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(marker["schemaVersion"], POOL_SCHEMA_VERSION)
+        self.assertEqual(marker["poolId"], migrated.storage_info()["poolId"])
+
+    def test_legacy_default_layout_is_adopted_without_moving_content(self) -> None:
+        working_directory = Path(self.temporary_directory.name) / "legacy-host"
+        legacy_root = working_directory / "config" / "maafw_runtime_pool"
+        (legacy_root / "runtimes").mkdir(parents=True)
+        (legacy_root / ".staging").mkdir()
+        (legacy_root / "cache").mkdir()
+        sentinel = legacy_root / "cache" / "sentinel"
+        sentinel.write_text("keep", encoding="utf-8")
+
+        with mock.patch(
+            "automas_maafw_runtime_pool.service.Path.cwd",
+            return_value=working_directory,
+        ), mock.patch(
+            "automas_maafw_runtime_pool.pool.Path.cwd",
+            return_value=working_directory,
+        ):
+            adopted = MaaFWRuntimePoolService(installer=self._fake_installer)
+
+        self.assertTrue((legacy_root / POOL_MARKER_NAME).is_file())
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep")
+        self.assertTrue(adopted.storage_info()["isDefault"])
+
+    def test_invalid_marker_fails_closed(self) -> None:
+        invalid = Path(self.temporary_directory.name) / "invalid-pool-marker"
+        invalid.mkdir()
+        (invalid / POOL_MARKER_NAME).write_text(
+            json.dumps(
+                {
+                    "schemaVersion": POOL_SCHEMA_VERSION,
+                    "kind": "not-a-runtime-pool",
+                    "poolId": "00000000-0000-0000-0000-000000000000",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(MaaFWRuntimePoolError, "marker kind is invalid"):
+            MaaFWRuntimePoolService(invalid, installer=self._fake_installer)
+
+    def test_plugin_uses_root_from_context_config(self) -> None:
+        from automas_maafw_runtime_pool.plugin import Plugin
+
+        configured = Path(self.temporary_directory.name) / "configured-pool"
+        context = type("Context", (), {"config": {"Root": str(configured)}})()
+
+        plugin = Plugin(context)
+
+        self.assertEqual(plugin.service.pool.root, configured.resolve())
+
+    def test_configured_root_must_be_absolute(self) -> None:
+        with self.assertRaisesRegex(MaaFWRuntimePoolError, "absolute path"):
+            MaaFWRuntimePoolService("relative-pool", installer=self._fake_installer)
+
+    def test_runtime_dtos_include_pool_identity_and_inventory_reports_corruption(
+        self,
+    ) -> None:
+        runtime = self.service.ensure_runtime({"requirements": ["maafw==4.3.0"]})
+        self.assertEqual(runtime["poolId"], self.service.storage_info()["poolId"])
+        corrupt = self.pool_root / "runtimes" / "maafw-runtime-corrupt"
+        corrupt.mkdir()
+        (corrupt / "manifest.json").write_text("{}", encoding="utf-8")
+
+        snapshot = self.service.inventory()
+
+        self.assertFalse(snapshot["complete"])
+        self.assertEqual(len(snapshot["items"]), 1)
+        self.assertEqual(snapshot["items"][0]["poolId"], runtime["poolId"])
+        self.assertEqual(snapshot["errors"][0]["runtimeId"], corrupt.name)
+        self.assertEqual(
+            snapshot["rootIdentity"]["poolId"],
+            runtime["poolId"],
+        )
+        preview = self.service.collect_garbage(
+            dry_run=True,
+            grace_seconds=0,
+            keep_latest=0,
+            now="2030-01-01T00:00:00Z",
+        )
+        self.assertFalse(preview["complete"])
+        self.assertTrue(preview["inventoryErrors"])
+        self.assertEqual(preview["deleted"], [])
+        self.assertEqual(
+            preview["cachePrune"]["status"],
+            "skipped-incomplete-inventory",
+        )
+        with self.assertRaisesRegex(
+            MaaFWRuntimePoolError,
+            "inventory is incomplete",
+        ):
+            self.service.collect_garbage(
+                dry_run=False,
+                grace_seconds=0,
+                keep_latest=0,
+                now="2030-01-01T00:00:00Z",
+            )
+        self.assertTrue(Path(runtime["path"]).is_dir())
+
+    def test_gc_refuses_runtime_manifest_with_malformed_lease(self) -> None:
+        runtime = self.service.ensure_runtime({"requirements": ["maafw==4.3.0"]})
+        manifest_path = Path(runtime["path"]) / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["leases"] = {
+            "possibly-active": {
+                "owner": "runner",
+                "expiresAt": "",
+            }
+        }
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        preview = self.service.collect_garbage(
+            dry_run=True,
+            grace_seconds=0,
+            keep_latest=0,
+            now="2030-01-01T00:00:00Z",
+        )
+        self.assertFalse(preview["complete"])
+        self.assertTrue(preview["inventoryErrors"])
+        self.assertEqual(preview["deleted"], [])
+        with self.assertRaisesRegex(
+            MaaFWRuntimePoolError,
+            "inventory is incomplete",
+        ):
+            self.service.collect_garbage(
+                dry_run=False,
+                grace_seconds=0,
+                keep_latest=0,
+                now="2030-01-01T00:00:00Z",
+            )
+        self.assertTrue(Path(runtime["path"]).is_dir())
+
+    def test_reparse_root_is_rejected_when_supported(self) -> None:
+        target = Path(self.temporary_directory.name) / "runtime-reparse-target"
+        target.mkdir()
+        link = Path(self.temporary_directory.name) / "runtime-reparse-link"
+        try:
+            link.symlink_to(target, target_is_directory=True)
+        except OSError as exc:
+            self.skipTest(f"directory symlink unavailable: {exc}")
+
+        with self.assertRaisesRegex(MaaFWRuntimePoolError, "reparse points"):
+            MaaFWRuntimePoolService(link, installer=self._fake_installer)
 
     def test_canonical_selector_is_shared_without_project_path_identity(self) -> None:
         first = self.service.ensure_runtime(
@@ -978,7 +1190,7 @@ class MaaFWRuntimePoolStaticContractTest(unittest.TestCase):
         entry_points = project["entry-points"]["auto_mas.plugins"]
 
         self.assertEqual(project["name"], "automas-maafw-runtime-pool")
-        self.assertEqual(project["version"], "0.1.4")
+        self.assertEqual(project["version"], "0.1.5")
         self.assertEqual(
             entry_points["automas_maafw_runtime_pool"],
             "automas_maafw_runtime_pool.plugin:Plugin",

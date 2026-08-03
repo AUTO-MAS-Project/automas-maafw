@@ -6,6 +6,7 @@ import os
 import platform
 import re
 import shutil
+import stat
 import threading
 import uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -24,7 +25,8 @@ from .identity import (
 )
 
 
-POOL_SCHEMA_VERSION = 1
+POOL_SCHEMA_VERSION = 2
+LEGACY_POOL_SCHEMA_VERSION = 1
 MANIFEST_SCHEMA_VERSION = 1
 POOL_MARKER_NAME = ".auto_mas_maafw_runtime_pool.json"
 RUNTIME_MANIFEST_NAME = "manifest.json"
@@ -54,12 +56,49 @@ class MaaFWRuntimePool:
         installer: RuntimeInstaller | None = None,
         cache_pruner: RuntimeCachePruner | None = prune_uv_cache,
     ) -> None:
-        self.root = Path(root).resolve()
+        default_root = Path.cwd() / "config" / "maafw_runtime_pool"
+        requested_root = Path(root)
+        if not requested_root.is_absolute():
+            raise MaaFWRuntimePoolError(
+                "configured runtime-pool root must be an absolute path"
+            )
+        absolute_root = Path(os.path.abspath(requested_root))
+        _assert_existing_chain_has_no_reparse(absolute_root)
+        if absolute_root.exists() and not absolute_root.is_dir():
+            raise MaaFWRuntimePoolError(
+                f"runtime-pool root must be a directory: {absolute_root}"
+            )
+        absolute_root.mkdir(parents=True, exist_ok=True)
+        _assert_not_reparse(absolute_root)
+        self.root = absolute_root.resolve(strict=True)
+        self._is_default_root = _same_path(self.root, default_root)
         self.runtime_root = self.root / RUNTIME_DIRECTORY_NAME
         self.staging_root = self.root / STAGING_DIRECTORY_NAME
         self.installer = installer
         self.cache_pruner = cache_pruner
         self._lock = _pool_lock(self.root)
+        self._root_identity: dict[str, Any] = {}
+        with self._lock:
+            self._initialize()
+
+    @property
+    def root_identity(self) -> dict[str, Any]:
+        with self._lock:
+            self._initialize()
+            return copy.deepcopy(self._root_identity)
+
+    @property
+    def rootIdentity(self) -> dict[str, Any]:  # noqa: N802 - public JSON contract
+        return self.root_identity
+
+    def storage_info(self) -> dict[str, Any]:
+        identity = self.root_identity
+        return {
+            "root": str(self.root),
+            "poolId": identity["poolId"],
+            "isDefault": self._is_default_root,
+            "rootIdentity": identity,
+        }
 
     def list(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -358,6 +397,32 @@ class MaaFWRuntimePool:
         cutoff = reference_time - timedelta(seconds=float(grace_seconds))
 
         with self._lock:
+            inventory = self.inventory()
+            if not inventory["complete"]:
+                if not dry_run:
+                    raise MaaFWRuntimePoolError(
+                        "refusing runtime-pool garbage collection because "
+                        "resource inventory is incomplete"
+                    )
+                return {
+                    "dryRun": True,
+                    "complete": False,
+                    "inventoryErrors": copy.deepcopy(inventory["errors"]),
+                    "graceSeconds": float(grace_seconds),
+                    "keepLatest": int(keep_latest),
+                    "candidates": [],
+                    "deleted": [],
+                    "kept": [],
+                    "errors": [],
+                    "cachePrune": {
+                        "kind": "uv",
+                        "scope": "pool",
+                        "dryRun": True,
+                        "attempted": False,
+                        "status": "skipped-incomplete-inventory",
+                        "error": "resource inventory is incomplete",
+                    },
+                }
             runtimes = self.list()
             keep_ids = {
                 str(item["runtimeId"])
@@ -398,6 +463,8 @@ class MaaFWRuntimePool:
             cache_prune = self._prune_cache(dry_run=bool(dry_run))
             return {
                 "dryRun": bool(dry_run),
+                "complete": True,
+                "inventoryErrors": [],
                 "graceSeconds": float(grace_seconds),
                 "keepLatest": int(keep_latest),
                 "candidates": candidates,
@@ -430,25 +497,99 @@ class MaaFWRuntimePool:
             }
 
     def _initialize(self) -> None:
-        self.root.mkdir(parents=True, exist_ok=True)
-        self.runtime_root.mkdir(parents=True, exist_ok=True)
-        self.staging_root.mkdir(parents=True, exist_ok=True)
+        # Validate every managed child before reading or upgrading the marker so
+        # an unsafe legacy layout is rejected without modifying it first.
+        for managed_path in (
+            self.runtime_root,
+            self.staging_root,
+            self.root / "cache",
+        ):
+            _assert_existing_chain_has_no_reparse(managed_path)
         marker_path = self.root / POOL_MARKER_NAME
-        if marker_path.is_file():
+        if marker_path.exists() or marker_path.is_symlink():
+            _assert_not_reparse(marker_path)
+            if not marker_path.is_file():
+                raise MaaFWRuntimePoolError(
+                    f"runtime pool marker must be a file: {marker_path}"
+                )
             try:
                 marker = json.loads(marker_path.read_text(encoding="utf-8"))
             except Exception as exc:
                 raise MaaFWRuntimePoolError(f"runtime pool marker is invalid: {exc}") from exc
-            if marker.get("schemaVersion") != POOL_SCHEMA_VERSION:
-                raise MaaFWRuntimePoolError("runtime pool marker version is unsupported")
-            return
-        _write_json_atomic(
-            marker_path,
-            {
+            if (
+                isinstance(marker, dict)
+                and marker.get("schemaVersion") == LEGACY_POOL_SCHEMA_VERSION
+                and marker.get("kind") == "auto-mas-maafw-runtime-pool"
+                and not marker.get("poolId")
+            ):
+                marker = {
+                    "schemaVersion": POOL_SCHEMA_VERSION,
+                    "kind": "auto-mas-maafw-runtime-pool",
+                    "poolId": str(uuid.uuid4()),
+                }
+                _write_json_atomic(marker_path, marker)
+            identity = _validate_pool_marker(marker)
+        else:
+            children = list(self.root.iterdir())
+            if children:
+                if not self._is_default_root or not _is_legacy_default_pool(children):
+                    raise MaaFWRuntimePoolError(
+                        "refusing to initialize a non-empty directory without a valid "
+                        f"runtime-pool marker: {self.root}"
+                    )
+            marker = {
                 "schemaVersion": POOL_SCHEMA_VERSION,
                 "kind": "auto-mas-maafw-runtime-pool",
-            },
-        )
+                "poolId": str(uuid.uuid4()),
+            }
+            _write_json_atomic(marker_path, marker)
+            identity = _validate_pool_marker(marker)
+        if self._root_identity and self._root_identity != identity:
+            raise MaaFWRuntimePoolError(
+                "runtime pool identity changed during the service lifetime"
+            )
+        self._root_identity = identity
+        _assert_existing_chain_has_no_reparse(self.runtime_root)
+        _assert_existing_chain_has_no_reparse(self.staging_root)
+        self.runtime_root.mkdir(parents=True, exist_ok=True)
+        self.staging_root.mkdir(parents=True, exist_ok=True)
+        _assert_not_reparse(self.runtime_root)
+        _assert_not_reparse(self.staging_root)
+
+    def inventory(self) -> dict[str, Any]:
+        """List every managed-looking runtime and report corruption explicitly."""
+
+        with self._lock:
+            self._initialize()
+            items: list[dict[str, Any]] = []
+            errors: list[dict[str, Any]] = []
+            for path in self.runtime_root.iterdir():
+                try:
+                    _assert_not_reparse(path)
+                    if not path.is_dir():
+                        raise MaaFWRuntimePoolError(
+                            f"managed runtime path must be a directory: {path}"
+                        )
+                    manifest = self._read_manifest(path.name)
+                    items.append(self._augment_manifest(manifest))
+                except Exception as exc:
+                    errors.append(
+                        {
+                            "runtimeId": path.name,
+                            "path": str(path),
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                    )
+            items.sort(
+                key=lambda item: str(item.get("lastUsedAt") or ""),
+                reverse=True,
+            )
+            return {
+                "complete": not errors,
+                "items": items,
+                "errors": errors,
+                "rootIdentity": self.root_identity,
+            }
 
     def _runtime_dir(self, runtime_id: str) -> Path:
         _validate_runtime_id(runtime_id)
@@ -506,6 +647,7 @@ class MaaFWRuntimePool:
             manifest.get("resolvedRequirements", []),
             "resolvedRequirements",
         )
+        _validate_runtime_leases(manifest.get("leases", {}))
         if expected_identity is not None and manifest.get("identity") != expected_identity:
             raise MaaFWRuntimePoolError(
                 f"runtime requirement selector mismatch: {runtime_id}"
@@ -537,6 +679,7 @@ class MaaFWRuntimePool:
             )
         now = _utc_now()
         payload["path"] = str(runtime_dir)
+        payload["poolId"] = self._root_identity["poolId"]
         payload["environmentPath"] = str(environment_path)
         payload["venvPath"] = str(environment_path)
         payload["pythonExecutable"] = str(python_executable)
@@ -665,6 +808,64 @@ def _pool_lock(root: Path) -> threading.RLock:
         return _POOL_LOCKS.setdefault(key, threading.RLock())
 
 
+def _validate_pool_marker(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise MaaFWRuntimePoolError("runtime pool marker must be a JSON object")
+    if value.get("schemaVersion") != POOL_SCHEMA_VERSION:
+        raise MaaFWRuntimePoolError("runtime pool marker version is unsupported")
+    if value.get("kind") != "auto-mas-maafw-runtime-pool":
+        raise MaaFWRuntimePoolError("runtime pool marker kind is invalid")
+    pool_id = value.get("poolId")
+    try:
+        normalized_pool_id = str(uuid.UUID(str(pool_id or "")))
+    except ValueError as exc:
+        raise MaaFWRuntimePoolError("runtime pool marker poolId is invalid") from exc
+    return {
+        "schemaVersion": POOL_SCHEMA_VERSION,
+        "kind": "auto-mas-maafw-runtime-pool",
+        "poolId": normalized_pool_id,
+    }
+
+
+def _is_legacy_default_pool(children: Iterable[Path]) -> bool:
+    known_names = {RUNTIME_DIRECTORY_NAME, STAGING_DIRECTORY_NAME, "cache"}
+    for child in children:
+        _assert_not_reparse(child)
+        if child.name not in known_names or not child.is_dir():
+            return False
+    return True
+
+
+def _assert_existing_chain_has_no_reparse(path: Path) -> None:
+    existing: list[Path] = []
+    current = path
+    while True:
+        if current.exists() or current.is_symlink():
+            existing.append(current)
+        if current.parent == current:
+            break
+        current = current.parent
+    for item in reversed(existing):
+        _assert_not_reparse(item)
+
+
+def _assert_not_reparse(path: Path) -> None:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    file_attributes = getattr(metadata, "st_file_attributes", 0)
+    if path.is_symlink() or bool(file_attributes & reparse_flag):
+        raise MaaFWRuntimePoolError(f"reparse points are not allowed: {path}")
+
+
+def _same_path(left: Path, right: Path) -> bool:
+    return os.path.normcase(str(left.resolve(strict=False))) == os.path.normcase(
+        str(Path(os.path.abspath(right)).resolve(strict=False))
+    )
+
+
 def _validate_runtime_id(runtime_id: str) -> None:
     if not RUNTIME_ID_RE.fullmatch(str(runtime_id or "")):
         raise MaaFWRuntimePoolError(f"invalid managed runtime id: {runtime_id}")
@@ -730,6 +931,30 @@ def _normalize_string_list(value: Any, field_name: str) -> list[str]:
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _validate_runtime_leases(value: Any) -> None:
+    if not isinstance(value, Mapping):
+        raise MaaFWRuntimePoolError("runtime manifest leases must be an object")
+    for lease_id, payload in value.items():
+        if not isinstance(lease_id, str) or not lease_id.strip():
+            raise MaaFWRuntimePoolError("runtime manifest lease id is invalid")
+        if not isinstance(payload, Mapping):
+            raise MaaFWRuntimePoolError("runtime manifest lease entry is invalid")
+        owner = payload.get("owner")
+        if not isinstance(owner, str):
+            raise MaaFWRuntimePoolError("runtime manifest lease owner is invalid")
+        expires_at = payload.get("expiresAt")
+        if expires_at is None:
+            continue
+        if not isinstance(expires_at, str) or not expires_at.strip():
+            raise MaaFWRuntimePoolError("runtime manifest lease expiry is invalid")
+        try:
+            _parse_time(expires_at)
+        except ValueError as exc:
+            raise MaaFWRuntimePoolError(
+                "runtime manifest lease expiry is invalid"
+            ) from exc
 
 
 def _parse_time(value: Any) -> datetime:

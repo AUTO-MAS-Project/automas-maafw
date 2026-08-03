@@ -33,11 +33,25 @@ class MaaFWRuntimePoolService:
             cache_pruner=cache_pruner,
         )
 
+    @property
+    def root_identity(self) -> dict[str, Any]:
+        return self.pool.root_identity
+
+    @property
+    def rootIdentity(self) -> dict[str, Any]:  # noqa: N802 - public JSON contract
+        return self.root_identity
+
+    def storage_info(self) -> dict[str, Any]:
+        return self.pool.storage_info()
+
     def list(self) -> list[dict[str, Any]]:
         return self.pool.list()
 
     def list_runtimes(self) -> list[dict[str, Any]]:
         return self.list()
+
+    def inventory(self) -> dict[str, Any]:
+        return self.pool.inventory()
 
     def resolve(
         self,

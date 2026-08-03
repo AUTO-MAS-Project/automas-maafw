@@ -2,6 +2,17 @@
 
 Shared, selector-addressed Python environments for MaaFW runner workers.
 
+The plugin instance exposes a `Root` setting. Leaving it empty preserves the
+legacy `config/maafw_runtime_pool` location under the AUTO-MAS working
+directory. The path is fixed for the service lifetime and configuration changes
+take effect after restart. Every pool has a persistent UUID in
+`.auto_mas_maafw_runtime_pool.json`; legacy version-1 markers are upgraded in
+place without moving runtimes. Empty roots and the known markerless default
+layout can be initialized, while unknown non-empty directories, invalid marker
+kinds, symlinks and Windows reparse-point chains are rejected. `storage_info()`
+returns the resolved root, `poolId`, default-root flag and JSON-friendly
+`rootIdentity`.
+
 The plugin provides the JSON-friendly `maafw.runtime_pool.v1` service. Runtime
 identity is a selector derived from the canonical requirement set and current
 Python ABI/platform/architecture. Projects with the same selector reuse one

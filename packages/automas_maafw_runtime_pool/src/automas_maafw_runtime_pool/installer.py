@@ -242,6 +242,12 @@ def _python_supports_venv(python: str) -> bool:
 
 
 def _find_uv_executable(bootstrap: str) -> str | None:
+    configured_uv = os.environ.get("AUTO_MAS_UV_EXE")
+    if configured_uv:
+        configured_path = Path(configured_uv)
+        if configured_path.is_file():
+            return str(configured_path.resolve())
+
     bootstrap_path = Path(bootstrap).resolve()
     bootstrap_candidates = (
         bootstrap_path.parent / "uv.exe",

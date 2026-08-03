@@ -12,6 +12,8 @@ from .installer import install_python_runtime
 from .pool import (
     MaaFWRuntimePool,
     MaaFWRuntimePoolError,
+    POOL_MARKER_NAME,
+    POOL_SCHEMA_VERSION,
     RuntimeCachePruner,
     RuntimeInstaller,
 )
@@ -22,6 +24,8 @@ __all__ = [
     "MaaFWRuntimePool",
     "MaaFWRuntimePoolError",
     "MaaFWRuntimePoolService",
+    "POOL_MARKER_NAME",
+    "POOL_SCHEMA_VERSION",
     "RuntimeCachePruner",
     "RuntimeInstaller",
     "build_runtime_identity",
