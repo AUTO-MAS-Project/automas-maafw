@@ -20,6 +20,7 @@ from .updater import (
     discover_maafw_project_update,
     download_maafw_project_package,
     list_update_providers,
+    release_maafw_project_package,
     update_maafw_project_if_needed,
 )
 
@@ -103,6 +104,20 @@ class MaaFWProjectUpdateService:
         )
         return self._downloaded_package_dict(downloaded)
 
+    async def release_download_package(
+        self,
+        download_root: str | Path,
+        package: MaaFWDownloadedProjectPackage | Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Safely release one archive previously returned by download_package."""
+
+        downloaded = self._coerce_downloaded_package(package)
+        return await release_maafw_project_package(
+            Path(download_root),
+            downloaded.path,
+            downloaded.sha256,
+        )
+
     async def update_if_needed(
         self,
         project_path: str | Path,
@@ -168,6 +183,40 @@ class MaaFWProjectUpdateService:
             "size": package.size,
             "sha256": package.sha256,
         }
+
+    @staticmethod
+    def _coerce_downloaded_package(
+        package: MaaFWDownloadedProjectPackage | Mapping[str, Any],
+    ) -> MaaFWDownloadedProjectPackage:
+        if isinstance(package, MaaFWDownloadedProjectPackage):
+            return package
+        if hasattr(package, "model_dump"):
+            data = package.model_dump(mode="json", by_alias=True)
+        elif isinstance(package, Mapping):
+            data = dict(package)
+        else:
+            raise MaaFWProjectUpdateError(
+                "MaaFW downloaded package must be a JSON object or stable DTO"
+            )
+        path = str(data.get("path") or "").strip()
+        sha256 = str(data.get("sha256") or "").strip()
+        if not path or not sha256:
+            raise MaaFWProjectUpdateError(
+                "MaaFW downloaded package is missing path or sha256"
+            )
+        try:
+            size = int(data.get("size") or 0)
+        except (TypeError, ValueError) as exc:
+            raise MaaFWProjectUpdateError(
+                "MaaFW downloaded package has an invalid size"
+            ) from exc
+        return MaaFWDownloadedProjectPackage(
+            source=str(data.get("source") or "").strip(),
+            version=str(data.get("version") or "").strip(),
+            path=path,
+            size=size,
+            sha256=sha256,
+        )
 
     @staticmethod
     def _coerce_interface(interface: MaaFWInterface | dict[str, Any]) -> MaaFWInterface:

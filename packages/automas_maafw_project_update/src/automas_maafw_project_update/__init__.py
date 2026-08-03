@@ -14,6 +14,7 @@ from .updater import (
     discover_maafw_project_update,
     download_maafw_project_package,
     list_update_providers,
+    release_maafw_project_package,
     update_maafw_project_if_needed,
 )
 
@@ -31,5 +32,6 @@ __all__ = [
     "discover_maafw_project_update",
     "download_maafw_project_package",
     "list_update_providers",
+    "release_maafw_project_package",
     "update_maafw_project_if_needed",
 ]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import sys
 import tempfile
 import threading
@@ -115,7 +116,7 @@ class MaaFWProjectUpdateProviderContractTest(unittest.TestCase):
                 / "pyproject.toml"
             ).read_text(encoding="utf-8")
         )
-        self.assertEqual(project["project"]["version"], "0.2.1")
+        self.assertEqual(project["project"]["version"], "0.2.2")
 
     def test_result_positional_contract_keeps_existing_field_order(self) -> None:
         result = MaaFWProjectUpdateResult(
@@ -811,6 +812,306 @@ class MaaFWProjectUpdateProviderContractTest(unittest.TestCase):
         self.assertFalse(
             any(event["stage"] in {"completed", "failed"} for event in events)
         )
+
+    def test_service_releases_managed_download_idempotently(self) -> None:
+        service = MaaFWProjectUpdateService()
+        archive_key = "a" * 24
+        content = b"validated managed download"
+        digest = hashlib.sha256(content).hexdigest()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            archive_dir = root / archive_key
+            archive_dir.mkdir()
+            package_path = archive_dir / f"{digest}.zip"
+            package_path.write_bytes(content)
+            package = {
+                "source": "github_release",
+                "version": "2.0.0",
+                "path": str(package_path),
+                "size": len(content),
+                "sha256": digest,
+            }
+
+            released = asyncio.run(
+                service.release_download_package(root, package)
+            )
+            repeated = asyncio.run(
+                service.release_download_package(root, package)
+            )
+
+            self.assertEqual(
+                released,
+                {
+                    "released": True,
+                    "retained": False,
+                    "directoryRemoved": True,
+                },
+            )
+            self.assertEqual(
+                repeated,
+                {
+                    "released": False,
+                    "retained": False,
+                    "directoryRemoved": False,
+                },
+            )
+            self.assertFalse(package_path.exists())
+            self.assertFalse(archive_dir.exists())
+
+    def test_release_rejects_escape_wrong_sha_and_reparse_points(self) -> None:
+        service = MaaFWProjectUpdateService()
+        content = b"do not release without exact identity"
+        digest = hashlib.sha256(content).hexdigest()
+        archive_key = "b" * 24
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            base = Path(temporary_directory)
+            root = base / "managed"
+            root.mkdir()
+
+            outside_dir = base / "outside" / archive_key
+            outside_dir.mkdir(parents=True)
+            outside = outside_dir / f"{digest}.zip"
+            outside.write_bytes(content)
+            with self.assertRaisesRegex(
+                MaaFWProjectUpdateError,
+                "escapes managed root",
+            ):
+                asyncio.run(
+                    service.release_download_package(
+                        root,
+                        {"path": str(outside), "sha256": digest},
+                    )
+                )
+            self.assertTrue(outside.is_file())
+
+            archive_dir = root / archive_key
+            archive_dir.mkdir()
+            tampered_sha = "c" * 64
+            tampered = archive_dir / f"{tampered_sha}.zip"
+            tampered.write_bytes(content)
+            with self.assertRaisesRegex(
+                MaaFWProjectUpdateError,
+                "sha256 verification failed",
+            ):
+                asyncio.run(
+                    service.release_download_package(
+                        root,
+                        {"path": str(tampered), "sha256": tampered_sha},
+                    )
+                )
+            self.assertTrue(tampered.is_file())
+
+            tampered.unlink()
+            package_path = archive_dir / f"{digest}.zip"
+            package_path.write_bytes(content)
+            original_reparse_check = updater_module._is_reparse_path
+
+            def mark_archive_dir_as_reparse(path: Path) -> bool:
+                return Path(path) == archive_dir or original_reparse_check(Path(path))
+
+            with (
+                patch.object(
+                    updater_module,
+                    "_is_reparse_path",
+                    side_effect=mark_archive_dir_as_reparse,
+                ),
+                self.assertRaisesRegex(
+                    MaaFWProjectUpdateError,
+                    "reparse point",
+                ),
+            ):
+                asyncio.run(
+                    service.release_download_package(
+                        root,
+                        {"path": str(package_path), "sha256": digest},
+                    )
+                )
+            self.assertTrue(package_path.is_file())
+
+    def test_failed_managed_download_removes_only_its_empty_archive_dir(self) -> None:
+        candidate = MaaFWProjectUpdateCandidate(
+            source="github_release",
+            version="2.0.0",
+            download_url="https://example.invalid/project.zip",
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            with patch.object(
+                updater_module,
+                "_download_candidate_to_paths",
+                side_effect=MaaFWProjectUpdateError("synthetic download failure"),
+            ):
+                with self.assertRaisesRegex(
+                    MaaFWProjectUpdateError,
+                    "synthetic download failure",
+                ):
+                    asyncio.run(
+                        updater_module.download_maafw_project_package(
+                            root,
+                            candidate,
+                        )
+                    )
+
+            self.assertEqual(list(root.iterdir()), [])
+
+    def test_cancelled_managed_download_cleans_work_files_before_reraising(
+        self,
+    ) -> None:
+        candidate = MaaFWProjectUpdateCandidate(
+            source="github_release",
+            version="2.0.0",
+            download_url="https://example.invalid/project.zip",
+        )
+
+        async def scenario(root: Path) -> None:
+            started = asyncio.Event()
+
+            async def cancellable_download(
+                temp_path,
+                provisional_path,
+                _download_url,
+                **_kwargs,
+            ):
+                temp_path.write_bytes(b"partial temp")
+                provisional_path.write_bytes(b"partial provisional")
+                started.set()
+                await asyncio.Event().wait()
+
+            with patch.object(
+                updater_module,
+                "_download_candidate_to_paths",
+                side_effect=cancellable_download,
+            ):
+                task = asyncio.create_task(
+                    updater_module.download_maafw_project_package(
+                        root,
+                        candidate,
+                    )
+                )
+                await started.wait()
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            asyncio.run(scenario(root))
+            self.assertEqual(list(root.iterdir()), [])
+
+    def test_cancel_during_publish_worker_cannot_recreate_cleaned_download(
+        self,
+    ) -> None:
+        candidate = MaaFWProjectUpdateCandidate(
+            source="github_release",
+            version="2.0.0",
+            download_url="https://example.invalid/project.zip",
+        )
+        validate_started = threading.Event()
+        finish_validate = threading.Event()
+        original_validate = updater_module._validate_and_publish_download
+
+        async def fake_stream(temp_path, _url, **_kwargs):
+            with zipfile.ZipFile(temp_path, "w") as archive:
+                archive.writestr("interface.json", '{"version":"2.0.0"}')
+            size = temp_path.stat().st_size
+            return size, size
+
+        def blocking_validate(temp_path, package_path, expected_sha256):
+            validate_started.set()
+            if not finish_validate.wait(timeout=2):
+                raise TimeoutError("test validate worker was not released")
+            return original_validate(temp_path, package_path, expected_sha256)
+
+        async def scenario(root: Path) -> bool:
+            with (
+                patch.object(
+                    updater_module,
+                    "_stream_update_package",
+                    side_effect=fake_stream,
+                ),
+                patch.object(
+                    updater_module,
+                    "_validate_and_publish_download",
+                    side_effect=blocking_validate,
+                ),
+            ):
+                task = asyncio.create_task(
+                    updater_module.download_maafw_project_package(
+                        root,
+                        candidate,
+                    )
+                )
+                self.assertTrue(
+                    await asyncio.to_thread(validate_started.wait, 2),
+                    "validate worker did not start",
+                )
+                task.cancel()
+                await asyncio.sleep(0)
+                pending_after_cancel = not task.done()
+                finish_validate.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                return pending_after_cancel
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            pending_after_cancel = asyncio.run(scenario(root))
+            self.assertTrue(pending_after_cancel)
+            self.assertEqual(list(root.iterdir()), [])
+
+    def test_cancelled_release_finishes_unlink_then_remains_idempotent(self) -> None:
+        service = MaaFWProjectUpdateService()
+        archive_key = "e" * 24
+        content = b"release cancellation package"
+        digest = hashlib.sha256(content).hexdigest()
+        release_started = threading.Event()
+        finish_release = threading.Event()
+        original_release = updater_module._release_content_addressed_download
+
+        def blocking_release(download_root, package_path, package_sha256):
+            release_started.set()
+            if not finish_release.wait(timeout=2):
+                raise TimeoutError("test release worker was not released")
+            return original_release(download_root, package_path, package_sha256)
+
+        async def scenario(root: Path, package: dict) -> bool:
+            with patch.object(
+                updater_module,
+                "_release_content_addressed_download",
+                side_effect=blocking_release,
+            ):
+                task = asyncio.create_task(
+                    service.release_download_package(root, package)
+                )
+                self.assertTrue(
+                    await asyncio.to_thread(release_started.wait, 2),
+                    "release worker did not start",
+                )
+                task.cancel()
+                await asyncio.sleep(0)
+                pending_after_cancel = not task.done()
+                finish_release.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                return pending_after_cancel
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            archive_dir = root / archive_key
+            archive_dir.mkdir()
+            package_path = archive_dir / f"{digest}.zip"
+            package_path.write_bytes(content)
+            package = {"path": str(package_path), "sha256": digest}
+
+            pending_after_cancel = asyncio.run(scenario(root, package))
+            repeated = asyncio.run(
+                service.release_download_package(root, package)
+            )
+
+            self.assertTrue(pending_after_cancel)
+            self.assertFalse(package_path.exists())
+            self.assertFalse(repeated["retained"])
+            self.assertFalse(repeated["released"])
 
     def test_archive_apply_does_not_block_the_event_loop(self) -> None:
         started = threading.Event()

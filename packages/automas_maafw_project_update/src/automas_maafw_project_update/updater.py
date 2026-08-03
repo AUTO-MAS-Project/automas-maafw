@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import uuid
 import zipfile
 from dataclasses import dataclass
@@ -658,15 +659,15 @@ async def download_maafw_project_package(
     download_id = uuid.uuid4().hex
     temp_path = download_dir / f"{download_id}.{DOWNLOAD_TEMP_NAME}"
     provisional_path = download_dir / f"{download_id}.{DOWNLOAD_FILE_NAME}"
-    await asyncio.to_thread(
-        _prepare_download_paths,
-        download_dir,
-        temp_path,
-        provisional_path,
-    )
 
     send_update_log = send_log or (lambda _: None)
     try:
+        await _run_worker_to_completion(
+            _prepare_download_paths,
+            download_dir,
+            temp_path,
+            provisional_path,
+        )
         await _download_candidate_to_paths(
             temp_path,
             provisional_path,
@@ -677,11 +678,11 @@ async def download_maafw_project_package(
             max_download_bytes=max_download_bytes,
             progress=progress,
         )
-        package_sha256 = await asyncio.to_thread(
+        package_sha256 = await _run_worker_to_completion(
             _calculate_sha256,
             provisional_path,
         )
-        package_path = await asyncio.to_thread(
+        package_path = await _run_worker_to_completion(
             _publish_content_addressed_download,
             provisional_path,
             download_dir,
@@ -696,8 +697,15 @@ async def download_maafw_project_package(
             total_bytes=package_size,
             percent=100.0,
         )
-    except Exception:
-        await asyncio.to_thread(_remove_path, provisional_path)
+    except BaseException:
+        await _run_cleanup_to_completion(
+            _cleanup_failed_managed_download,
+            resolved_root,
+            download_dir,
+            archive_key,
+            temp_path,
+            provisional_path,
+        )
         raise
     return MaaFWDownloadedProjectPackage(
         source=source,
@@ -705,6 +713,27 @@ async def download_maafw_project_package(
         path=str(package_path),
         size=package_size,
         sha256=package_sha256,
+    )
+
+
+async def release_maafw_project_package(
+    download_root: Path,
+    package_path: str | Path,
+    package_sha256: str,
+) -> dict[str, Any]:
+    """Release one validated content-addressed download.
+
+    This is deliberately narrower than the updater's internal cleanup helper:
+    callers may release only the exact ``<24 hex>/<sha256>.zip`` shape emitted
+    by :func:`download_maafw_project_package`.  The operation is idempotent for
+    an already-missing package and never recursively removes caller data.
+    """
+
+    return await _run_worker_to_completion(
+        _release_content_addressed_download,
+        Path(download_root),
+        Path(package_path),
+        package_sha256,
     )
 
 
@@ -997,7 +1026,7 @@ async def _download_candidate_to_paths(
                 total_bytes=total_bytes,
                 percent=100.0 if total_bytes else None,
             )
-            package_size = await asyncio.to_thread(
+            package_size = await _run_worker_to_completion(
                 _validate_and_publish_download,
                 temp_path,
                 package_path,
@@ -1275,6 +1304,239 @@ def _publish_content_addressed_download(
         raise MaaFWProjectUpdateError("download cache sha256 verification failed")
     _remove_path(provisional_path)
     return package_path
+
+
+def _release_content_addressed_download(
+    download_root: Path,
+    package_path: Path,
+    package_sha256: str,
+) -> dict[str, Any]:
+    """Unlink one downloader-owned archive after strict identity checks."""
+
+    normalized_sha256 = str(package_sha256 or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", normalized_sha256):
+        raise MaaFWProjectUpdateError(
+            "download package release requires a valid sha256"
+        )
+    if not package_path.is_absolute():
+        raise MaaFWProjectUpdateError(
+            "download package release requires an absolute package path"
+        )
+
+    lexical_root = Path(os.path.abspath(os.fspath(download_root)))
+    lexical_package = Path(os.path.abspath(os.fspath(package_path)))
+    try:
+        relative = lexical_package.relative_to(lexical_root)
+    except ValueError as exc:
+        raise MaaFWProjectUpdateError(
+            "download package release path escapes managed root"
+        ) from exc
+    if len(relative.parts) != 2:
+        raise MaaFWProjectUpdateError(
+            "download package release path has an invalid managed shape"
+        )
+    archive_key, file_name = relative.parts
+    if not re.fullmatch(r"[0-9a-f]{24}", archive_key):
+        raise MaaFWProjectUpdateError(
+            "download package release path has an invalid archive key"
+        )
+    if file_name != f"{normalized_sha256}.zip":
+        raise MaaFWProjectUpdateError(
+            "download package release path does not match its sha256"
+        )
+
+    archive_dir = lexical_root / archive_key
+    if _is_reparse_path(lexical_root):
+        raise MaaFWProjectUpdateError(
+            "download package release root cannot be a reparse point"
+        )
+    if lexical_root.exists() and not lexical_root.is_dir():
+        raise MaaFWProjectUpdateError(
+            "download package release root is not a directory"
+        )
+    if _is_reparse_path(archive_dir):
+        raise MaaFWProjectUpdateError(
+            "download package release directory cannot be a reparse point"
+        )
+    if archive_dir.exists() and not archive_dir.is_dir():
+        raise MaaFWProjectUpdateError(
+            "download package release directory is invalid"
+        )
+    if _is_reparse_path(lexical_package):
+        raise MaaFWProjectUpdateError(
+            "download package release target cannot be a reparse point"
+        )
+    if not os.path.lexists(lexical_package):
+        return {
+            "released": False,
+            "retained": False,
+            "directoryRemoved": False,
+        }
+
+    resolved_root = lexical_root.resolve(strict=False)
+    resolved_package = lexical_package.resolve(strict=True)
+    if not _is_within_path(resolved_package, resolved_root):
+        raise MaaFWProjectUpdateError(
+            "download package release target escapes managed root"
+        )
+    before = lexical_package.lstat()
+    if not stat.S_ISREG(before.st_mode):
+        raise MaaFWProjectUpdateError(
+            "download package release target is not a regular file"
+        )
+    if _calculate_sha256(lexical_package) != normalized_sha256:
+        raise MaaFWProjectUpdateError(
+            "download package release sha256 verification failed"
+        )
+    after = lexical_package.lstat()
+    if _file_identity(before) != _file_identity(after):
+        raise MaaFWProjectUpdateError(
+            "download package changed while release was being verified"
+        )
+
+    try:
+        lexical_package.unlink()
+    except FileNotFoundError:
+        return {
+            "released": False,
+            "retained": False,
+            "directoryRemoved": False,
+        }
+    if os.path.lexists(lexical_package):
+        raise MaaFWProjectUpdateError("download package could not be released")
+
+    directory_removed = _remove_empty_download_directory(
+        lexical_root,
+        archive_dir,
+        archive_key,
+    )
+    return {
+        "released": True,
+        "retained": False,
+        "directoryRemoved": directory_removed,
+    }
+
+
+def _is_reparse_path(path: Path) -> bool:
+    """Recognize POSIX symlinks and Windows junction/reparse points."""
+
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return False
+    attributes = int(getattr(metadata, "st_file_attributes", 0) or 0)
+    reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    return stat.S_ISLNK(metadata.st_mode) or bool(attributes & reparse_flag)
+
+
+def _file_identity(metadata: os.stat_result) -> tuple[int, int, int, int]:
+    return (
+        int(metadata.st_dev),
+        int(metadata.st_ino),
+        int(metadata.st_size),
+        int(metadata.st_mtime_ns),
+    )
+
+
+def _remove_empty_download_directory(
+    download_root: Path,
+    download_dir: Path,
+    archive_key: str,
+) -> bool:
+    """Remove one validated empty archive-key directory, never recursively."""
+
+    normalized_key = str(archive_key or "").strip()
+    if not re.fullmatch(r"[0-9a-f]{24}", normalized_key):
+        return False
+    lexical_root = Path(os.path.abspath(os.fspath(download_root)))
+    expected_dir = lexical_root / normalized_key
+    lexical_dir = Path(os.path.abspath(os.fspath(download_dir)))
+    if lexical_dir != expected_dir:
+        return False
+    if _is_reparse_path(lexical_root) or _is_reparse_path(lexical_dir):
+        return False
+    if not lexical_dir.exists() or not lexical_dir.is_dir():
+        return False
+    resolved_root = lexical_root.resolve(strict=False)
+    resolved_dir = lexical_dir.resolve(strict=True)
+    if resolved_dir.parent != resolved_root:
+        return False
+    try:
+        lexical_dir.rmdir()
+    except OSError:
+        # A non-empty or concurrently used directory must be retained.
+        return False
+    return True
+
+
+def _cleanup_failed_managed_download(
+    download_root: Path,
+    download_dir: Path,
+    archive_key: str,
+    temp_path: Path,
+    provisional_path: Path,
+) -> None:
+    _remove_download_work_file(temp_path)
+    _remove_download_work_file(provisional_path)
+    _remove_empty_download_directory(download_root, download_dir, archive_key)
+
+
+def _remove_download_work_file(path: Path) -> None:
+    """Unlink only a regular downloader work file; never recurse into a dir."""
+
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(metadata.st_mode):
+        return
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+async def _run_worker_to_completion(function: Callable[..., Any], *args: Any) -> Any:
+    """Do not abandon a filesystem worker when its awaiter is cancelled."""
+
+    worker = asyncio.create_task(asyncio.to_thread(function, *args))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                continue
+            except BaseException:
+                break
+        if worker.done() and not worker.cancelled():
+            try:
+                worker.result()
+            except BaseException:
+                pass
+        raise
+
+
+async def _run_cleanup_to_completion(
+    function: Callable[..., Any],
+    *args: Any,
+) -> None:
+    """Finish best-effort cleanup, then let the outer exception propagate."""
+
+    worker = asyncio.create_task(asyncio.to_thread(function, *args))
+    while not worker.done():
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            continue
+        except BaseException:
+            break
+    if worker.done() and not worker.cancelled():
+        try:
+            worker.result()
+        except BaseException:
+            pass
 
 
 def _read_local_download_error_hint(path: Path) -> str:

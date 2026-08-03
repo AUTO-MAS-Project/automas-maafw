@@ -19,6 +19,15 @@ downloads use unique temporary files and a content-addressed final name, so
 concurrent scripts cannot delete each other's in-progress archive. Project
 Store consumers can then import the returned local path.
 
+`release_download_package()` releases that caller-owned staging archive after
+the immutable import is durable. It accepts only the exact content-addressed
+package DTO returned by `download_package()`, re-verifies SHA256, rejects path
+escapes, extra nesting, symlinks and Windows reparse points, and unlinks only
+the regular archive plus its now-empty direct archive-key directory. Missing
+packages are idempotently treated as already released; no recursive cache
+deletion is exposed. Failed or cancelled downloads apply the same narrow
+cleanup to their UUID work files and empty archive-key directory.
+
 Downloads share one 300-second wall-clock deadline across retries. The optional
 best-effort progress callback reports real streamed bytes (when available),
 validation, extraction, switching and terminal states without allowing a UI
