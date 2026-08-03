@@ -3,6 +3,18 @@
 ## Unreleased
 
 - 将通用 MaaFW 插件从 AUTO-MAS 主仓迁移到独立工作区仓库。
+- Project Store 0.2.2 在脱壳时从 ProjectInterface 或唯一的
+  `python3XY._pth` 记录 `runtime.python` 硬约束，并把该元数据纳入不可变来源
+  身份；显式约束与打包解释器冲突时失败关闭。
+- Runtime Pool 0.2.0 支持 CP312/CP313 解释器族。每个 ABI 可复用已配置、宿主或
+  pool-local uv-managed Python，每个完整规范化依赖 selector 仍使用独立 venv，
+  仅共享 uv 下载/解包缓存与 hardlink 文件。
+- Runner 0.4.0 校验 Managed 提供的完整 selector、`poolId`、`runtimeId` 与 Python
+  约束后复用可信绑定，不再用宿主 Python ABI 重算跨 ABI runtime；准备与实际运行
+  共用同一条路由。Agent Env 0.1.4 同步识别共享 runtime，并原子写入兼容 shim。
+- Script MaaFW 0.1.11 强制使用已注册 Runtime Pool 的实际 root/poolId；Managed
+  0.3.0 新增 `maafw.managed.environment.v1`，按 `scriptId` 在不启动 Agent、controller
+  或游戏的前提下完成 Store 解析、绑定与精确预热。
 - Project Store 0.2.0 支持从本地目录或 ZIP 安全导入不可变资源版本；可从
   `ProjectInterface.version` 推断版本，并记录 agent、能力、被剥离前端壳与体积
   摘要；新增进程内共享资源生命周期事务，供 Managed 串行多调用引用对账、
@@ -58,12 +70,12 @@
 ## Current package versions
 
 - `automas-maafw-interface`: 0.2.0
-- `automas-maafw-agent-env`: 0.1.2
-- `automas-maafw-controller-adb`: 0.1.0
-- `automas-maafw-controller-win32`: 0.1.1
-- `automas-maafw-project-update`: 0.1.3
-- `automas-maafw-project-store`: 0.2.0
-- `automas-maafw-runtime-pool`: 0.1.4
-- `automas-maafw-runner`: 0.3.3
-- `automas-script-maafw`: 0.1.9
-- `automas-script-maafw-managed`: 0.2.0
+- `automas-maafw-agent-env`: 0.1.4
+- `automas-maafw-controller-adb`: 0.1.1
+- `automas-maafw-controller-win32`: 0.1.2
+- `automas-maafw-project-update`: 0.2.2
+- `automas-maafw-project-store`: 0.2.2
+- `automas-maafw-runtime-pool`: 0.2.0
+- `automas-maafw-runner`: 0.4.0
+- `automas-script-maafw`: 0.1.11
+- `automas-script-maafw-managed`: 0.3.0

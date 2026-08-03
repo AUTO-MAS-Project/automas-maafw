@@ -49,7 +49,20 @@
 | 新 controller 类型 | AUTO-MAS Direct 明确只支持 Adb/Win32 | 保持显式错误，不伪装支持 |
 | wait-freezes/action/recognition detail 扩展 | sink 对未知 raw notification 可容忍 | 升级前后各跑任务失败诊断测试 |
 | Python binding 类型收紧 | 当前 DTO 以 int/JSON 边界传递 | 运行时 5.12.2 回归验证 |
-| M9A Python 3.13 Agent | 发布包自带解释器时可隔离运行 | 禁止改用 AUTO-MAS Python 3.12 强行加载 |
+| M9A Python 3.13 Agent | 脱壳后由 Store `runtime.python` 路由到 Pool CP313 | 禁止改用 AUTO-MAS Python 3.12 强行加载 |
+
+## 多 ABI 托管运行约束
+
+Project Store 0.2.2 会在移除发行包内置解释器前，从显式 ProjectInterface 声明或
+唯一 `python3XY._pth` 静态固化 `runtime.python`；M9A 的 CP313 约束因此不会随
+脱壳丢失。Runtime Pool 0.2.0 支持 CP312/CP313：每个 ABI 可复用基础解释器和 pool
+内 uv 缓存，但每个完整规范化 dependency selector 仍有独立 venv，不共享
+`site-packages`。
+
+Runner 0.4.0 对完整 selector、`poolId`、`runtimeId` 和 Python 约束做一致性校验，
+再复用 Store/Pool 的可信 binding；准备和真实运行使用相同 identity，不能以宿主
+CP312 重算 CP313 runtime。M9A 集成包的发布下限必须同步为
+`automas-maafw-runner>=0.4.0` 与 `automas-script-maafw>=0.1.11`。
 
 ## Reference 样本结果
 
@@ -78,7 +91,8 @@ run-plan；两个 M9A 临时解压目录缺少自身声明的
 
 1. 将新 interface/runner wheel 集成到宿主并生成对应前端类型。
 2. 实现设置分区和快捷键捕获 UI，禁止用户直接编辑整数键码。
-3. 在独立 runtime 中验证 MaaFW 5.12.2，再更新宿主 pin、runtime lock 和 wheelhouse。
+3. 在 Pool CP313 的独立 selector venv 中验证 MaaFW 5.12.2，再更新宿主 pin、
+   runtime lock 和 wheelhouse。
 4. 对 M9A 稳定发行包执行 project-store → preview → run-plan → Agent command plan
    的无启动黑盒回归。
 

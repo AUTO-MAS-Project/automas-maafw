@@ -55,28 +55,30 @@ class Plugin:
 |---|---:|---|---|
 | `automas-maafw-interface` | 0.2.0 | `maafw.interface.v1` | PI 加载、校验、预览、任务快照和 option 归一化 |
 | `automas-maafw-project-update` | 0.2.2 | `maafw.project_update.v1` | MirrorChyan/GitHub Release 版本发现、受限下载、临时包安全释放、可安装候选与更新 |
-| `automas-maafw-agent-env` | 0.1.3 | `maafw.agent_env.v1` | agent 运行方式识别、命令规划和 Python 环境准备 |
+| `automas-maafw-agent-env` | 0.1.4 | `maafw.agent_env.v1` | agent 运行方式识别、命令规划和 Python 环境准备 |
 | `automas-maafw-controller-adb` | 0.1.1 | `maafw.controller.adb` | ADB provider 与设备参数构建 |
 | `automas-maafw-controller-win32` | 0.1.2 | `maafw.controller.win32` | Win32 provider、窗口扫描与设备参数构建 |
-| `automas-maafw-project-store` | 0.2.1 | `maafw.project_store.v1` | 本地目录/ZIP 资源导入、不可变版本、隔离 checkout、全局盘点、引用和 GC |
-| `automas-maafw-runtime-pool` | 0.1.5 | `maafw.runtime_pool.v1` | 可配置根目录、稳定 pool 身份、按 requirement selector 隔离环境并复用 uv cache |
-| `automas-maafw-runner` | 0.3.4 | `maafw.runner.v1` | 运行计划、worker job、runtime 路由、环境预热和结果模型 |
-| `automas-script-maafw` | 0.1.10 | `maafw.registry.v1`、`maafw.configuration_reuse.v1` | MaaFW 脚本适配、能力注册、原生配置导入和用户复制 |
-| `automas-script-maafw-managed` | 0.2.1 | 无 | 单一 MaaFW 入口的原地托管转换、全局资源盘点、本地/远程资源管理、运行绑定与 pack 升级计划 |
-| `automas-script-maafw-pack-m9a` | 0.1.4 | `maafw.pack.m9a.v1` | M9A 默认约定、资源 profile/升级规划和通知翻译 |
-| `automas-m9a` | 0.1.4 | 无 | 聚合安装上述 MaaFW/M9A 插件 |
+| `automas-maafw-project-store` | 0.2.2 | `maafw.project_store.v1` | 本地目录/ZIP 资源导入、不可变版本、Python 约束、隔离 checkout、全局盘点、引用和 GC |
+| `automas-maafw-runtime-pool` | 0.2.0 | `maafw.runtime_pool.v1` | 可配置根目录、CP312/CP313 解释器、按完整 requirement selector 隔离 venv 并复用 uv cache |
+| `automas-maafw-runner` | 0.4.0 | `maafw.runner.v1` | 运行计划、worker job、可信 runtime 路由、环境预热和结果模型 |
+| `automas-script-maafw` | 0.1.11 | `maafw.registry.v1`、`maafw.configuration_reuse.v1` | MaaFW 脚本适配、能力注册、原生配置导入、用户复制和 Pool 路由 |
+| `automas-script-maafw-managed` | 0.3.0 | `maafw.managed.environment.v1` | 单一 MaaFW 入口的原地托管转换、全局资源盘点、本地/远程资源管理、环境准备、运行绑定与 pack 升级计划 |
+| `automas-script-maafw-pack-m9a` | 0.1.5 | `maafw.pack.m9a.v1` | M9A 默认约定、资源 profile/升级规划和通知翻译 |
+| `automas-m9a` | 0.1.5 | 无 | 聚合安装上述 MaaFW/M9A 插件 |
 
 ### 3.1 发布依赖顺序
 
 `publish.yml` 每次只发布一个 distribution。当前版本按以下层级发布；同层可并行，
 下一层必须等待依赖版本已经可从 PyPI 安装：
 
-1. `automas-maafw-interface` 0.2.0、`automas-maafw-project-store` 0.2.1、
-   `automas-maafw-runtime-pool` 0.1.5。
-2. `automas-maafw-agent-env` 0.1.3、`automas-maafw-project-update` 0.2.2。
-3. `automas-maafw-runner` 0.3.4。
-4. `automas-script-maafw` 0.1.10。
-5. `automas-script-maafw-managed` 0.2.1。
+1. `automas-maafw-interface` 0.2.0、`automas-maafw-project-store` 0.2.2、
+   `automas-maafw-runtime-pool` 0.2.0。
+2. `automas-maafw-agent-env` 0.1.4、`automas-maafw-project-update` 0.2.2。
+3. `automas-maafw-runner` 0.4.0。
+4. `automas-script-maafw` 0.1.11。
+5. `automas-script-maafw-managed` 0.3.0。
+6. 在独立 M9A 仓库发布 `automas-script-maafw-pack-m9a` 0.1.5，随后发布
+   聚合包 `automas-m9a` 0.1.5；二者不得早于前五层依赖在 PyPI 可安装。
 
 首次发布 Project Store、Runtime Pool 和 Managed 前，仍须创建
 `pypi-project-store`、`pypi-runtime-pool`、`pypi-script-maafw-managed` GitHub
@@ -720,7 +722,10 @@ prepare_environment(
     runtime_pool=None,
     runtime_installer=None,
     runtime_requirement=None,
+    runtime_requirements=None,
     runtime_id=None,
+    runtime_pool_id=None,
+    runtime_python_constraint=None,
     lease_owner="automas-maafw-runner",
     lease_ttl_seconds=86400,
     import_paths=None,
@@ -742,7 +747,10 @@ prepare_project_environment(
     runtime_pool=None,
     runtime_installer=None,
     runtime_requirement=None,
+    runtime_requirements=None,
     runtime_id=None,
+    runtime_pool_id=None,
+    runtime_python_constraint=None,
     agent_env_root=None,
     import_paths=None,
     send_log=None,
@@ -1246,8 +1254,8 @@ python -m pip install automas-m9a
 
 ```text
 automas-maafw-interface >= 0.2.0
-automas-maafw-runner >= 0.3.4
-automas-script-maafw >= 0.1.10
+automas-maafw-runner >= 0.4.0
+automas-script-maafw >= 0.1.11
 ```
 
 ## 14. 完整调用示例
@@ -1371,6 +1379,20 @@ resource_lifecycle_transaction() -> AsyncContextManager[None]
 ProjectInterface 的原始版本拼写。未显式给版本时必须能从 ProjectInterface
 推断，否则拒绝导入。
 
+MaaFW 约束优先使用调用方、ProjectInterface 或 requirements 的有效声明；均未钉
+版本时，可从发行包内某个 `MaaFramework.dll` 自身唯一的静态 `vX.Y.Z` 标记推导
+精确 `==X.Y.Z`。服务不得加载项目 DLL；含多个历史版本字符串的 DLL 不作为
+版本证据，临时/更新目录和 pip `~*` 卸载残留也必须忽略。显式约束不包含唯一
+推导版本或多份唯一二进制版本不一致时失败关闭。
+
+Project Store 0.2.2 在私有 manifest 的 `runtime.python` 中保存
+`implementation=cpython`、硬版本 `constraint` 与 `sources`。优先读取
+ProjectInterface 的显式声明；脱壳项目没有声明时，只静态读取被剥离解释器同目录
+唯一的 `python3XY._pth`，或 Windows 发行包根/声明解释器目录唯一的
+`python3XY.dll` 推导 `==3.X.*`，不执行项目代码。显式约束与 marker 冲突、
+多个 minor marker 或实现不是 CPython 时失败关闭。该元数据参与 projected source
+hash，避免 CP312/CP313 发行包被误判为同一不可变版本。
+
 `resolve_project()` 至少返回：
 
 ```text
@@ -1384,7 +1406,8 @@ summary
 ```
 
 `summary` 是供本地资源管理界面消费的 JSON 摘要，包含 `interfaceVersion`、
-`sourceKind`、`runtimeConstraint`、`agents`/`agentCount`、`capabilities`、
+`sourceKind`、`runtimeConstraint`、`pythonConstraint`、`pythonImplementation`、
+`agents`/`agentCount`、`capabilities`、
 `shells`、`size`、`flags` 和 `warningCount`。`shells` 记录被剥离壳的类别与路径；
 `size` 同时给出输入、原树、最终投影与节省字节数。
 
@@ -1394,7 +1417,7 @@ summary
 `checkout_project(project_id, version, script_id)`，它在独立 RunRoot 中按
 `storeId + projectId + version + sourceHash + payloadHash + scriptId` 完整复制并原子发布可写副本，
 不使用 hardlink，也不复制私有 Store manifest。同一身份重复解析会复用 checkout 并
-保留运行产物；marker、接口或身份损坏时失败关闭且不覆盖原目录。Managed 0.2.1
+保留运行产物；marker、接口或身份损坏时失败关闭且不覆盖原目录。Managed 0.3.0
 无条件要求 Project Store 提供 checkout，并要求稳定 `scriptId`、`runRootId` 和
 `payloadHash`；缺少任一能力或身份都拒绝运行，绝不回落到不可变 Store 路径。
 
@@ -1530,7 +1553,18 @@ collect_garbage(*, dry_run=True, grace_seconds=604800, keep_latest=1) -> dict
 ```
 
 `request` 可以是 MaaFW requirement 字符串，或包含 `requirements`/`packages`
-完整依赖集合的字典。结果至少包含：
+完整依赖集合的字典。Runtime Pool 0.2.0 还接受可选 Python 约束：
+
+```json
+{
+  "requirements": ["maafw==5.12.2", "json5==0.12.1"],
+  "python": {"implementation": "cpython", "constraint": ">=3.13,<3.14"}
+}
+```
+
+当前受管 minor family 为 CP312 与 CP313。`resolve_runtime()` 只查找已经可用的
+解释器/runtime，不触发下载；`ensure_runtime()` 可以通过 uv 在 pool 的 `python/`
+目录准备缺失的受管解释器。结果至少包含：
 
 ```text
 runtimeId
@@ -1547,8 +1581,12 @@ references
 leases
 ```
 
-runtime identity 由规范化 requirement selector 集合、Python ABI、操作系统和架构
-组成，不含项目路径。`resolvedRequirements` 是安装后的 `pip freeze --all` 审计
+显式多 ABI runtime identity 由完整规范化 requirement selector 集合、选中的
+Python ABI、实际 patch 版本、操作系统和架构组成，不含项目路径；精确
+`==/===X.Y.Z` 约束会让 uv 查找或安装对应 patch，不能复用同 minor 的其他 patch。
+不带显式 Python identity 的宿主 selector 也记录完整实际 patch；宿主与显式解释器
+的 ABI、patch、平台、架构和完整 requirement selector 全部一致时复用同一
+runtime。`resolvedRequirements` 是安装后的 `pip freeze --all` 审计
 快照，不参与 identity；因此范围 selector 对应的 runtime 删除后重建时，可能解析
 到范围内更新的依赖版本。包含本地路径、editable 或递归 requirements 的依赖不能
 安全跨项目共享，服务会拒绝创建共享 identity。删除与 GC 会保护固定、引用和活动
@@ -1560,7 +1598,9 @@ Runtime Pool 插件实例的 `Root` 可留空或配置绝对路径；留空使�
 `complete/items/errors` 显式报告损坏条目；Managed 在任何真实 GC 删除开始前同时
 预检 Project Store、checkout 与 Runtime Pool，盘点不完整时整次拒绝删除。
 
-每个完整 requirement selector 仍对应一个独立 venv；环境之间不共享
+每个 ABI 解释器族可为多个 runtime 提供建 venv 的基础解释器，但每个完整
+requirement selector + 解释器 identity（含显式路由的实际 patch）仍对应一个独立
+venv；环境之间不共享
 `site-packages`，也不拼接 `PYTHONPATH`。使用 uv 时，它们共享 pool 内的
 下载/解包缓存，并以 hardlink 安装可复用文件，因此依赖隔离与磁盘复用可以同时
 成立。每次 GC 返回 `cachePrune`：dry-run 只统计缓存并展示命令，实际 GC 在删除
@@ -1574,7 +1614,10 @@ Runtime Pool 插件实例的 `Root` 可留空或配置绝对路径；留空使�
 ```python
 runtime_pool_root=None
 runtime_requirement=None
+runtime_requirements=None
 runtime_id=None
+runtime_pool_id=None
+runtime_python_constraint=None
 lease_owner="automas-maafw-runner"
 lease_ttl_seconds=86400
 progress=None
@@ -1586,6 +1629,31 @@ progress=None
 既无 binding 又无版本约束时会拒绝运行，不会静默安装 `latest`。已绑定 runtime
 丢失但 binding 记录了 `maafwVersion` 时，Managed gateway 会按精确
 `maafw==<version>` 重建环境并持久化新 binding。
+
+Runner 0.4.0 的可信 Managed 路由同时传入完整 `runtime_requirements`、`runtime_id`、
+`runtime_pool_id` 与 Store `runtime.python.constraint`。Runner 必须校验当前 Pool
+marker、runtime manifest 的完整 selector 和 Python identity；校验成功后直接复用并
+租用该绑定，不得用 AUTO-MAS 宿主的 CP312 身份重算 CP313 runtimeId。缺字段、
+selector 不一致、Pool 换身或 Python 约束不匹配均失败关闭。普通 MaaFW 仍由相同
+Pool 服务解析默认 selector。
+
+Managed 0.3.0 另提供 `maafw.managed.environment.v1`：
+
+```python
+await prepare_script_environment(
+    script_id,
+    requested_path,
+    *,
+    send_log=None,
+    progress=None,
+) -> dict | None
+```
+
+宿主按 `scriptId` 调用该服务。服务在 Project Store 生命周期事务和宿主脚本配置
+事务中重读权威 `MaaFWManaged` 记录，解析 Store checkout、校验/持久化 runtime
+binding、预留项目路径，再调用 Runner 的同一完整 selector 路由做预热；普通
+`MaaFW` 返回 `None`。该流程不会启动 Agent、controller 或游戏，短 lease 和路径
+预留在结束时释放，因此准备页建立的环境就是首次真实运行会重新租用的环境。
 
 `prepare_environment()` 返回的 `MaaFWRunnerEnvironment` 带 `runtime_id`、
 `runtime_pool_root` 和 `lease_id`。调用方必须在 worker 退出的 `finally` 中调用
@@ -1612,7 +1680,7 @@ Controller 与 Tasker 前加载这些目录；任一路径越出项目根、缺�
 stage/apply/prepare 交错。原地转换的只读 source snapshot 是特例：它先单独取得并
 释放短宿主事务，随后资源导入与最终 CAS 提交仍严格按“资源生命周期 → 宿主配置”
 顺序执行，且不会在全局配置锁内做 Project Store I/O。
-Managed 0.2.1 在 Project Store 缺少该 Python 协调接口时失败关闭，不提供无锁
+Managed 0.3.0 在 Project Store 缺少该 Python 协调接口时失败关闭，不提供无锁
 兼容路径；它同时要求宿主提供 `Config.script_config_transaction()`、
 `Config.script_config_write_scope()` 和 ScriptConfigStore
 `write_transaction()`。原地转换还要求
@@ -1642,8 +1710,8 @@ Bearer 和带签名下载地址在 HTTP、WebSocket 进度、日志及持久化 
 全局和脚本都没有 CDK 时仍可发现 MirrorChyan 版本元数据，但没有可安装 URL 就不能
 执行导入或升级。
 
-普通脚本 0.1.10 的配置复用同样依赖上述宿主事务 API。M9A 集成下限必须为
-`automas-maafw-runner>=0.3.4` 与 `automas-script-maafw>=0.1.10`。
+普通脚本 0.1.11 的配置复用同样依赖上述宿主事务 API。M9A 集成下限必须为
+`automas-maafw-runner>=0.4.0` 与 `automas-script-maafw>=0.1.11`。
 
 ## 18. 变更规则
 

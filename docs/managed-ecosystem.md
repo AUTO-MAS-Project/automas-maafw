@@ -18,9 +18,15 @@ Bundle、Agent 和无法安全重建的项目文件；MaaFW 与 Python 依赖由
    - 发现项目根或 `assets` 下的 `interface.json[c]`。
    - 保持 `resource.path` 和 `attach_resource_path` 的顺序及 Bundle 目录层级。
    - 管理 current 版本、引用、固定、删除和陈旧版本 GC。
+   - 在脱壳前从 ProjectInterface、唯一 `python3XY._pth`，或 Windows 发行包根/
+     声明解释器目录唯一的 `python3XY.dll` 固化 `runtime.python`，不执行项目代码；
+     约束冲突时失败关闭。
 2. `maafw.runtime_pool.v1`
-   - 用规范化 requirement selector、Python ABI、操作系统和架构生成身份。
-   - 相同身份共用一个隔离环境；不同 MaaFW 版本不会混用 site-packages。
+   - 为 CP312/CP313 分别解析已配置、宿主或 pool-local uv-managed 解释器。
+   - 用完整规范化 requirement selector、Python ABI、实际 patch、操作系统和架构
+     生成多 ABI 身份；宿主与显式解释器物理身份一致时直接复用同一环境。
+   - 相同身份共用一个隔离 venv；不同 selector 或解释器身份不会混用
+     `site-packages`，精确 patch 约束也不会误复用同 minor 的其他 patch。
    - 安装后记录 `pip freeze --all` 的 `resolvedRequirements` 供审计。
    - 管理引用、运行租约、固定、显式删除和带宽限期的 GC。
 3. `MaaFWManaged`
@@ -32,6 +38,8 @@ Bundle、Agent 和无法安全重建的项目文件；MaaFW 与 Python 依赖由
      controller 和 Agent 环境服务。
    - 统一资源管理动作提供 HTTP 轮询与 WebSocket 双通道阶段进度；远程下载透传真实
      字节数，Project Store/Runtime Pool 只报告可验证的外层事务边界。
+   - 提供 `maafw.managed.environment.v1`，让宿主按 `scriptId` 使用权威 Store
+     binding 预热首次运行会租用的同一 runtime，不启动 Agent、controller 或游戏。
 
 ## 资源投影边界
 
@@ -59,14 +67,22 @@ manifest。至少记录：
 - 来源与内容哈希；
 - ProjectInterface 路径和项目版本；
 - MaaFW requirement selector、安装后的解析审计及精确 `maafwVersion`；
-- 操作系统、架构、Python ABI 和 Agent 运行方式；
+- `runtime.python` 的 CPython 硬约束、操作系统、架构、Python ABI 和 Agent
+  运行方式；
 - runtime binding、引用、固定与最后使用时间；
 - 已复制、已排除和因不透明边界扩大保留的项目。
 
-共享粒度是“相同的规范化 selector identity”。`resolvedRequirements` 不参与
-identity；范围 selector 对应的 runtime 被删除后重建时，可能解析到范围内更新的
-版本。不同 selector 不会直接共用一个 venv，以免升级一个项目时破坏另一个项目。
-下载缓存可以共用；跨版本 site-packages 文件级去重不属于首版保证。
+ProjectInterface 与 requirements 未钉 MaaFW 时，Store 只静态读取发行包内某个
+`MaaFramework.dll` 自身唯一的 `vX.Y.Z` 标记作为精确 selector；含多个历史版本
+字符串的 DLL、临时/更新目录和 pip `~*` 卸载残留不作为证据，也不会被加载。
+显式 selector 排除唯一推导版本或多份唯一二进制版本冲突时失败关闭。
+
+共享粒度是“相同的完整规范化 selector + Python ABI identity”。每个 ABI
+解释器族可作为多个 venv 的基础解释器，但每个完整 selector 仍有独立 venv；
+`resolvedRequirements` 不参与 identity，范围 selector 对应的 runtime 被删除后
+重建时，可能解析到范围内更新的版本。不同 selector 或 CP312/CP313 不会直接共用
+一个 venv，以免升级一个项目时破坏另一个项目。下载缓存可以共用，uv hardlink
+可复用缓存文件，但绝不拼接多个 `site-packages` 或 `PYTHONPATH`。
 
 Python Agent 只有在私有 manifest 明确标记
 `runtime.sharedAgentDependenciesComplete: true` 时才复用共享 worker。该标志仅在
@@ -82,6 +98,11 @@ Python Agent 只有在私有 manifest 明确标记
 
 范围 selector 首次解析后由精确 runtime binding 固定；日常执行不会每次漂移到
 范围内的新版本。
+
+Runner 0.4.0 接收完整 selector、`poolId`、`runtimeId` 与 Store 的 Python 约束，
+校验 Pool/runtime manifest 后复用可信绑定；它不会用宿主 CP312 重新计算 CP313
+identity。环境准备服务与真实运行都走这条路由，因此准备完成后首次运行只需重新
+取得 lease，不会再次创建或安装同一环境。
 
 ## 删除和自动回收
 
