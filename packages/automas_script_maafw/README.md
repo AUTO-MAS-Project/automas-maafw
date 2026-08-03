@@ -22,3 +22,11 @@ ProjectInterface. It never modifies the source directory. Plans are previewed,
 fingerprinted and CAS-checked before the host creates the first/new user;
 internal user copies exclude runtime state and resource journals. Project packs
 may override source discovery and plan generation through JSON-only methods.
+
+Script MaaFW 0.1.11 requires the active `maafw.runtime_pool.v1` service and
+routes its resolved `Root`/`poolId` into both environment preparation and the
+real worker run. Managed execution additionally consumes the prevalidated
+Store/runtime route (complete selector, binding and Python constraint), so the
+environment promised by the wizard is the environment later leased by the
+script instead of a second host-default pool. Its release minimums are Agent
+Env 0.1.4, Runner 0.4.0 and Runtime Pool 0.2.0.

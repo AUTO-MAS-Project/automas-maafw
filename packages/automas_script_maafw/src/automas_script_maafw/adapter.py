@@ -14,11 +14,17 @@ from automas_maafw_interface.service import MaaFWInterfaceService
 from automas_maafw_project_update.service import MaaFWProjectUpdateService
 
 from .project_path import release_project_path, try_reserve_project_path
+from .runtime_route import (
+    RUNTIME_POOL_SERVICE,
+    MaaFWRuntimePoolRoute,
+    runtime_pool_route_from_service,
+)
 from .runner_task import MaaFWPluginAutoProxyTask
 from .schema import build_source_config
 
 
 logger = get_logger("MaaFW 插件适配")
+_RUNTIME_POOL_ROUTE_KEY = "maafw_runtime_pool_route"
 
 
 class MaaFWAdapterHooks(ScriptAdapterHooks):
@@ -56,6 +62,7 @@ class MaaFWAdapterHooks(ScriptAdapterHooks):
         return "Pass"
 
     async def prepare(self, runtime: ScriptAdapterRuntime) -> None:
+        self._runtime_pool_route(runtime)
         await runtime.storage.lock()
 
         script_config = await runtime.build_script_model()
@@ -91,13 +98,17 @@ class MaaFWAdapterHooks(ScriptAdapterHooks):
     def run_auto_proxy(self, runtime: ScriptAdapterRuntime) -> TaskExecuteBase:
         if runtime.script_config is None or runtime.user_config is None:
             raise RuntimeError("MaaFW 插件配置尚未准备")
-        return MaaFWPluginAutoProxyTask(
+        runtime_pool = self._runtime_pool_route(runtime)
+        task = MaaFWPluginAutoProxyTask(
             runtime.script_info,
             runtime.script_config,
             runtime.user_config,
             runtime.emulator_manager,
             list(runtime.extra.get("maafw_project_update_logs") or []),
         )
+        task.maafw_runtime_pool_root = runtime_pool.root
+        task.maafw_runtime_pool_id = runtime_pool.pool_id
+        return task
 
     async def finalize(self, runtime: ScriptAdapterRuntime) -> None:
         previous_status = runtime.script_info.status
@@ -204,11 +215,14 @@ class MaaFWAdapterHooks(ScriptAdapterHooks):
                     "MaaFW project updated, preparing agent Python env",
                 )
                 agent_prepare_logs: list[str] = []
+                runtime_pool = self._runtime_pool_route(runtime)
                 try:
                     await asyncio.to_thread(
                         _prepare_maafw_agent_python_envs,
                         project_path,
                         refreshed_interface,
+                        runtime_pool_root=runtime_pool.root,
+                        runtime_pool_id=runtime_pool.pool_id,
                         send_log=agent_prepare_logs.append,
                     )
                 except Exception as exc:
@@ -237,6 +251,19 @@ class MaaFWAdapterHooks(ScriptAdapterHooks):
             logs.extend(_format_update_log_lines(message))
             runtime.script_info.log = "".join(logs[-80:])
 
+    @staticmethod
+    def _runtime_pool_route(runtime: ScriptAdapterRuntime) -> MaaFWRuntimePoolRoute:
+        cached = runtime.extra.get(_RUNTIME_POOL_ROUTE_KEY)
+        if isinstance(cached, MaaFWRuntimePoolRoute):
+            return cached
+        if cached is not None:
+            raise RuntimeError("MaaFW Runtime Pool 缓存路由类型无效")
+        route = runtime_pool_route_from_service(
+            runtime.get_service(RUNTIME_POOL_SERVICE)
+        )
+        runtime.extra[_RUNTIME_POOL_ROUTE_KEY] = route
+        return route
+
 
 def _format_update_log_lines(message: str) -> list[str]:
     now = datetime.now().strftime("%H:%M:%S")
@@ -247,6 +274,8 @@ def _prepare_maafw_agent_python_envs(
     project_path: Path,
     interface_model: Any,
     *,
+    runtime_pool_root: Path,
+    runtime_pool_id: str,
     send_log: Any = None,
 ) -> None:
     from automas_maafw_runner.service import MaaFWRunnerService
@@ -254,7 +283,8 @@ def _prepare_maafw_agent_python_envs(
     MaaFWRunnerService().prepare_project_environment(
         project_path,
         interface_model,
-        runtime_pool_root=Path.cwd() / "config" / "maafw_runtime_pool",
+        runtime_pool_root=runtime_pool_root,
+        runtime_pool_id=runtime_pool_id,
         send_log=send_log,
     )
 

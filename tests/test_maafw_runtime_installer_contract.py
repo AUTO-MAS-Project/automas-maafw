@@ -33,12 +33,13 @@ HOST_SHORT_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 
 def _probe_for(identity: dict[str, Any]) -> dict[str, str]:
     implementation, cache_tag, soabi = str(identity["pythonAbi"]).split(":", 2)
+    python_version = str(identity["pythonVersion"])
     return {
         "implementation": implementation,
         "cacheTag": cache_tag,
         "soabi": soabi,
-        "version": f"{identity['pythonVersion']}.99",
-        "shortVersion": str(identity["pythonVersion"]),
+        "version": python_version,
+        "shortVersion": ".".join(python_version.split(".")[:2]),
     }
 
 
@@ -198,7 +199,9 @@ class MaaFWRuntimeInstallerBootstrapTest(unittest.TestCase):
                 "C:/portable/uv.exe",
                 "venv",
                 "--python",
-                HOST_SHORT_VERSION,
+                "C:/portable/python.exe",
+                "--no-python-downloads",
+                "--no-project",
                 "--cache-dir",
                 str(self.uv_cache_dir),
                 "--link-mode",
@@ -224,7 +227,7 @@ class MaaFWRuntimeInstallerBootstrapTest(unittest.TestCase):
     def test_runtime_python_version_comes_from_the_created_environment(self) -> None:
         result = self._install(supports_venv=True)
 
-        self.assertEqual(result["pythonVersion"], f"{HOST_SHORT_VERSION}.99")
+        self.assertEqual(result["pythonVersion"], self.identity["pythonVersion"])
 
     def test_abi_mismatch_between_identity_and_runtime_is_rejected(self) -> None:
         drifted = _probe_for(self.identity)
@@ -238,13 +241,14 @@ class MaaFWRuntimeInstallerBootstrapTest(unittest.TestCase):
             )
 
         self.assertIn("ABI", str(raised.exception))
-        # uv pip install 必须没有发生：只创建了环境就中止。
-        self.assertEqual(len(self.commands), 1)
+        # 精确 bootstrap 在创建环境前即对账，不能先造出错误 ABI venv。
+        self.assertEqual(self.commands, [])
 
     def test_python_version_mismatch_between_identity_and_runtime_is_rejected(
         self,
     ) -> None:
         drifted = _probe_for(self.identity)
+        drifted["version"] = "2.7.18"
         drifted["shortVersion"] = "2.7"
 
         with self.assertRaises(RuntimeError) as raised:
@@ -254,7 +258,7 @@ class MaaFWRuntimeInstallerBootstrapTest(unittest.TestCase):
                 probe=drifted,
             )
 
-        self.assertIn("2.7", str(raised.exception))
+        self.assertIn("2.7.18", str(raised.exception))
 
 
 class MaaFWRuntimeInstallerProbeTest(unittest.TestCase):
@@ -294,7 +298,8 @@ class MaaFWRuntimeInstallerProbeTest(unittest.TestCase):
             f"{probe['implementation']}:{probe['cacheTag']}:{probe['soabi']}",
             identity["pythonAbi"],
         )
-        self.assertEqual(probe["shortVersion"], identity["pythonVersion"])
+        self.assertEqual(probe["version"], identity["pythonVersion"])
+        self.assertEqual(probe["shortVersion"], HOST_SHORT_VERSION)
 
 
 if __name__ == "__main__":

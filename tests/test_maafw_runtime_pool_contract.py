@@ -42,13 +42,19 @@ from automas_maafw_runtime_pool import (  # noqa: E402
     MaaFWRuntimePoolService,
     POOL_MARKER_NAME,
     POOL_SCHEMA_VERSION,
+    build_runtime_id,
     build_runtime_identity,
 )
 from automas_maafw_runtime_pool import installer as runtime_installer  # noqa: E402
+from automas_maafw_runtime_pool import pool as runtime_pool  # noqa: E402
 from automas_maafw_agent_env.planner import (  # noqa: E402
+    MaaFWAgentEnvError,
     build_maafw_agent_command_plans,
 )
-from automas_maafw_agent_env.env import prepare_agent_envs  # noqa: E402
+from automas_maafw_agent_env.env import (  # noqa: E402
+    prepare_agent_envs,
+    write_agent_compat_shims,
+)
 from automas_maafw_agent_env.models import MaaFWAgentCommandPlan  # noqa: E402
 from automas_maafw_runner.service import MaaFWRunnerService  # noqa: E402
 
@@ -58,12 +64,21 @@ class MaaFWRuntimePoolContractTest(unittest.TestCase):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.pool_root = Path(self.temporary_directory.name) / "pool"
         self.install_calls: list[tuple[tuple[str, ...], dict[str, Any]]] = []
+        self.fake_python_identities: dict[str, dict[str, str]] = {}
+        self.real_python_probe = runtime_pool.probe_python_identity
+        self.python_probe_patch = mock.patch.object(
+            runtime_pool,
+            "probe_python_identity",
+            side_effect=self._probe_fake_python,
+        )
+        self.python_probe_patch.start()
         self.service = MaaFWRuntimePoolService(
             self.pool_root,
             installer=self._fake_installer,
         )
 
     def tearDown(self) -> None:
+        self.python_probe_patch.stop()
         self.temporary_directory.cleanup()
 
     def _fake_installer(
@@ -78,6 +93,17 @@ class MaaFWRuntimePoolContractTest(unittest.TestCase):
         python_name = "python.exe" if os.name == "nt" else "python"
         python_executable = scripts_dir / python_name
         python_executable.write_text("fake runtime", encoding="utf-8")
+        implementation, cache_tag, soabi = str(identity["pythonAbi"]).split(":", 2)
+        version = str(identity["pythonVersion"])
+        self.fake_python_identities[self._runtime_key(python_executable)] = {
+            "implementation": implementation,
+            "cacheTag": cache_tag,
+            "soabi": soabi,
+            "version": version,
+            "shortVersion": ".".join(version.split(".")[:2]),
+            "platform": str(identity["platform"]),
+            "architecture": str(identity["architecture"]),
+        }
         maafw_version = next(
             (
                 item.split("==", 1)[1]
@@ -106,6 +132,22 @@ class MaaFWRuntimePoolContractTest(unittest.TestCase):
             },
             "link": {"mode": "hardlink"},
         }
+
+    def _probe_fake_python(self, python_executable: str | Path) -> dict[str, str]:
+        identity = self.fake_python_identities.get(
+            self._runtime_key(python_executable)
+        )
+        if identity is not None:
+            return dict(identity)
+        return self.real_python_probe(python_executable)
+
+    @staticmethod
+    def _runtime_key(path: str | Path) -> str:
+        prefix = "maafw-runtime-"
+        for part in Path(path).parts:
+            if part.startswith(prefix) and len(part) >= len(prefix) + 24:
+                return part[: len(prefix) + 24]
+        return str(Path(path).resolve())
 
     def test_uv_discovery_honors_host_configured_executable(self) -> None:
         configured_uv = self.pool_root.parent / "host-tools" / "uv.exe"
@@ -361,7 +403,7 @@ class MaaFWRuntimePoolContractTest(unittest.TestCase):
         json.dumps(first)
 
         identity = build_runtime_identity(["maafw==4.3.0"])
-        self.assertRegex(identity["pythonVersion"], r"^\d+\.\d+$")
+        self.assertRegex(identity["pythonVersion"], r"^\d+\.\d+\.\d+$")
         self.assertNotIn("projectPath", identity)
 
     def test_different_maafw_versions_are_isolated(self) -> None:
@@ -554,6 +596,64 @@ class MaaFWRuntimePoolContractTest(unittest.TestCase):
             )
         )
 
+    def test_shared_runtime_agent_requires_existing_python(self) -> None:
+        project_path = Path(self.temporary_directory.name) / "missing-shared-runtime"
+        project_path.mkdir()
+        missing_python = (
+            Path(self.temporary_directory.name)
+            / "missing-runtime"
+            / "Scripts"
+            / "python.exe"
+        )
+        plan = MaaFWAgentCommandPlan(
+            childExec="python/python.exe",
+            executable=str(missing_python),
+            executableExists=False,
+            runtimeKind="shared_runtime",
+            command=[str(missing_python), "agent.py"],
+            childArgs=["agent.py"],
+            cwd=str(project_path),
+        )
+
+        with self.assertRaisesRegex(
+            MaaFWAgentEnvError,
+            "共享 MaaFW runtime Python 不存在",
+        ):
+            prepare_agent_envs(project_path, [plan])
+
+    def test_agent_compat_shim_write_is_atomic_and_idempotent(self) -> None:
+        runtime_path = Path(self.temporary_directory.name) / "shim-runtime"
+        shim_dir = runtime_path / ".auto_mas_shims"
+        shim_dir.mkdir(parents=True)
+        shim_path = shim_dir / "sitecustomize.py"
+        shim_path.write_text("old shim\n", encoding="utf-8")
+
+        with (
+            mock.patch.object(
+                Path,
+                "replace",
+                side_effect=OSError("replace failed"),
+            ),
+            self.assertRaisesRegex(OSError, "replace failed"),
+        ):
+            write_agent_compat_shims(runtime_path)
+
+        self.assertEqual(shim_path.read_text(encoding="utf-8"), "old shim\n")
+        self.assertEqual(list(shim_dir.glob("sitecustomize.py.tmp-*")), [])
+
+        returned_shim_dir = write_agent_compat_shims(runtime_path)
+        content = shim_path.read_text(encoding="utf-8")
+        self.assertEqual(returned_shim_dir, shim_dir)
+        self.assertIn("_patch_legacy_maafw_resource", content)
+
+        with mock.patch.object(
+            Path,
+            "write_text",
+            side_effect=AssertionError("identical shim must not be rewritten"),
+        ):
+            self.assertEqual(write_agent_compat_shims(runtime_path), shim_dir)
+        self.assertEqual(shim_path.read_text(encoding="utf-8"), content)
+
     def test_isolated_agent_venv_preparation_is_serialized_by_path(self) -> None:
         project_path = Path(self.temporary_directory.name) / "isolated-agent-project"
         project_path.mkdir()
@@ -685,6 +785,179 @@ class MaaFWRuntimePoolContractTest(unittest.TestCase):
         finally:
             runner.release_environment(execution, runtime_pool=self.service.pool)
 
+    def test_managed_explicit_selector_ignores_checkout_route_and_requirements(
+        self,
+    ) -> None:
+        project_path = Path(self.temporary_directory.name) / "managed-selector"
+        project_path.mkdir()
+        (project_path / ".auto_mas_maafw_project.json").write_text(
+            "{malformed checkout sidecar",
+            encoding="utf-8",
+        )
+        (project_path / "requirements.txt").write_text(
+            "maafw==99.0.0\ncheckout-only==1.0\n",
+            encoding="utf-8",
+        )
+        selector = [
+            "maafw==4.3.0",
+            "json-with-comments",
+            "requests==2.34.2",
+        ]
+        runtime = self.service.ensure_runtime({"requirements": selector})
+        self.assertEqual(runtime["runtimeId"], build_runtime_id(selector))
+        runner = MaaFWRunnerService()
+
+        environment = runner.prepare_environment(
+            project_path,
+            runtime_pool=self.service.pool,
+            runtime_installer=self._fake_installer,
+            runtime_requirement=runtime["maafwRequirement"],
+            runtime_requirements=runtime["selectorRequirements"],
+            runtime_id=runtime["runtimeId"],
+            runtime_pool_id=runtime["poolId"],
+        )
+        try:
+            self.assertEqual(environment.runtime_id, runtime["runtimeId"])
+            self.assertEqual(
+                environment.python_executable,
+                Path(runtime["pythonExecutable"]),
+            )
+            self.assertEqual(environment.runtime_pool_id, runtime["poolId"])
+            self.assertEqual(len(self.install_calls), 1)
+        finally:
+            runner.release_environment(
+                environment,
+                runtime_pool=self.service.pool,
+            )
+
+        with self.assertRaisesRegex(RuntimeError, "Pool 身份不匹配"):
+            runner.prepare_environment(
+                project_path,
+                runtime_pool=self.service.pool,
+                runtime_requirements=runtime["selectorRequirements"],
+                runtime_id=runtime["runtimeId"],
+                runtime_pool_id="00000000-0000-0000-0000-000000000000",
+            )
+
+    def test_managed_preflight_routes_python_agent_to_exact_shared_runtime(
+        self,
+    ) -> None:
+        project_path = Path(self.temporary_directory.name) / "managed-agent"
+        project_path.mkdir()
+        (project_path / "agent.py").write_text("pass\n", encoding="utf-8")
+        selector = ["maafw==4.3.0", "json-with-comments"]
+        runtime = self.service.ensure_runtime({"requirements": selector})
+        runner = MaaFWRunnerService()
+
+        result = runner.prepare_project_environment(
+            project_path,
+            {
+                "agent": {
+                    "child_exec": "python",
+                    "child_args": ["agent.py"],
+                }
+            },
+            runtime_pool=self.service.pool,
+            runtime_installer=self._fake_installer,
+            runtime_requirement=runtime["maafwRequirement"],
+            runtime_requirements=runtime["selectorRequirements"],
+            runtime_id=runtime["runtimeId"],
+            runtime_pool_id=runtime["poolId"],
+            agent_env_root=Path(self.temporary_directory.name) / "agent-venvs",
+            install_agent_dependencies=False,
+            managed_shared_agent_dependencies_complete=True,
+            managed_python_agent_indexes=[0],
+        )
+
+        self.assertEqual(result["runtime"]["runtimeId"], runtime["runtimeId"])
+        self.assertEqual(result["runtime"]["poolId"], runtime["poolId"])
+        self.assertEqual(len(self.install_calls), 1)
+        plans = result["agents"]["plans"]
+        self.assertEqual(len(plans), 1)
+        self.assertEqual(plans[0]["runtimeKind"], "shared_runtime")
+        self.assertEqual(plans[0]["executable"], runtime["pythonExecutable"])
+        self.assertEqual(result["agents"]["preparedVenvs"], [])
+        self.assertEqual(result["agents"]["skipped"], [])
+        self.assertTrue(
+            any(
+                "共享 MaaFW runtime Python 已就绪" in message
+                for message in result["agents"]["messages"]
+            )
+        )
+
+    def test_managed_cp313_binding_is_not_recomputed_from_host_python(self) -> None:
+        project_path = Path(self.temporary_directory.name) / "managed-cp313"
+        project_path.mkdir()
+        selector = ["maafw==5.12.2", "json-with-comments"]
+        host_identity = build_runtime_identity(selector)
+        cp313 = {
+            "implementation": "cpython",
+            "cacheTag": "cpython-313",
+            "soabi": "cp313-win_amd64",
+            "version": "3.13.14",
+            "shortVersion": "3.13",
+            "platform": host_identity["platform"],
+            "architecture": host_identity["architecture"],
+        }
+        with (
+            mock.patch.object(
+                self.service.pool,
+                "resolve_python",
+                return_value={
+                    "executable": "C:/pool/python/cpython-3.13/python.exe",
+                    "identity": cp313,
+                    "source": "pool-managed",
+                    "constraint": "==3.13.*",
+                },
+            ),
+            mock.patch.object(
+                runtime_pool,
+                "probe_python_identity",
+                return_value=cp313,
+            ),
+        ):
+            runtime = self.service.ensure_runtime(
+                {
+                    "requirements": selector,
+                    "python": {
+                        "implementation": "cpython",
+                        "constraint": "==3.13.*",
+                    },
+                }
+            )
+
+        runner = MaaFWRunnerService()
+        with mock.patch.object(
+            runtime_pool,
+            "probe_python_identity",
+            return_value=cp313,
+        ):
+            environment = runner.prepare_environment(
+                project_path,
+                runtime_pool=self.service.pool,
+                runtime_installer=self._fake_installer,
+                runtime_requirement=runtime["maafwRequirement"],
+                runtime_requirements=runtime["selectorRequirements"],
+                runtime_id=runtime["runtimeId"],
+                runtime_pool_id=runtime["poolId"],
+                runtime_python_constraint="==3.13.*",
+            )
+        try:
+            self.assertEqual(environment.runtime_id, runtime["runtimeId"])
+            self.assertEqual(environment.python_constraint, "==3.13.*")
+            self.assertEqual(
+                runtime["identity"]["pythonVersion"],
+                "3.13.14",
+            )
+            if sys.version_info[:2] != (3, 13):
+                self.assertNotEqual(runtime["runtimeId"], build_runtime_id(selector))
+            self.assertEqual(len(self.install_calls), 1)
+        finally:
+            runner.release_environment(
+                environment,
+                runtime_pool=self.service.pool,
+            )
+
     def test_project_preflight_failure_reports_and_releases_lease(self) -> None:
         project_path = Path(self.temporary_directory.name) / "failed-prewarm-project"
         project_path.mkdir()
@@ -697,7 +970,7 @@ class MaaFWRuntimePoolContractTest(unittest.TestCase):
 
         with (
             mock.patch(
-                "automas_maafw_runner.service.MaaFWAgentEnvService.prepare_env",
+                "automas_maafw_runner.service.prepare_agent_envs",
                 side_effect=RuntimeError("agent preparation failed"),
             ),
             self.assertRaisesRegex(RuntimeError, "agent preparation failed"),
@@ -1101,6 +1374,226 @@ class MaaFWRuntimePoolContractTest(unittest.TestCase):
         )
         self.assertEqual(legacy_agent.runtimeKind, "isolated_venv")
 
+    def test_authoritative_shared_agent_flag_overrides_checkout_manifest(
+        self,
+    ) -> None:
+        from automas_maafw_runner.shared_agent import (
+            route_managed_python_agents_to_shared_runtime,
+        )
+
+        project = Path(self.temporary_directory.name) / "managed-authoritative-flag"
+        project.mkdir()
+        manifest_path = project / ".auto_mas_maafw_project.json"
+        shared_python = Path(self.temporary_directory.name) / "shared" / "python.exe"
+        shared_python.parent.mkdir()
+        shared_python.write_text("fake", encoding="utf-8")
+
+        def agent() -> SimpleNamespace:
+            return SimpleNamespace(
+                embedded=False,
+                runtimeKind="isolated_venv",
+                isolatedVenvPath="C:/managed/venv",
+                executable="C:/managed/venv/Scripts/python.exe",
+                executableExists=False,
+                command=["C:/managed/venv/Scripts/python.exe", "agent.py"],
+                childArgs=["agent.py"],
+                fallbackReason=None,
+            )
+
+        manifest_path.write_text(
+            json.dumps(
+                {"runtime": {"sharedAgentDependenciesComplete": False}}
+            ),
+            encoding="utf-8",
+        )
+        trusted_true = agent()
+        self.assertEqual(
+            route_managed_python_agents_to_shared_runtime(
+                project,
+                [trusted_true],
+                python_executable=shared_python,
+                dependencies_complete=True,
+            ),
+            [trusted_true],
+        )
+        self.assertEqual(trusted_true.runtimeKind, "shared_runtime")
+
+        manifest_path.write_text(
+            json.dumps(
+                {"runtime": {"sharedAgentDependenciesComplete": True}}
+            ),
+            encoding="utf-8",
+        )
+        trusted_false = agent()
+        self.assertEqual(
+            route_managed_python_agents_to_shared_runtime(
+                project,
+                [trusted_false],
+                python_executable=shared_python,
+                dependencies_complete=False,
+            ),
+            [],
+        )
+        self.assertEqual(trusted_false.runtimeKind, "isolated_venv")
+
+        manifest_path.write_text("{malformed checkout sidecar", encoding="utf-8")
+        trusted_over_malformed_checkout = agent()
+        self.assertEqual(
+            route_managed_python_agents_to_shared_runtime(
+                project,
+                [trusted_over_malformed_checkout],
+                python_executable=shared_python,
+                dependencies_complete=True,
+            ),
+            [trusted_over_malformed_checkout],
+        )
+
+    def test_stripped_bare_python_route_is_indexed_and_project_local(
+        self,
+    ) -> None:
+        from automas_maafw_runner.shared_agent import (
+            route_managed_python_agents_to_shared_runtime,
+        )
+
+        project = Path(self.temporary_directory.name) / "stripped-python"
+        (project / "agent").mkdir(parents=True)
+        (project / "agent" / "bootstrap.pyw").write_text(
+            "print('agent')\n",
+            encoding="utf-8",
+        )
+        outside_entry = Path(self.temporary_directory.name) / "outside.py"
+        outside_entry.write_text("print('outside')\n", encoding="utf-8")
+        shared_python = Path(self.temporary_directory.name) / "shared" / "python.exe"
+        shared_python.parent.mkdir()
+        shared_python.write_text("fake", encoding="utf-8")
+
+        def external_agent(
+            child_exec: str = "python",
+            child_args: list[str] | None = None,
+            *,
+            embedded: bool = False,
+        ) -> SimpleNamespace:
+            args = child_args or ["-u", "agent/bootstrap.pyw"]
+            return SimpleNamespace(
+                childExec=child_exec,
+                childArgs=args,
+                embedded=embedded,
+                runtimeKind="external",
+                isolatedVenvPath=None,
+                executable=child_exec,
+                executableExists=None,
+                command=[child_exec, *args, "<socket_id>"],
+                fallbackReason=None,
+            )
+
+        stripped = external_agent()
+        explicit_external = external_agent("C:/tools/python.exe")
+        no_entrypoint = external_agent(child_args=["-m", "agent.bootstrap"])
+        outside = external_agent(child_args=["-u", "../outside.py"])
+        embedded = external_agent(embedded=True)
+        routed = route_managed_python_agents_to_shared_runtime(
+            project,
+            [stripped, explicit_external, no_entrypoint, outside, embedded],
+            python_executable=shared_python,
+            dependencies_complete=True,
+            managed_python_agent_indexes=[0],
+        )
+
+        self.assertEqual(routed, [stripped])
+        self.assertEqual(stripped.runtimeKind, "shared_runtime")
+        self.assertEqual(stripped.command[0], str(shared_python.resolve()))
+        for untouched in (explicit_external, no_entrypoint, outside, embedded):
+            self.assertEqual(untouched.runtimeKind, "external")
+            self.assertNotEqual(untouched.command[0], str(shared_python.resolve()))
+
+        unindexed = external_agent()
+        self.assertEqual(
+            route_managed_python_agents_to_shared_runtime(
+                project,
+                [unindexed],
+                python_executable=shared_python,
+                dependencies_complete=True,
+                managed_python_agent_indexes=[],
+            ),
+            [],
+        )
+
+        ordinary_project = Path(self.temporary_directory.name) / "ordinary"
+        (ordinary_project / "agent").mkdir(parents=True)
+        (ordinary_project / "agent" / "bootstrap.pyw").write_text(
+            "print('ordinary')\n",
+            encoding="utf-8",
+        )
+        ordinary = external_agent()
+        self.assertEqual(
+            route_managed_python_agents_to_shared_runtime(
+                ordinary_project,
+                [ordinary],
+                python_executable=shared_python,
+            ),
+            [],
+        )
+        self.assertEqual(ordinary.runtimeKind, "external")
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "trusted Store projection",
+        ):
+            route_managed_python_agents_to_shared_runtime(
+                project,
+                [explicit_external],
+                python_executable=shared_python,
+                dependencies_complete=True,
+                managed_python_agent_indexes=[0],
+            )
+        inline_code = external_agent(
+            child_args=["-cprint('not a file entrypoint')", "agent/bootstrap.pyw"]
+        )
+        with self.assertRaisesRegex(RuntimeError, "trusted Store projection"):
+            route_managed_python_agents_to_shared_runtime(
+                project,
+                [inline_code],
+                python_executable=shared_python,
+                dependencies_complete=True,
+                managed_python_agent_indexes=[0],
+            )
+        with self.assertRaisesRegex(RuntimeError, "outside the current interface"):
+            route_managed_python_agents_to_shared_runtime(
+                project,
+                [stripped],
+                python_executable=shared_python,
+                dependencies_complete=True,
+                managed_python_agent_indexes=[1],
+            )
+
+        (project / ".auto_mas_maafw_project.json").write_text(
+            json.dumps(
+                {
+                    "runtime": {
+                        "sharedAgentDependenciesComplete": True,
+                        "agent": [
+                            {
+                                "index": 0,
+                                "classification": "python",
+                                "interpreterRoute": "managed-python",
+                                "projectedChildExec": "python",
+                            }
+                        ],
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        manifest_routed = external_agent()
+        self.assertEqual(
+            route_managed_python_agents_to_shared_runtime(
+                project,
+                [manifest_routed],
+                python_executable=shared_python,
+            ),
+            [manifest_routed],
+        )
+
     def test_bootstrap_python_agent_isolated_plan_precedes_shared_opt_in(
         self,
     ) -> None:
@@ -1182,6 +1675,24 @@ class MaaFWRuntimePoolContractTest(unittest.TestCase):
 
 
 class MaaFWRuntimePoolStaticContractTest(unittest.TestCase):
+    def test_worker_and_preflight_use_the_same_shared_agent_router(self) -> None:
+        runner_source = (RUNNER_SOURCE / "runner.py").read_text(encoding="utf-8")
+        service_source = (RUNNER_SOURCE / "service.py").read_text(encoding="utf-8")
+        for source in (runner_source, service_source):
+            tree = ast.parse(source)
+            route_calls = [
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id
+                == "route_managed_python_agents_to_shared_runtime"
+            ]
+            self.assertEqual(len(route_calls), 1)
+            keywords = {keyword.arg for keyword in route_calls[0].keywords}
+            self.assertIn("dependencies_complete", keywords)
+            self.assertIn("managed_python_agent_indexes", keywords)
+
     def test_plugin_distribution_and_service_contract(self) -> None:
         pyproject = tomllib.loads(
             (RUNTIME_POOL_PACKAGE / "pyproject.toml").read_text(encoding="utf-8")
@@ -1190,7 +1701,7 @@ class MaaFWRuntimePoolStaticContractTest(unittest.TestCase):
         entry_points = project["entry-points"]["auto_mas.plugins"]
 
         self.assertEqual(project["name"], "automas-maafw-runtime-pool")
-        self.assertEqual(project["version"], "0.1.5")
+        self.assertEqual(project["version"], "0.2.0")
         self.assertEqual(
             entry_points["automas_maafw_runtime_pool"],
             "automas_maafw_runtime_pool.plugin:Plugin",
@@ -1243,13 +1754,13 @@ class MaaFWRuntimePoolStaticContractTest(unittest.TestCase):
         pyproject = tomllib.loads(
             (RUNNER_PACKAGE / "pyproject.toml").read_text(encoding="utf-8")
         )
-        self.assertEqual(pyproject["project"]["version"], "0.3.4")
+        self.assertEqual(pyproject["project"]["version"], "0.4.0")
         self.assertIn(
-            "automas-maafw-runtime-pool>=0.1.4",
+            "automas-maafw-runtime-pool>=0.2.0",
             pyproject["project"]["dependencies"],
         )
         self.assertIn(
-            "automas-maafw-agent-env>=0.1.3",
+            "automas-maafw-agent-env>=0.1.4",
             pyproject["project"]["dependencies"],
         )
         self.assertIn(
@@ -1259,7 +1770,7 @@ class MaaFWRuntimePoolStaticContractTest(unittest.TestCase):
         agent_env_pyproject = tomllib.loads(
             (AGENT_ENV_PACKAGE / "pyproject.toml").read_text(encoding="utf-8")
         )
-        self.assertEqual(agent_env_pyproject["project"]["version"], "0.1.3")
+        self.assertEqual(agent_env_pyproject["project"]["version"], "0.1.4")
 
         environment_source = (RUNNER_SOURCE / "environment.py").read_text(
             encoding="utf-8"

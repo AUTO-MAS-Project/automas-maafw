@@ -121,6 +121,17 @@ class _Runtime:
     async def initialize_emulator_manager(self, _emulator_id: str) -> None:
         raise AssertionError("Emulator.Id='-' must not initialize an emulator")
 
+    def get_service(self, name: str, default: Any = None) -> Any:
+        if name != "maafw.runtime_pool.v1":
+            return default
+        return SimpleNamespace(
+            storage_info=lambda: {
+                "root": str(Path.cwd() / "config" / "maafw_runtime_pool"),
+                "poolId": "test-runtime-pool",
+                "rootIdentity": {"poolId": "test-runtime-pool"},
+            }
+        )
+
 
 def _module(name: str, **attributes: Any) -> types.ModuleType:
     value = types.ModuleType(name)

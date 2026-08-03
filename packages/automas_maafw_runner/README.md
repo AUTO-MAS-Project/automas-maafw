@@ -14,7 +14,8 @@ canonical requirement selector rather than by project path. The returned
 environment holds a lease for the worker lifetime; callers must invoke
 `MaaFWRunnerService.release_environment()` in their worker cleanup path.
 Runtime Pool keeps selector venvs isolated while uv reuses a pool-local package
-cache with hardlinks. Runner 0.3.4 requires Runtime Pool 0.1.4+, which records
+cache with hardlinks. Runner 0.4.0 requires Agent Env 0.1.4+ and Runtime Pool
+0.2.0+, which record
 installer/cache/link metadata, never composes environments through
 `PYTHONPATH`, and prunes the pool-local uv cache after collecting stale
 runtimes. Successful reclaim statistics and explicit unavailable/unsafe/error
@@ -27,8 +28,15 @@ worker run reacquires the same runtime without reinstalling unchanged
 requirements. Optional progress events expose deterministic runtime/Agent
 stages and do not invent dependency-download byte counts.
 
-Managed projects may declare `runtime.constraint`, `runtime.binding`, and
-`nativePluginPaths` in `.auto_mas_maafw_project.json`. An isolated Python Agent
+For a Managed project, the caller supplies the Store-authoritative complete
+selector, `runtimeId`, `poolId`, and `runtime.python` constraint. Runner checks
+the bound Pool manifest and Python identity, then reuses that trusted binding;
+it does not recompute a CP313 runtime ID from the AUTO-MAS host's CP312
+interpreter. Preparation and execution therefore acquire the same runtime.
+
+Managed projects may declare `runtime.constraint`, `runtime.binding`,
+`runtime.python`, and `nativePluginPaths` in
+`.auto_mas_maafw_project.json`. An isolated Python Agent
 reuses the worker interpreter only when the manifest explicitly sets
 `runtime.sharedAgentDependenciesComplete` to `true`. Legacy, incomplete,
 binary, and external Agents keep their previous routing behavior.

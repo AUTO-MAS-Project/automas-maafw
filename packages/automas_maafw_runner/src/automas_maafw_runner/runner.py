@@ -28,13 +28,13 @@ import subprocess
 import sys
 import threading
 import time
-import uuid
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO, Callable, Literal, TextIO
 
 import maa as maa_package
+from automas_maafw_agent_env import write_agent_compat_shims
 from maa.agent_client import AgentClient
 from maa.controller import (
     AdbController,
@@ -108,7 +108,6 @@ PIP_HEALTH_CHECK_TIMEOUT = 15
 # pip 安装/修复超时（秒）
 PIP_INSTALL_TIMEOUT = 120
 AGENT_ENV_MANIFEST_NAME = ".auto_mas_agent_env.json"
-AGENT_COMPAT_SHIM_DIR_NAME = ".auto_mas_shims"
 EMBEDDED_AGENT_SERVER_SINK_DECORATORS = {
     "resource_sink",
     "controller_sink",
@@ -294,47 +293,6 @@ def _venv_bootstrap_python() -> str:
     if portable_python.is_file():
         return str(portable_python)
     return sys.executable
-
-
-def _agent_compat_shim_dir(venv_path: Path) -> Path:
-    return venv_path / AGENT_COMPAT_SHIM_DIR_NAME
-
-
-def _write_agent_compat_shims(venv_path: Path) -> Path:
-    shim_dir = _agent_compat_shim_dir(venv_path)
-    shim_dir.mkdir(parents=True, exist_ok=True)
-    shim_path = shim_dir / "sitecustomize.py"
-    content = "\n".join(
-        [
-            "def _patch_legacy_maafw_resource():",
-            "    try:",
-            "        import maa.resource as maa_resource_module",
-            "        if hasattr(maa_resource_module, 'resource'):",
-            "            return",
-            "        from maa.agent.agent_server import AgentServer",
-            "        maa_resource_module.resource = AgentServer",
-            "    except Exception:",
-            "        pass",
-            "",
-            "_patch_legacy_maafw_resource()",
-            "",
-        ]
-    )
-    try:
-        if shim_path.read_text(encoding="utf-8") == content:
-            return shim_dir
-    except (FileNotFoundError, OSError, UnicodeError):
-        pass
-
-    temporary_path = shim_path.with_name(
-        f"{shim_path.name}.tmp-{uuid.uuid4().hex}"
-    )
-    try:
-        temporary_path.write_text(content, encoding="utf-8")
-        temporary_path.replace(shim_path)
-    finally:
-        temporary_path.unlink(missing_ok=True)
-    return shim_dir
 
 
 def _ensure_maafw_global_init(project_path: Path | None = None) -> None:
@@ -925,9 +883,15 @@ class MaaFWRunner:
             self.plan.path,
             process_agents,
             python_executable=sys.executable,
+            dependencies_complete=(
+                self.plan.managedSharedAgentDependenciesComplete
+            ),
+            managed_python_agent_indexes=(
+                self.plan.managedPythonAgentIndexes
+            ),
         )
         if shared_agents:
-            shim_dir = _write_agent_compat_shims(Path(sys.prefix))
+            shim_dir = write_agent_compat_shims(Path(sys.prefix))
             self.send_log(
                 "[Python环境] 托管 Python Agent 复用当前共享 runtime: "
                 f"{sys.executable} (agents={len(shared_agents)}, shim={shim_dir})"
@@ -1428,14 +1392,14 @@ class MaaFWRunner:
             if venv_path_str:
                 try:
                     python_path_items.append(
-                        str(_write_agent_compat_shims(Path(venv_path_str)))
+                        str(write_agent_compat_shims(Path(venv_path_str)))
                     )
                 except Exception as exc:
                     self.send_log(f"[Python环境] 写入 Agent 兼容层失败: {exc}")
         elif getattr(agent_plan, "runtimeKind", None) == SHARED_RUNTIME_KIND:
             try:
                 python_path_items.append(
-                    str(_write_agent_compat_shims(Path(sys.prefix)))
+                    str(write_agent_compat_shims(Path(sys.prefix)))
                 )
             except Exception as exc:
                 raise RuntimeError(
@@ -1565,7 +1529,7 @@ class MaaFWRunner:
             self._reset_isolated_venv(venv_path)
             had_valid_venv = False
         self._ensure_isolated_venv(venv_path)
-        _write_agent_compat_shims(venv_path)
+        write_agent_compat_shims(venv_path)
 
         test_env = self._build_agent_env_for_pip(project_path)
         # 隔离 venv 的 PYTHONPATH 指向项目根目录

@@ -7,6 +7,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
+from automas_maafw_agent_env import prepare_agent_envs, write_agent_compat_shims
 from automas_maafw_agent_env.service import MaaFWAgentEnvService
 from automas_maafw_interface.models import MaaFWInterface
 from automas_maafw_runtime_pool import MaaFWRuntimePool, RuntimeInstaller
@@ -19,6 +20,7 @@ from .environment import (
 )
 from .models import MaaFWDeviceConfig, MaaFWRunnerJobPayload, MaaFWRunPlan, MaaFWRunResult
 from .run_plan import build_maafw_run_plan
+from .shared_agent import route_managed_python_agents_to_shared_runtime
 from .worker_registry import (
     GLOBAL_MAAFW_WORKER_REGISTRY,
     MaaFWWorkerRegistry,
@@ -120,7 +122,10 @@ class MaaFWRunnerService:
         runtime_pool: MaaFWRuntimePool | None = None,
         runtime_installer: RuntimeInstaller | None = None,
         runtime_requirement: str | None = None,
+        runtime_requirements: list[str] | tuple[str, ...] | None = None,
         runtime_id: str | None = None,
+        runtime_pool_id: str | None = None,
+        runtime_python_constraint: str | None = None,
         lease_owner: str = "automas-maafw-runner",
         lease_ttl_seconds: float | None = DEFAULT_RUNTIME_LEASE_TTL_SECONDS,
         import_paths: list[str | Path] | None = None,
@@ -134,7 +139,10 @@ class MaaFWRunnerService:
             runtime_pool=runtime_pool,
             runtime_installer=runtime_installer,
             runtime_requirement=runtime_requirement,
+            runtime_requirements=runtime_requirements,
             runtime_id=runtime_id,
+            runtime_pool_id=runtime_pool_id,
+            runtime_python_constraint=runtime_python_constraint,
             lease_owner=lease_owner,
             lease_ttl_seconds=lease_ttl_seconds,
             import_paths=import_paths or [],
@@ -162,12 +170,17 @@ class MaaFWRunnerService:
         runtime_pool: MaaFWRuntimePool | None = None,
         runtime_installer: RuntimeInstaller | None = None,
         runtime_requirement: str | None = None,
+        runtime_requirements: list[str] | tuple[str, ...] | None = None,
         runtime_id: str | None = None,
+        runtime_pool_id: str | None = None,
+        runtime_python_constraint: str | None = None,
         agent_env_root: str | Path | None = None,
         import_paths: list[str | Path] | None = None,
         send_log: Callable[[str], None] | None = None,
         bootstrap_python: str | None = None,
         install_agent_dependencies: bool = True,
+        managed_shared_agent_dependencies_complete: bool | None = None,
+        managed_python_agent_indexes: list[int] | tuple[int, ...] | None = None,
         progress: ProjectEnvironmentProgressCallback | None = None,
     ) -> dict[str, Any]:
         """Prewarm the exact Runner pool identity and project Agent runtimes.
@@ -185,7 +198,10 @@ class MaaFWRunnerService:
                 runtime_pool=runtime_pool,
                 runtime_installer=runtime_installer,
                 runtime_requirement=runtime_requirement,
+                runtime_requirements=runtime_requirements,
                 runtime_id=runtime_id,
+                runtime_pool_id=runtime_pool_id,
+                runtime_python_constraint=runtime_python_constraint,
                 lease_owner=f"automas-maafw-preflight:{uuid.uuid4().hex}",
                 lease_ttl_seconds=600,
                 import_paths=import_paths,
@@ -225,10 +241,32 @@ class MaaFWRunnerService:
                     **details,
                 )
 
-            agent_result = MaaFWAgentEnvService().prepare_env(
+            agent_service = MaaFWAgentEnvService()
+            agent_plans = agent_service.build_command_plans(
                 project_path,
                 interface,
                 managed_env_root=agent_env_root,
+            )
+            shared_agents = route_managed_python_agents_to_shared_runtime(
+                project_path,
+                agent_plans,
+                python_executable=environment.python_executable,
+                dependencies_complete=(
+                    managed_shared_agent_dependencies_complete
+                ),
+                managed_python_agent_indexes=managed_python_agent_indexes,
+            )
+            if shared_agents:
+                shim_dir = write_agent_compat_shims(environment.venv_path)
+                if send_log is not None:
+                    send_log(
+                        "[Python环境] 托管 Python Agent 复用共享 runtime: "
+                        f"{environment.python_executable} "
+                        f"(agents={len(shared_agents)}, shim={shim_dir})"
+                    )
+            agent_result = prepare_agent_envs(
+                project_path,
+                agent_plans,
                 send_log=send_log,
                 bootstrap_python=bootstrap_python,
                 install_dependencies=install_agent_dependencies,
@@ -238,6 +276,7 @@ class MaaFWRunnerService:
                 "status": "ready",
                 "runtime": {
                     "runtimeId": environment.runtime_id,
+                    "poolId": environment.runtime_pool_id,
                     "pythonExecutable": str(environment.python_executable),
                     "venvPath": str(environment.venv_path),
                     "packages": list(environment.packages),

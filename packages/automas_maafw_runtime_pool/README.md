@@ -14,9 +14,21 @@ returns the resolved root, `poolId`, default-root flag and JSON-friendly
 `rootIdentity`.
 
 The plugin provides the JSON-friendly `maafw.runtime_pool.v1` service. Runtime
-identity is a selector derived from the canonical requirement set and current
-Python ABI/platform/architecture. Projects with the same selector reuse one
-environment while incompatible MaaFW selectors remain isolated.
+Pool 0.2.0 accepts an optional `python` request with a CPython constraint and
+supports the CP312 and CP313 minor families. It resolves a configured, host, or
+pool-local uv-managed interpreter for that ABI; `resolve_runtime()` never
+downloads one, while `ensure_runtime()` may prepare the missing pool-local
+interpreter. One interpreter family can seed multiple environments, but it is
+not itself a shared `site-packages` directory.
+
+Runtime identity is derived from the complete canonical requirement set plus
+the selected Python ABI, probed patch version, platform and architecture for
+explicit multi-ABI requests. Projects with the same full identity reuse one
+environment, while a different dependency selector or Python interpreter
+identity receives a different venv. Exact constraints such as `==3.13.14` are
+looked up and installed as that exact uv-managed patch. Host Python uses the
+same full probed patch identity, so it can reuse an explicit route only when the
+physical interpreter and complete requirement selector are actually identical.
 
 Each complete canonical requirement set still receives its own isolated venv.
 When `uv` is available, Runtime Pool creates a pool-local `cache/uv` and uses

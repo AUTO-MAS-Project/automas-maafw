@@ -21,6 +21,7 @@ from automas_maafw_runtime_pool import (  # noqa: E402
     prune_uv_cache,
 )
 from automas_maafw_runtime_pool import cache as runtime_cache  # noqa: E402
+from automas_maafw_runtime_pool import pool as runtime_pool  # noqa: E402
 
 
 class MaaFWRuntimeCachePruneContractTest(unittest.TestCase):
@@ -154,6 +155,14 @@ class MaaFWRuntimeCacheGcIntegrationTest(unittest.TestCase):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.pool_root = Path(self.temporary_directory.name) / "pool"
         self.prune_calls: list[dict[str, Any]] = []
+        self.fake_python_identities: dict[str, dict[str, str]] = {}
+        self.real_python_probe = runtime_pool.probe_python_identity
+        self.python_probe_patch = mock.patch.object(
+            runtime_pool,
+            "probe_python_identity",
+            side_effect=self._probe_fake_python,
+        )
+        self.python_probe_patch.start()
         self.service = MaaFWRuntimePoolService(
             self.pool_root,
             installer=self._fake_installer,
@@ -161,6 +170,7 @@ class MaaFWRuntimeCacheGcIntegrationTest(unittest.TestCase):
         )
 
     def tearDown(self) -> None:
+        self.python_probe_patch.stop()
         self.temporary_directory.cleanup()
 
     def _fake_installer(
@@ -169,13 +179,40 @@ class MaaFWRuntimeCacheGcIntegrationTest(unittest.TestCase):
         requirements: tuple[str, ...] | list[str],
         identity: dict[str, Any],
     ) -> dict[str, Any]:
-        del requirements, identity
+        del requirements
         scripts_dir = environment_path / ("Scripts" if os.name == "nt" else "bin")
         scripts_dir.mkdir(parents=True)
         python_name = "python.exe" if os.name == "nt" else "python"
         python_executable = scripts_dir / python_name
         python_executable.write_text("fake", encoding="utf-8")
+        implementation, cache_tag, soabi = str(identity["pythonAbi"]).split(":", 2)
+        version = str(identity["pythonVersion"])
+        self.fake_python_identities[self._runtime_key(python_executable)] = {
+            "implementation": implementation,
+            "cacheTag": cache_tag,
+            "soabi": soabi,
+            "version": version,
+            "shortVersion": ".".join(version.split(".")[:2]),
+            "platform": str(identity["platform"]),
+            "architecture": str(identity["architecture"]),
+        }
         return {"pythonExecutable": str(python_executable)}
+
+    def _probe_fake_python(self, python_executable: str | Path) -> dict[str, str]:
+        identity = self.fake_python_identities.get(
+            self._runtime_key(python_executable)
+        )
+        if identity is not None:
+            return dict(identity)
+        return self.real_python_probe(python_executable)
+
+    @staticmethod
+    def _runtime_key(path: str | Path) -> str:
+        prefix = "maafw-runtime-"
+        for part in Path(path).parts:
+            if part.startswith(prefix) and len(part) >= len(prefix) + 24:
+                return part[: len(prefix) + 24]
+        return str(Path(path).resolve())
 
     def _record_prune(
         self,

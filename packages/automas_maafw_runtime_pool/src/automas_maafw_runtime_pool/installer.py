@@ -3,12 +3,16 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
+
+from packaging.specifiers import InvalidSpecifier, SpecifierSet
+from packaging.version import InvalidVersion, Version
 
 
 RUNTIME_INSTALL_TIMEOUT_SECONDS = 300
@@ -16,20 +20,213 @@ RUNTIME_AUDIT_TIMEOUT_SECONDS = 60
 VENV_PROBE_TIMEOUT_SECONDS = 30
 # uv 兜底可能需要下载 managed Python，给足余量。
 UV_VENV_TIMEOUT_SECONDS = 300
+UV_PYTHON_INSTALL_TIMEOUT_SECONDS = 300
 UV_CACHE_RELATIVE_PATH = Path("cache") / "uv"
+UV_PYTHON_RELATIVE_PATH = Path("python")
 UV_LINK_MODE = "hardlink"
 RUNTIME_POOL_STAGING_DIRECTORY_NAME = ".staging"
+SUPPORTED_CPYTHON_MINORS = ((3, 12), (3, 13))
 
 _IDENTITY_PROBE_SCRIPT = (
-    "import json,sys,sysconfig;"
+    "import json,platform,sys,sysconfig;"
     "print(json.dumps({"
     "'implementation': getattr(sys.implementation, 'name', 'python'),"
     "'cacheTag': getattr(sys.implementation, 'cache_tag', None) or 'unknown',"
     "'soabi': str(sysconfig.get_config_var('SOABI') or 'unknown'),"
     "'version': '.'.join(str(part) for part in sys.version_info[:3]),"
     "'shortVersion': f'{sys.version_info.major}.{sys.version_info.minor}',"
+    "'platform': sysconfig.get_platform() or sys.platform,"
+    "'architecture': platform.machine() or 'unknown',"
     "}))"
 )
+
+
+def resolve_python_interpreter(
+    pool_root: str | Path,
+    python_request: Mapping[str, Any],
+    *,
+    allow_install: bool,
+) -> dict[str, Any] | None:
+    """Resolve one exact interpreter for an explicit Python constraint.
+
+    Resolution never silently crosses ABI boundaries.  The host interpreter
+    is reused when it satisfies the request.  Otherwise an explicitly
+    configured interpreter or a uv-managed interpreter under ``pool/python``
+    is used.  Only ``allow_install=True`` may download a missing interpreter.
+    """
+
+    implementation = str(
+        python_request.get("implementation") or "cpython"
+    ).strip().casefold()
+    if implementation != "cpython":
+        raise RuntimeError(
+            "MaaFW runtime currently supports only CPython interpreters"
+        )
+    constraint = _normalize_python_constraint(python_request.get("constraint"))
+    specifier = _parse_python_constraint(constraint)
+    target_versions = _matching_supported_python_minors(specifier)
+    if not target_versions:
+        raise RuntimeError(
+            "MaaFW runtime Python constraint has no supported CPython target "
+            f"(supported: 3.12, 3.13): {constraint}"
+        )
+
+    host_probe = probe_python_identity(Path(sys.executable))
+    if _python_probe_satisfies(host_probe, implementation, specifier):
+        return {
+            "executable": str(Path(sys.executable).resolve()),
+            "identity": host_probe,
+            "source": "host",
+            "constraint": constraint,
+        }
+
+    exact_patch_target = _exact_python_patch_target(specifier)
+    target_requests = [
+        (
+            exact_patch_target
+            if exact_patch_target is not None
+            and exact_patch_target.startswith(f"{target_version}.")
+            else target_version
+        )
+        for target_version in target_versions
+    ]
+
+    for target_version in reversed(target_versions):
+        configured = _configured_python_executable(target_version)
+        if configured is None:
+            continue
+        probe = probe_python_identity(configured)
+        if not _python_probe_satisfies(probe, implementation, specifier):
+            raise RuntimeError(
+                "configured MaaFW runtime Python does not satisfy the request: "
+                f"path={configured}, constraint={constraint}, "
+                f"actual={probe.get('implementation')} {probe.get('version')}"
+            )
+        return {
+            "executable": str(configured.resolve()),
+            "identity": probe,
+            "source": "configured",
+            "constraint": constraint,
+        }
+
+    root = Path(pool_root).resolve()
+    python_root = (root / UV_PYTHON_RELATIVE_PATH).resolve()
+    cache_dir = (root / UV_CACHE_RELATIVE_PATH).resolve()
+    uv_executable = _find_uv_executable(sys.executable)
+    if uv_executable is None:
+        if allow_install:
+            raise RuntimeError(
+                "MaaFW runtime requires a different Python ABI, but uv was not found"
+            )
+        return None
+
+    for target_version in reversed(target_requests):
+        executable = _find_pool_managed_python(
+            uv_executable,
+            target_version,
+            pool_root=root,
+            python_root=python_root,
+            cache_dir=cache_dir,
+        )
+        if executable is None:
+            continue
+        probe = probe_python_identity(executable)
+        if _python_probe_satisfies(probe, implementation, specifier):
+            return {
+                "executable": str(executable),
+                "identity": probe,
+                "source": "pool-managed",
+                "constraint": constraint,
+            }
+
+    if not allow_install:
+        if exact_patch_target is not None or all(
+            _minor_family_fully_satisfies(specifier, target_version)
+            for target_version in target_versions
+        ):
+            return None
+        installed_target = _select_uv_python_version(
+            uv_executable,
+            specifier,
+            target_versions,
+            pool_root=root,
+            python_root=python_root,
+            cache_dir=cache_dir,
+            only_installed=True,
+        )
+        if installed_target is None:
+            return None
+        executable = _find_pool_managed_python(
+            uv_executable,
+            installed_target,
+            pool_root=root,
+            python_root=python_root,
+            cache_dir=cache_dir,
+        )
+        if executable is None:
+            return None
+        probe = probe_python_identity(executable)
+        if not _python_probe_satisfies(probe, implementation, specifier):
+            return None
+        return {
+            "executable": str(executable),
+            "identity": probe,
+            "source": "pool-managed",
+            "constraint": constraint,
+        }
+
+    target_version = target_requests[-1]
+    if (
+        exact_patch_target is None
+        and not _minor_family_fully_satisfies(specifier, target_versions[-1])
+    ):
+        selected_download = _select_uv_python_version(
+            uv_executable,
+            specifier,
+            target_versions,
+            pool_root=root,
+            python_root=python_root,
+            cache_dir=cache_dir,
+            only_installed=False,
+        )
+        if selected_download is None:
+            raise RuntimeError(
+                "uv has no downloadable CPython satisfying the MaaFW runtime "
+                f"constraint: {constraint}"
+            )
+        target_version = selected_download
+    python_root.mkdir(parents=True, exist_ok=True)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    _install_pool_managed_python(
+        uv_executable,
+        target_version,
+        pool_root=root,
+        python_root=python_root,
+        cache_dir=cache_dir,
+    )
+    executable = _find_pool_managed_python(
+        uv_executable,
+        target_version,
+        pool_root=root,
+        python_root=python_root,
+        cache_dir=cache_dir,
+    )
+    if executable is None:
+        raise RuntimeError(
+            f"uv installed CPython {target_version}, but it was not found in the pool"
+        )
+    probe = probe_python_identity(executable)
+    if not _python_probe_satisfies(probe, implementation, specifier):
+        raise RuntimeError(
+            "uv installed MaaFW runtime Python with an incompatible ABI: "
+            f"constraint={constraint}, actual={probe.get('version')}"
+        )
+    return {
+        "executable": str(executable),
+        "identity": probe,
+        "source": "pool-managed",
+        "constraint": constraint,
+    }
 
 
 def install_python_runtime(
@@ -53,6 +250,7 @@ def install_python_runtime(
 
     log = send_log or (lambda _: None)
     bootstrap = str(bootstrap_python or sys.executable)
+    _verify_runtime_identity(Path(bootstrap), identity)
     resolved_cwd = Path(cwd).resolve() if cwd is not None else Path.cwd()
     pool_root = _runtime_pool_root(environment_path)
     uv_cache_dir = (pool_root / UV_CACHE_RELATIVE_PATH).resolve()
@@ -199,11 +397,8 @@ def _create_environment_with_uv(
     uv_cache_dir: Path,
     log: Callable[[str], None],
 ) -> None:
-    # runtime identity 的 pythonAbi 取自宿主进程，兜底解释器必须同 major.minor，
-    # 否则会造出 manifest 声明与实际不符的 runtime。
-    target_version = f"{sys.version_info.major}.{sys.version_info.minor}"
     log(
-        f"[MaaFW Runtime Pool] uv 创建共享环境 (python {target_version}): "
+        f"[MaaFW Runtime Pool] uv 创建共享环境 (python {bootstrap}): "
         f"{environment_path}"
     )
     _run(
@@ -211,7 +406,9 @@ def _create_environment_with_uv(
             uv_executable,
             "venv",
             "--python",
-            target_version,
+            bootstrap,
+            "--no-python-downloads",
+            "--no-project",
             "--cache-dir",
             str(uv_cache_dir),
             "--link-mode",
@@ -222,6 +419,301 @@ def _create_environment_with_uv(
         env=_uv_environment(uv_cache_dir, UV_LINK_MODE),
         timeout=UV_VENV_TIMEOUT_SECONDS,
     )
+
+
+def _normalize_python_constraint(value: Any) -> str:
+    normalized = str(value or "").strip()
+    if not normalized:
+        raise RuntimeError("MaaFW runtime python.constraint cannot be empty")
+    if re.fullmatch(r"\d+\.\d+", normalized):
+        return f"=={normalized}.*"
+    return normalized
+
+
+def _parse_python_constraint(value: str) -> SpecifierSet:
+    try:
+        return SpecifierSet(value)
+    except InvalidSpecifier as exc:
+        raise RuntimeError(
+            f"invalid MaaFW runtime Python constraint: {value}"
+        ) from exc
+
+
+def _matching_supported_python_minors(specifier: SpecifierSet) -> list[str]:
+    matches: list[str] = []
+    for major, minor in SUPPORTED_CPYTHON_MINORS:
+        if any(
+            specifier.contains(
+                Version(f"{major}.{minor}.{patch}"),
+                prereleases=True,
+            )
+            for patch in range(1000)
+        ):
+            matches.append(f"{major}.{minor}")
+    return matches
+
+
+def _minor_family_fully_satisfies(
+    specifier: SpecifierSet,
+    target_minor: str,
+) -> bool:
+    return all(
+        specifier.contains(
+            Version(f"{target_minor}.{patch}"),
+            prereleases=True,
+        )
+        for patch in range(1000)
+    )
+
+
+def _exact_python_patch_target(specifier: SpecifierSet) -> str | None:
+    """Return one exact CPython patch requested by ``==``/``===``.
+
+    Other range constraints continue to select a compatible supported minor
+    and are verified against the interpreter probe.  Exact patch requests
+    must be passed to uv unchanged; asking uv only for ``3.13`` could otherwise
+    return a different installed patch and make the request impossible to
+    satisfy deterministically.
+    """
+
+    targets: set[str] = set()
+    for item in specifier:
+        if item.operator not in {"==", "==="} or "*" in item.version:
+            continue
+        try:
+            version = Version(item.version)
+        except InvalidVersion:
+            continue
+        release = version.release
+        if len(release) < 3:
+            continue
+        targets.add(".".join(str(part) for part in release[:3]))
+    if len(targets) > 1:
+        raise RuntimeError(
+            "MaaFW runtime Python constraint contains conflicting exact patches: "
+            + ", ".join(sorted(targets))
+        )
+    return next(iter(targets), None)
+
+
+def _python_probe_satisfies(
+    probe: Mapping[str, Any],
+    implementation: str,
+    specifier: SpecifierSet,
+) -> bool:
+    if str(probe.get("implementation") or "").strip().casefold() != implementation:
+        return False
+    try:
+        version = Version(str(probe.get("version") or "").strip())
+    except InvalidVersion:
+        return False
+    return specifier.contains(version, prereleases=True)
+
+
+def _configured_python_executable(target_version: str) -> Path | None:
+    version_key = target_version.replace(".", "_")
+    for env_name in (
+        f"AUTO_MAS_PYTHON_{version_key}_EXE",
+        "AUTO_MAS_PYTHON_EXE",
+    ):
+        configured = str(os.environ.get(env_name) or "").strip()
+        if not configured:
+            continue
+        path = Path(configured)
+        if not path.is_file():
+            raise RuntimeError(
+                f"configured MaaFW runtime Python does not exist: {path}"
+            )
+        return path.resolve()
+    return None
+
+
+def _pool_python_environment(
+    python_root: Path,
+    cache_dir: Path,
+) -> dict[str, str]:
+    env = _uv_environment(cache_dir, UV_LINK_MODE)
+    env["UV_PYTHON_INSTALL_DIR"] = str(python_root)
+    return env
+
+
+def _find_pool_managed_python(
+    uv_executable: str,
+    target_version: str,
+    *,
+    pool_root: Path,
+    python_root: Path,
+    cache_dir: Path,
+) -> Path | None:
+    try:
+        result = subprocess.run(
+            [
+                uv_executable,
+                "python",
+                "find",
+                f"cpython-{target_version}",
+                "--managed-python",
+                "--no-project",
+                "--no-python-downloads",
+                "--resolve-links",
+                "--cache-dir",
+                str(cache_dir),
+            ],
+            capture_output=True,
+            timeout=VENV_PROBE_TIMEOUT_SECONDS,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=pool_root,
+            env=_pool_python_environment(python_root, cache_dir),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError("MaaFW runtime pool-local Python lookup failed") from exc
+    if result.returncode != 0:
+        return None
+    output = result.stdout.strip()
+    if not output:
+        return None
+    executable = Path(output).resolve()
+    try:
+        common = os.path.commonpath(
+            [os.path.normcase(str(executable)), os.path.normcase(str(python_root))]
+        )
+    except ValueError as exc:
+        common = ""
+        path_error = exc
+    else:
+        path_error = None
+    if common != os.path.normcase(str(python_root)):
+        raise RuntimeError(
+            f"uv returned a managed Python outside the runtime pool: {executable}"
+        ) from path_error
+    if not executable.is_file():
+        return None
+    return executable
+
+
+def _install_pool_managed_python(
+    uv_executable: str,
+    target_version: str,
+    *,
+    pool_root: Path,
+    python_root: Path,
+    cache_dir: Path,
+) -> None:
+    _run(
+        [
+            uv_executable,
+            "python",
+            "install",
+            f"cpython-{target_version}",
+            "--install-dir",
+            str(python_root),
+            "--no-bin",
+            "--no-registry",
+            "--cache-dir",
+            str(cache_dir),
+            "--no-progress",
+        ],
+        cwd=pool_root,
+        env=_pool_python_environment(python_root, cache_dir),
+        timeout=UV_PYTHON_INSTALL_TIMEOUT_SECONDS,
+    )
+
+
+def _select_uv_python_version(
+    uv_executable: str,
+    specifier: SpecifierSet,
+    target_minors: Sequence[str],
+    *,
+    pool_root: Path,
+    python_root: Path,
+    cache_dir: Path,
+    only_installed: bool,
+) -> str | None:
+    """Select the newest real uv catalog version satisfying a patch range."""
+
+    scope_flag = "--only-installed" if only_installed else "--only-downloads"
+    try:
+        result = subprocess.run(
+            [
+                uv_executable,
+                "python",
+                "list",
+                "cpython",
+                "--all-versions",
+                scope_flag,
+                "--output-format",
+                "json",
+                "--managed-python",
+                "--no-config",
+                "--cache-dir",
+                str(cache_dir),
+            ],
+            capture_output=True,
+            timeout=VENV_PROBE_TIMEOUT_SECONDS,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=pool_root,
+            env=_pool_python_environment(python_root, cache_dir),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError("MaaFW runtime uv Python catalog lookup failed") from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(
+            "MaaFW runtime uv Python catalog lookup failed "
+            f"(exit={result.returncode}): {detail[:800]}"
+        )
+    try:
+        rows = json.loads(result.stdout)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "MaaFW runtime uv Python catalog returned invalid JSON"
+        ) from exc
+    if not isinstance(rows, list):
+        raise RuntimeError(
+            "MaaFW runtime uv Python catalog must return a JSON array"
+        )
+
+    allowed_minors = set(target_minors)
+    candidates: list[Version] = []
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        if str(row.get("implementation") or "").casefold() != "cpython":
+            continue
+        raw_version = str(row.get("version") or "").strip()
+        try:
+            version = Version(raw_version)
+        except InvalidVersion:
+            continue
+        release = version.release
+        if len(release) < 2 or f"{release[0]}.{release[1]}" not in allowed_minors:
+            continue
+        if not specifier.contains(version, prereleases=True):
+            continue
+        if only_installed:
+            raw_path = str(row.get("path") or "").strip()
+            if not raw_path:
+                continue
+            installed_path = Path(raw_path).resolve()
+            try:
+                common = os.path.commonpath(
+                    [
+                        os.path.normcase(str(installed_path)),
+                        os.path.normcase(str(python_root)),
+                    ]
+                )
+            except ValueError:
+                continue
+            if common != os.path.normcase(str(python_root)):
+                continue
+        candidates.append(version)
+    if not candidates:
+        return None
+    return str(max(candidates))
 
 
 def _python_supports_venv(python: str) -> bool:
@@ -360,6 +852,12 @@ def _probe_python_identity(python_executable: Path) -> dict[str, str]:
     return {str(key): str(value) for key, value in payload.items()}
 
 
+def probe_python_identity(python_executable: str | Path) -> dict[str, str]:
+    """Return the JSON-compatible ABI identity of one real interpreter."""
+
+    return _probe_python_identity(Path(python_executable))
+
+
 def _verify_runtime_identity(
     python_executable: Path,
     identity: dict[str, Any] | None,
@@ -381,7 +879,20 @@ def _verify_runtime_identity(
             f"expected={expected_abi}, actual={actual_abi}"
         )
     expected_version = str(identity.get("pythonVersion") or "").strip()
-    actual_version = probe.get("shortVersion", "")
+    actual_version = ""
+    if expected_version:
+        try:
+            expected_release = Version(expected_version).release
+        except InvalidVersion as exc:
+            raise RuntimeError(
+                "MaaFW runtime identity 的 pythonVersion 无效："
+                f"{expected_version}"
+            ) from exc
+        actual_version = str(
+            probe.get("version", "")
+            if len(expected_release) >= 3
+            else probe.get("shortVersion", "")
+        )
     if expected_version and expected_version != actual_version:
         raise RuntimeError(
             "MaaFW runtime Python 版本与 identity 声明不一致："

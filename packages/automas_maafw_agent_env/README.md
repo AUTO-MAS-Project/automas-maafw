@@ -16,3 +16,9 @@ the interpreter starts and imports `maa.agent.agent_server.AgentServer`. It is
 not required to contain pip or ensurepip and AUTO-MAS never mutates it. Only an
 AUTO-MAS-owned `isolated_venv` is bootstrapped and dependency-managed. The
 optional progress callback reports deterministic per-Agent completion.
+
+Agent Env 0.1.4 also recognizes a Runner-provided `shared_runtime` plan. It
+validates that the Runtime Pool interpreter exists without attempting to
+bootstrap or mutate that shared environment. Compatibility shims are written
+atomically and idempotently, so concurrent preparation cannot expose a partial
+`sitecustomize.py`.

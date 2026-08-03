@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import copy
+import functools
+import inspect
 import json
 import os
 import platform
@@ -14,6 +16,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from packaging.version import InvalidVersion, Version
+
 from .cache import prune_uv_cache
 
 from .identity import (
@@ -23,6 +27,7 @@ from .identity import (
     infer_exact_maafw_version,
     runtime_id_for_identity,
 )
+from .installer import probe_python_identity, resolve_python_interpreter
 
 
 POOL_SCHEMA_VERSION = 2
@@ -74,6 +79,7 @@ class MaaFWRuntimePool:
         self._is_default_root = _same_path(self.root, default_root)
         self.runtime_root = self.root / RUNTIME_DIRECTORY_NAME
         self.staging_root = self.root / STAGING_DIRECTORY_NAME
+        self.python_root = self.root / "python"
         self.installer = installer
         self.cache_pruner = cache_pruner
         self._lock = _pool_lock(self.root)
@@ -124,8 +130,12 @@ class MaaFWRuntimePool:
         requirements: Iterable[str],
         *,
         touch: bool = False,
+        python_identity: Mapping[str, Any] | None = None,
     ) -> dict[str, Any] | None:
-        identity = build_runtime_identity(requirements)
+        identity = build_runtime_identity(
+            requirements,
+            python_identity=python_identity,
+        )
         runtime_id = runtime_id_for_identity(identity)
         with self._lock:
             self._initialize()
@@ -133,10 +143,12 @@ class MaaFWRuntimePool:
             if not runtime_dir.is_dir():
                 return None
             manifest = self._read_manifest(runtime_id, expected_identity=identity)
+            payload = self._augment_manifest(manifest, verify_python=True)
             if touch:
                 manifest["lastUsedAt"] = _format_time(_utc_now())
                 self._write_manifest(runtime_id, manifest)
-            return self._augment_manifest(manifest)
+                payload["lastUsedAt"] = manifest["lastUsedAt"]
+            return payload
 
     def get(
         self,
@@ -150,10 +162,12 @@ class MaaFWRuntimePool:
             if not runtime_dir.is_dir():
                 return None
             manifest = self._read_manifest(runtime_id)
+            payload = self._augment_manifest(manifest, verify_python=True)
             if touch:
                 manifest["lastUsedAt"] = _format_time(_utc_now())
                 self._write_manifest(runtime_id, manifest)
-            return self._augment_manifest(manifest)
+                payload["lastUsedAt"] = manifest["lastUsedAt"]
+            return payload
 
     def ensure(
         self,
@@ -161,8 +175,13 @@ class MaaFWRuntimePool:
         *,
         installer: RuntimeInstaller | None = None,
         metadata: Mapping[str, Any] | None = None,
+        python_identity: Mapping[str, Any] | None = None,
+        bootstrap_python: str | Path | None = None,
     ) -> dict[str, Any]:
-        identity = build_runtime_identity(requirements)
+        identity = build_runtime_identity(
+            requirements,
+            python_identity=python_identity,
+        )
         canonical_requirements = tuple(identity["requirements"])
         runtime_id = runtime_id_for_identity(identity)
         install = installer or self.installer
@@ -170,10 +189,16 @@ class MaaFWRuntimePool:
             raise MaaFWRuntimePoolError(
                 "runtime does not exist and no installer was provided"
             )
+        if bootstrap_python is not None:
+            install = _bind_bootstrap_python(install, bootstrap_python)
 
         with self._lock:
             self._initialize()
-            existing = self.resolve(canonical_requirements, touch=True)
+            existing = self.resolve(
+                canonical_requirements,
+                touch=True,
+                python_identity=python_identity,
+            )
             if existing is not None:
                 return existing
 
@@ -193,6 +218,12 @@ class MaaFWRuntimePool:
                     environment_path,
                     install_result,
                 )
+                installed_python_identity = None
+                if python_identity is not None:
+                    installed_python_identity = _verify_installed_python_identity(
+                        stage_dir / python_relative,
+                        identity,
+                    )
                 now = _format_time(_utc_now())
                 maafw_requirement = find_maafw_requirement(canonical_requirements)
                 maafw_version = _optional_string(
@@ -200,9 +231,18 @@ class MaaFWRuntimePool:
                     or install_result.pop("maafw_version", None)
                 ) or infer_exact_maafw_version(maafw_requirement)
                 python_patch_version = _optional_string(
-                    install_result.pop("pythonVersion", None)
+                    (
+                        installed_python_identity.get("version")
+                        if installed_python_identity is not None
+                        else None
+                    )
+                    or install_result.pop("pythonVersion", None)
                     or install_result.pop("python_version", None)
-                ) or platform.python_version()
+                ) or (
+                    str(identity["pythonVersion"])
+                    if python_identity is not None
+                    else platform.python_version()
+                )
                 resolved_requirements = _normalize_string_list(
                     install_result.pop("resolvedRequirements", None)
                     or install_result.pop("resolved_requirements", None),
@@ -236,7 +276,8 @@ class MaaFWRuntimePool:
                 if runtime_dir.exists():
                     self._remove_staging_dir(stage_dir, runtime_id)
                     return self._augment_manifest(
-                        self._read_manifest(runtime_id, expected_identity=identity)
+                        self._read_manifest(runtime_id, expected_identity=identity),
+                        verify_python=True,
                     )
                 try:
                     stage_dir.replace(runtime_dir)
@@ -245,12 +286,29 @@ class MaaFWRuntimePool:
                         raise
                     self._remove_staging_dir(stage_dir, runtime_id)
                 return self._augment_manifest(
-                    self._read_manifest(runtime_id, expected_identity=identity)
+                    self._read_manifest(runtime_id, expected_identity=identity),
+                    verify_python=True,
                 )
             except Exception:
                 if stage_dir.exists():
                     self._remove_staging_dir(stage_dir, runtime_id)
                 raise
+
+    def resolve_python(
+        self,
+        python_request: Mapping[str, Any],
+        *,
+        allow_install: bool = False,
+    ) -> dict[str, Any] | None:
+        """Resolve an explicit interpreter under the pool's operation lock."""
+
+        with self._lock:
+            self._initialize()
+            return resolve_python_interpreter(
+                self.root,
+                python_request,
+                allow_install=allow_install,
+            )
 
     def touch(
         self,
@@ -260,6 +318,7 @@ class MaaFWRuntimePool:
     ) -> dict[str, Any]:
         with self._lock:
             manifest = self._read_manifest(runtime_id)
+            self._augment_manifest(manifest, verify_python=True)
             manifest["lastUsedAt"] = _format_time(_parse_time(at) if at else _utc_now())
             self._prune_expired_leases(manifest, _utc_now())
             self._write_manifest(runtime_id, manifest)
@@ -338,6 +397,7 @@ class MaaFWRuntimePool:
             raise MaaFWRuntimePoolError("lease ttl_seconds must be positive")
         with self._lock:
             manifest = self._read_manifest(runtime_id)
+            self._augment_manifest(manifest, verify_python=True)
             now = _utc_now()
             self._prune_expired_leases(manifest, now)
             leases = dict(manifest.get("leases") or {})
@@ -503,6 +563,7 @@ class MaaFWRuntimePool:
             self.runtime_root,
             self.staging_root,
             self.root / "cache",
+            self.python_root,
         ):
             _assert_existing_chain_has_no_reparse(managed_path)
         marker_path = self.root / POOL_MARKER_NAME
@@ -553,8 +614,10 @@ class MaaFWRuntimePool:
         _assert_existing_chain_has_no_reparse(self.staging_root)
         self.runtime_root.mkdir(parents=True, exist_ok=True)
         self.staging_root.mkdir(parents=True, exist_ok=True)
+        self.python_root.mkdir(parents=True, exist_ok=True)
         _assert_not_reparse(self.runtime_root)
         _assert_not_reparse(self.staging_root)
+        _assert_not_reparse(self.python_root)
 
     def inventory(self) -> dict[str, Any]:
         """List every managed-looking runtime and report corruption explicitly."""
@@ -660,7 +723,12 @@ class MaaFWRuntimePool:
         self._validate_managed_runtime_dir(runtime_dir, runtime_id, require_manifest=True)
         _write_json_atomic(runtime_dir / RUNTIME_MANIFEST_NAME, manifest)
 
-    def _augment_manifest(self, manifest: dict[str, Any]) -> dict[str, Any]:
+    def _augment_manifest(
+        self,
+        manifest: dict[str, Any],
+        *,
+        verify_python: bool = False,
+    ) -> dict[str, Any]:
         payload = copy.deepcopy(manifest)
         runtime_id = str(payload["runtimeId"])
         runtime_dir = self._runtime_dir(runtime_id).resolve()
@@ -677,6 +745,13 @@ class MaaFWRuntimePool:
             raise MaaFWRuntimePoolError(
                 f"runtime environment is incomplete: {runtime_id}"
             )
+        identity = payload.get("identity")
+        if verify_python and _has_explicit_patch_identity(identity):
+            if not isinstance(identity, Mapping):  # pragma: no cover - manifest guard
+                raise MaaFWRuntimePoolError(
+                    f"runtime manifest identity is invalid: {runtime_id}"
+                )
+            _verify_installed_python_identity(python_executable, identity)
         now = _utc_now()
         payload["path"] = str(runtime_dir)
         payload["poolId"] = self._root_identity["poolId"]
@@ -828,7 +903,12 @@ def _validate_pool_marker(value: Any) -> dict[str, Any]:
 
 
 def _is_legacy_default_pool(children: Iterable[Path]) -> bool:
-    known_names = {RUNTIME_DIRECTORY_NAME, STAGING_DIRECTORY_NAME, "cache"}
+    known_names = {
+        RUNTIME_DIRECTORY_NAME,
+        STAGING_DIRECTORY_NAME,
+        "cache",
+        "python",
+    }
     for child in children:
         _assert_not_reparse(child)
         if child.name not in known_names or not child.is_dir():
@@ -901,6 +981,111 @@ def _required_token(value: str, field_name: str) -> str:
     if not normalized:
         raise MaaFWRuntimePoolError(f"{field_name} cannot be empty")
     return normalized
+
+
+def _bind_bootstrap_python(
+    installer: RuntimeInstaller,
+    bootstrap_python: str | Path,
+) -> RuntimeInstaller:
+    """Bind exact bootstrap support without breaking legacy test installers."""
+
+    try:
+        parameters = inspect.signature(installer).parameters
+    except (TypeError, ValueError):
+        return installer
+    accepts_keyword = "bootstrap_python" in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+    if not accepts_keyword:
+        return installer
+    return functools.partial(
+        installer,
+        bootstrap_python=str(Path(bootstrap_python).resolve()),
+    )
+
+
+def _verify_installed_python_identity(
+    python_executable: Path,
+    expected_identity: Mapping[str, Any],
+) -> dict[str, str]:
+    """Fail closed when a custom installer returns the wrong Python ABI."""
+
+    try:
+        actual = probe_python_identity(python_executable)
+    except Exception as exc:
+        raise MaaFWRuntimePoolError(
+            "installed runtime Python identity could not be verified: "
+            f"{python_executable}"
+        ) from exc
+
+    required_probe_fields = (
+        "implementation",
+        "cacheTag",
+        "soabi",
+        "version",
+        "shortVersion",
+        "platform",
+        "architecture",
+    )
+    missing = [
+        field
+        for field in required_probe_fields
+        if not str(actual.get(field) or "").strip()
+    ]
+    if missing:
+        raise MaaFWRuntimePoolError(
+            "installed runtime Python identity is incomplete: "
+            + ", ".join(missing)
+        )
+
+    expected_python_version = str(
+        expected_identity.get("pythonVersion") or ""
+    ).strip()
+    try:
+        expected_release = Version(expected_python_version).release
+    except InvalidVersion as exc:
+        raise MaaFWRuntimePoolError(
+            "selected runtime Python identity has an invalid pythonVersion"
+        ) from exc
+    actual_values = {
+        "pythonAbi": (
+            f"{actual['implementation']}:{actual['cacheTag']}:{actual['soabi']}"
+        ),
+        "pythonVersion": str(
+            actual["version"]
+            if len(expected_release) >= 3
+            else actual["shortVersion"]
+        ),
+        "platform": str(actual["platform"]),
+        "architecture": str(actual["architecture"]),
+    }
+    mismatches = [
+        f"{field}: expected={expected_identity.get(field)!r}, "
+        f"actual={actual_value!r}"
+        for field, actual_value in actual_values.items()
+        if str(expected_identity.get(field) or "") != actual_value
+    ]
+    if mismatches:
+        raise MaaFWRuntimePoolError(
+            "installed runtime Python identity does not match the selected ABI: "
+            + "; ".join(mismatches)
+        )
+    return {str(key): str(value) for key, value in actual.items()}
+
+
+def _has_explicit_patch_identity(value: Any) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    python_version = str(value.get("pythonVersion") or "").strip()
+    if not python_version:
+        return False
+    try:
+        return len(Version(python_version).release) >= 3
+    except InvalidVersion as exc:
+        raise MaaFWRuntimePoolError(
+            "runtime manifest identity has an invalid pythonVersion"
+        ) from exc
 
 
 def _optional_string(value: Any) -> str | None:

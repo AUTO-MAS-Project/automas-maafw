@@ -5,8 +5,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from packaging.specifiers import InvalidSpecifier, SpecifierSet
+from packaging.version import InvalidVersion, Version
+
 from .cache import prune_uv_cache
-from .identity import build_runtime_id
+from .identity import build_runtime_id, canonicalize_requirements
 from .installer import install_python_runtime
 from .pool import (
     MaaFWRuntimePool,
@@ -58,16 +61,28 @@ class MaaFWRuntimePoolService:
         requirements: Iterable[str],
         *,
         touch: bool = False,
+        python_identity: Mapping[str, Any] | None = None,
     ) -> dict[str, Any] | None:
-        return self.pool.resolve(requirements, touch=touch)
+        return self.pool.resolve(
+            requirements,
+            touch=touch,
+            python_identity=python_identity,
+        )
 
     def ensure(
         self,
         requirements: Iterable[str],
         *,
         metadata: Mapping[str, Any] | None = None,
+        python_identity: Mapping[str, Any] | None = None,
+        bootstrap_python: str | Path | None = None,
     ) -> dict[str, Any]:
-        return self.pool.ensure(requirements, metadata=metadata)
+        return self.pool.ensure(
+            requirements,
+            metadata=metadata,
+            python_identity=python_identity,
+            bootstrap_python=bootstrap_python,
+        )
 
     def resolve_runtime(
         self,
@@ -78,16 +93,38 @@ class MaaFWRuntimePoolService:
             if runtime_id:
                 resolved = self.pool.get(
                     runtime_id,
-                    touch=bool(request.get("touch", False)),
+                    touch=False,
                 )
-                if resolved is not None and _request_contains_requirements(request):
-                    requirements, _, _ = _normalize_runtime_request(request)
-                    expected = self.pool.resolve(requirements)
-                    if expected is None or expected["runtimeId"] != runtime_id:
+                if resolved is None:
+                    return None
+                if _request_contains_selector(request):
+                    requirements, _, _, python_request = _normalize_runtime_request(
+                        request
+                    )
+                    if not _runtime_matches_request(
+                        resolved,
+                        requirements=(
+                            requirements
+                            if _request_contains_requirements(request)
+                            else None
+                        ),
+                        python_request=python_request,
+                    ):
                         return None
+                if bool(request.get("touch", False)):
+                    return self.pool.touch(runtime_id)
                 return resolved
-        requirements, _, touch = _normalize_runtime_request(request)
-        return self.resolve(requirements, touch=touch)
+        requirements, _, touch, python_request = _normalize_runtime_request(request)
+        if python_request is None:
+            return self.resolve(requirements, touch=touch)
+        target = self.pool.resolve_python(python_request, allow_install=False)
+        if target is None:
+            return None
+        return self.resolve(
+            requirements,
+            touch=touch,
+            python_identity=target["identity"],
+        )
 
     def ensure_runtime(
         self,
@@ -96,25 +133,65 @@ class MaaFWRuntimePoolService:
         requested_runtime_id = ""
         if isinstance(request, Mapping):
             requested_runtime_id = str(request.get("runtimeId") or "").strip()
-            if requested_runtime_id and not _request_contains_requirements(request):
+            if requested_runtime_id:
                 existing = self.pool.get(
                     requested_runtime_id,
-                    touch=bool(request.get("touch", False)),
+                    touch=False,
                 )
-                if existing is None:
+                if existing is not None:
+                    if _request_contains_selector(request):
+                        requirements, _, _, python_request = (
+                            _normalize_runtime_request(request)
+                        )
+                        if not _runtime_matches_request(
+                            existing,
+                            requirements=(
+                                requirements
+                                if _request_contains_requirements(request)
+                                else None
+                            ),
+                            python_request=python_request,
+                        ):
+                            raise MaaFWRuntimePoolError(
+                                "requested runtimeId does not match the runtime manifest"
+                            )
+                    if bool(request.get("touch", False)):
+                        return self.pool.touch(requested_runtime_id)
+                    return existing
+                if not _request_contains_requirements(request):
                     raise MaaFWRuntimePoolError(
                         "cannot ensure an unknown runtimeId without requirements"
                     )
-                return existing
-        requirements, metadata, _ = _normalize_runtime_request(request)
-        computed_runtime_id = build_runtime_id(requirements)
+        requirements, metadata, _, python_request = _normalize_runtime_request(
+            request
+        )
+        if python_request is None:
+            python_identity = None
+            bootstrap_python = None
+        else:
+            target = self.pool.resolve_python(python_request, allow_install=True)
+            if target is None:  # pragma: no cover - allow_install is fail-closed
+                raise MaaFWRuntimePoolError(
+                    "MaaFW runtime Python could not be prepared"
+                )
+            python_identity = target["identity"]
+            bootstrap_python = target["executable"]
+        computed_runtime_id = build_runtime_id(
+            requirements,
+            python_identity=python_identity,
+        )
         if requested_runtime_id and computed_runtime_id != requested_runtime_id:
             raise MaaFWRuntimePoolError(
                 "requested runtimeId does not match the requirement selector: "
                 f"requested={requested_runtime_id}, "
                 f"computed={computed_runtime_id}"
             )
-        return self.ensure(requirements, metadata=metadata)
+        return self.ensure(
+            requirements,
+            metadata=metadata,
+            python_identity=python_identity,
+            bootstrap_python=bootstrap_python,
+        )
 
     def touch(
         self,
@@ -201,12 +278,12 @@ class MaaFWRuntimePoolService:
 
 def _normalize_runtime_request(
     request: str | Mapping[str, Any],
-) -> tuple[list[str], dict[str, Any], bool]:
+) -> tuple[list[str], dict[str, Any], bool, dict[str, str] | None]:
     if isinstance(request, str):
         value = request.strip()
         if not value:
             raise ValueError("runtime requirement cannot be empty")
-        return [value], {}, False
+        return [value], {}, False, None
     if not isinstance(request, Mapping):
         raise TypeError("runtime request must be a requirement string or mapping")
 
@@ -233,7 +310,12 @@ def _normalize_runtime_request(
 
     metadata_value = request.get("metadata")
     metadata = dict(metadata_value) if isinstance(metadata_value, Mapping) else {}
-    return requirements, metadata, bool(request.get("touch", False))
+    return (
+        requirements,
+        metadata,
+        bool(request.get("touch", False)),
+        _normalize_python_request(request.get("python")),
+    )
 
 
 def _request_contains_requirements(request: Mapping[str, Any]) -> bool:
@@ -245,4 +327,63 @@ def _request_contains_requirements(request: Mapping[str, Any]) -> bool:
             "maafwRequirement",
             "requirement",
         )
+    )
+
+
+def _request_contains_selector(request: Mapping[str, Any]) -> bool:
+    return _request_contains_requirements(request) or "python" in request
+
+
+def _normalize_python_request(value: Any) -> dict[str, str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise TypeError("runtime request python must be an object")
+    implementation = str(value.get("implementation") or "cpython").strip().casefold()
+    constraint = str(value.get("constraint") or "").strip()
+    if not constraint:
+        raise ValueError("runtime request python.constraint cannot be empty")
+    if constraint.replace(".", "").isdigit() and constraint.count(".") == 1:
+        constraint = f"=={constraint}.*"
+    try:
+        SpecifierSet(constraint)
+    except InvalidSpecifier as exc:
+        raise ValueError(
+            f"runtime request python.constraint is invalid: {constraint}"
+        ) from exc
+    return {
+        "implementation": implementation,
+        "constraint": constraint,
+    }
+
+
+def _runtime_matches_request(
+    runtime: Mapping[str, Any],
+    *,
+    requirements: Iterable[str] | None,
+    python_request: Mapping[str, str] | None,
+) -> bool:
+    if requirements is not None:
+        expected_requirements = list(canonicalize_requirements(requirements))
+        actual_requirements = runtime.get(
+            "selectorRequirements",
+            runtime.get("requirements"),
+        )
+        if list(actual_requirements or []) != expected_requirements:
+            return False
+    if python_request is None:
+        return True
+    identity = runtime.get("identity")
+    if not isinstance(identity, Mapping):
+        return False
+    implementation = str(identity.get("pythonAbi") or "").split(":", 1)[0]
+    if implementation.casefold() != python_request["implementation"].casefold():
+        return False
+    try:
+        version = Version(str(identity.get("pythonVersion") or ""))
+    except InvalidVersion:
+        return False
+    return SpecifierSet(python_request["constraint"]).contains(
+        version,
+        prereleases=True,
     )

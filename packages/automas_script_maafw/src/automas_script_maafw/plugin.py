@@ -29,6 +29,7 @@ class Plugin(ScriptAdapterPlugin):
     """MaaFW script adapter plugin."""
 
     provides = ["maafw.registry.v1", "maafw.configuration_reuse.v1"]
+    needs = ["maafw.runtime_pool.v1"]
     wants = [
         "emulator",
         "maafw.interface.v1",

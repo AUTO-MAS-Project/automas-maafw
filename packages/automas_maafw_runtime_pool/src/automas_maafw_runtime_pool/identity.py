@@ -6,7 +6,7 @@ import platform as platform_module
 import re
 import sys
 import sysconfig
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 from packaging.requirements import InvalidRequirement, Requirement
@@ -43,21 +43,58 @@ def canonicalize_requirements(requirements: Iterable[str]) -> tuple[str, ...]:
     return tuple(sorted(canonical, key=str.casefold))
 
 
-def build_runtime_identity(requirements: Iterable[str]) -> dict[str, Any]:
+def build_runtime_identity(
+    requirements: Iterable[str],
+    *,
+    python_identity: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     canonical = canonicalize_requirements(requirements)
-    implementation = getattr(sys.implementation, "name", "python")
-    cache_tag = getattr(sys.implementation, "cache_tag", None) or "unknown"
-    soabi = str(sysconfig.get_config_var("SOABI") or "unknown")
+    if python_identity is None:
+        # The host interpreter participates with the same full physical
+        # identity as an explicitly selected interpreter.  This lets a native
+        # Agent project and a Python Agent project reuse one environment when
+        # their requirement selector and actual interpreter are identical,
+        # while a host patch upgrade correctly selects a new runtime.
+        implementation = getattr(sys.implementation, "name", "python")
+        cache_tag = getattr(sys.implementation, "cache_tag", None) or "unknown"
+        soabi = str(sysconfig.get_config_var("SOABI") or "unknown")
+        python_version = platform_module.python_version()
+        target_platform = sysconfig.get_platform() or sys.platform
+        architecture = platform_module.machine() or "unknown"
+    else:
+        implementation = _required_python_identity_value(
+            python_identity,
+            "implementation",
+        )
+        cache_tag = _required_python_identity_value(
+            python_identity,
+            "cacheTag",
+        )
+        soabi = _required_python_identity_value(python_identity, "soabi")
+        # Explicit multi-ABI routes are based on a probed interpreter.  Keep
+        # its full patch version in the selector so an exact request such as
+        # ``==3.13.14`` can never collide with, or reuse, a 3.13.13 runtime.
+        python_version = _required_python_identity_value(
+            python_identity,
+            "version",
+            fallback_key="pythonVersion",
+        )
+        target_platform = _required_python_identity_value(
+            python_identity,
+            "platform",
+        )
+        architecture = _required_python_identity_value(
+            python_identity,
+            "architecture",
+        )
     python_abi = f"{implementation}:{cache_tag}:{soabi}"
     return {
         "schemaVersion": IDENTITY_SCHEMA_VERSION,
         "requirements": list(canonical),
         "pythonAbi": python_abi,
-        "pythonVersion": (
-            f"{sys.version_info.major}.{sys.version_info.minor}"
-        ),
-        "platform": sysconfig.get_platform() or sys.platform,
-        "architecture": platform_module.machine() or "unknown",
+        "pythonVersion": python_version,
+        "platform": target_platform,
+        "architecture": architecture,
     }
 
 
@@ -71,8 +108,31 @@ def runtime_id_for_identity(identity: dict[str, Any]) -> str:
     return f"{RUNTIME_ID_PREFIX}{hashlib.sha256(payload).hexdigest()[:24]}"
 
 
-def build_runtime_id(requirements: Iterable[str]) -> str:
-    return runtime_id_for_identity(build_runtime_identity(requirements))
+def build_runtime_id(
+    requirements: Iterable[str],
+    *,
+    python_identity: Mapping[str, Any] | None = None,
+) -> str:
+    return runtime_id_for_identity(
+        build_runtime_identity(requirements, python_identity=python_identity)
+    )
+
+
+def _required_python_identity_value(
+    identity: Mapping[str, Any],
+    key: str,
+    *,
+    fallback_key: str | None = None,
+) -> str:
+    value = identity.get(key)
+    if (value is None or not str(value).strip()) and fallback_key is not None:
+        value = identity.get(fallback_key)
+    normalized = str(value or "").strip()
+    if not normalized:
+        raise MaaFWRuntimeIdentityError(
+            f"probed python identity is missing {key}"
+        )
+    return normalized
 
 
 def requirement_distribution_name(requirement: str) -> str | None:

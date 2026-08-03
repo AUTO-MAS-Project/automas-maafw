@@ -19,10 +19,13 @@ from automas_maafw_runtime_pool import (
     MaaFWRuntimePool,
     RuntimeInstaller,
     build_runtime_id,
+    canonicalize_requirements,
     install_python_runtime,
 )
 from packaging.requirements import InvalidRequirement, Requirement
+from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.utils import canonicalize_name
+from packaging.version import InvalidVersion, Version
 
 
 RUNNER_ENV_MANIFEST_NAME = ".auto_mas_maafw_runner_env.json"
@@ -83,6 +86,8 @@ class MaaFWRunnerEnvironment:
     runtime_id: str | None = None
     maafw_requirement: str | None = None
     runtime_pool_root: Path | None = None
+    runtime_pool_id: str | None = None
+    python_constraint: str | None = None
     lease_id: str | None = None
 
 
@@ -94,7 +99,10 @@ def prepare_runner_environment(
     runtime_pool: MaaFWRuntimePool | None = None,
     runtime_installer: RuntimeInstaller | None = None,
     runtime_requirement: str | None = None,
+    runtime_requirements: Iterable[str] | None = None,
     runtime_id: str | None = None,
+    runtime_pool_id: str | None = None,
+    runtime_python_constraint: str | None = None,
     lease_owner: str = "automas-maafw-runner",
     lease_ttl_seconds: float | None = DEFAULT_RUNTIME_LEASE_TTL_SECONDS,
     import_paths: Iterable[str | Path] = (),
@@ -116,10 +124,26 @@ def prepare_runner_environment(
         percent=5.0,
     )
     project = Path(project_path).resolve()
-    route = _load_project_runtime_route(project)
+    explicit_requirements = (
+        _runtime_selector_requirements(
+            runtime_requirements,
+            label="显式 MaaFW runtime selector",
+        )
+        if runtime_requirements is not None
+        else None
+    )
+    explicit_route = (
+        explicit_requirements is not None
+        or runtime_requirement is not None
+        or runtime_id is not None
+    )
+    # Explicit Managed DTOs are authoritative. Never let a writable checkout
+    # sidecar override or corrupt their route.
+    route = {"managed": True} if explicit_route else _load_project_runtime_route(project)
     managed_project = (
         bool(route.get("managed"))
         or runtime_requirement is not None
+        or explicit_requirements is not None
         or runtime_id is not None
     )
     root = Path(
@@ -128,6 +152,17 @@ def prepare_runner_environment(
         or (Path.cwd() / "config" / "maafw_runtime_pool")
     ).resolve()
     pool = runtime_pool or MaaFWRuntimePool(root)
+    expected_pool_id = (
+        str(runtime_pool_id).strip() if runtime_pool_id is not None else ""
+    )
+    if runtime_pool_id is not None and not expected_pool_id:
+        raise RuntimeError("MaaFW Runtime Pool ID 不能为空")
+    actual_pool_id = str(pool.root_identity.get("poolId") or "").strip()
+    if expected_pool_id and actual_pool_id != expected_pool_id:
+        raise RuntimeError(
+            "MaaFW Runtime Pool 身份不匹配: "
+            f"expected={expected_pool_id}, actual={actual_pool_id or '<missing>'}"
+        )
     if runtime_id is not None:
         bound_runtime_id = str(runtime_id).strip() or None
     elif runtime_requirement is not None:
@@ -137,7 +172,23 @@ def prepare_runner_environment(
     else:
         bound_runtime_id = str(route.get("runtimeId") or "").strip() or None
     bound_runtime = pool.get(bound_runtime_id) if bound_runtime_id else None
-    if runtime_requirement is not None:
+    if explicit_requirements is not None:
+        packages = explicit_requirements
+        selector_requirement = _selector_maafw_requirement(packages)
+        if runtime_requirement is not None:
+            selected_requirement = _normalize_maafw_requirement(
+                str(runtime_requirement),
+                allow_unconstrained=False,
+            )
+            if selected_requirement != selector_requirement:
+                raise RuntimeError(
+                    "MaaFW runtime requirement 与完整 selector 不匹配: "
+                    f"requirement={selected_requirement}, "
+                    f"selector={selector_requirement}"
+                )
+        else:
+            selected_requirement = selector_requirement
+    elif runtime_requirement is not None:
         selected_requirement = str(runtime_requirement).strip() or None
     elif bound_runtime is not None:
         # A persisted binding is authoritative after the managed gateway has
@@ -151,32 +202,71 @@ def prepare_runner_environment(
         selected_requirement = (
             str(route.get("runtimeRequirement") or "").strip() or None
         )
-    if selected_requirement is None:
-        selected_requirement = _declared_project_maafw_requirement(project)
-    if selected_requirement is None and bound_runtime is not None:
-        selected_requirement = (
-            str(bound_runtime.get("maafwRequirement") or "").strip() or None
+    if explicit_requirements is None:
+        if selected_requirement is None:
+            selected_requirement = _declared_project_maafw_requirement(project)
+        if selected_requirement is None and bound_runtime is not None:
+            selected_requirement = (
+                str(bound_runtime.get("maafwRequirement") or "").strip() or None
+            )
+        if selected_requirement is None and managed_project:
+            raise RuntimeError(
+                "MaaFW runtime 未绑定且项目未声明 runtime constraint；"
+                f"请在 {PROJECT_RUNTIME_MANIFEST_NAME} 中设置 runtime.constraint"
+            )
+        if selected_requirement is None:
+            # Legacy projects keep the historical unpinned default. Managed
+            # project-store entries must always provide a constraint or binding.
+            selected_requirement = "maafw"
+        selected_requirement = _normalize_maafw_requirement(
+            selected_requirement,
+            allow_unconstrained=not managed_project,
         )
-    if selected_requirement is None and managed_project:
+        packages = tuple(
+            build_runner_packages(
+                project,
+                maafw_requirement=selected_requirement,
+            )
+        )
+    normalized_python_constraint = _normalize_python_constraint(
+        runtime_python_constraint
+    )
+    if normalized_python_constraint is not None and (
+        explicit_requirements is None or not bound_runtime_id
+    ):
         raise RuntimeError(
-            "MaaFW runtime 未绑定且项目未声明 runtime constraint；"
-            f"请在 {PROJECT_RUNTIME_MANIFEST_NAME} 中设置 runtime.constraint"
+            "MaaFW Managed Python constraint 必须随完整 selector/runtimeId 注入"
         )
-    if selected_requirement is None:
-        # Legacy projects keep the historical unpinned default. Managed
-        # project-store entries must always provide a constraint or binding.
-        selected_requirement = "maafw"
-    selected_requirement = _normalize_maafw_requirement(
-        selected_requirement,
-        allow_unconstrained=not managed_project,
-    )
-    packages = tuple(
-        build_runner_packages(
-            project,
-            maafw_requirement=selected_requirement,
+    if explicit_requirements is not None and bound_runtime_id:
+        if bound_runtime is None:
+            raise RuntimeError(
+                f"MaaFW Managed runtime 不存在: {bound_runtime_id}"
+            )
+        try:
+            bound_selector = canonicalize_requirements(
+                bound_runtime.get("selectorRequirements")
+                or bound_runtime.get("packages")
+                or ()
+            )
+            requested_selector = canonicalize_requirements(packages)
+        except Exception as exc:
+            raise RuntimeError(
+                "MaaFW Managed runtime selector 无法验证"
+            ) from exc
+        if bound_selector != requested_selector:
+            raise RuntimeError(
+                "MaaFW Managed runtime 的完整 selector 与可信路由不一致"
+            )
+        _validate_runtime_python_constraint(
+            bound_runtime,
+            normalized_python_constraint,
         )
-    )
-    expected_runtime_id = build_runtime_id(packages)
+        # Pool.get() has already validated that runtimeId is derived from the
+        # persisted identity. Do not recompute a Managed CP313 identity from
+        # the CP312 host process.
+        expected_runtime_id = bound_runtime_id
+    else:
+        expected_runtime_id = build_runtime_id(packages)
     _report_environment_progress(
         progress,
         "runtime_check",
@@ -230,11 +320,14 @@ def prepare_runner_environment(
             send_log=send_log,
         )
 
-    runtime = pool.ensure(
-        packages,
-        installer=runtime_installer or install,
-        metadata={"component": "automas-maafw-runner"},
-    )
+    if existing_runtime is not None:
+        runtime = pool.touch(expected_runtime_id)
+    else:
+        runtime = pool.ensure(
+            packages,
+            installer=runtime_installer or install,
+            metadata={"component": "automas-maafw-runner"},
+        )
     resolved_runtime_id = str(runtime["runtimeId"])
     _report_environment_progress(
         progress,
@@ -286,6 +379,8 @@ def prepare_runner_environment(
             runtime_id=resolved_runtime_id,
             maafw_requirement=maafw_requirement,
             runtime_pool_root=pool.root,
+            runtime_pool_id=actual_pool_id or None,
+            python_constraint=normalized_python_constraint,
             lease_id=lease_id,
         )
     except Exception:
@@ -469,6 +564,50 @@ def _declared_project_maafw_requirement(project_path: Path) -> str | None:
     return matches[0] if matches else None
 
 
+def _normalize_python_constraint(value: str | None) -> str | None:
+    if value is None:
+        return None
+    raw_value = str(value).strip()
+    if not raw_value:
+        raise RuntimeError("MaaFW Managed Python constraint 不能为空")
+    try:
+        normalized = str(SpecifierSet(raw_value))
+    except InvalidSpecifier as exc:
+        raise RuntimeError(
+            f"无效的 MaaFW Managed Python constraint: {raw_value}"
+        ) from exc
+    if not normalized:
+        raise RuntimeError("MaaFW Managed Python constraint 不能为空")
+    return normalized
+
+
+def _validate_runtime_python_constraint(
+    runtime: Mapping[str, Any],
+    constraint: str | None,
+) -> None:
+    if constraint is None:
+        return
+    identity = runtime.get("identity")
+    identity_data = dict(identity) if isinstance(identity, Mapping) else {}
+    python_abi = str(identity_data.get("pythonAbi") or "").strip().casefold()
+    if not python_abi.startswith("cpython:"):
+        raise RuntimeError(
+            "MaaFW Managed runtime 缺少可信 CPython identity.pythonAbi"
+        )
+    python_version = str(identity_data.get("pythonVersion") or "").strip()
+    try:
+        compatible = Version(python_version) in SpecifierSet(constraint)
+    except (InvalidVersion, InvalidSpecifier) as exc:
+        raise RuntimeError(
+            "MaaFW Managed runtime 缺少可验证的 identity.pythonVersion"
+        ) from exc
+    if not compatible:
+        raise RuntimeError(
+            "MaaFW Managed runtime Python 版本不满足项目约束: "
+            f"required={constraint}, actual={python_version or '<missing>'}"
+        )
+
+
 def _normalize_maafw_requirement(
     value: str,
     *,
@@ -500,6 +639,46 @@ def _normalize_maafw_requirement(
             "请显式声明版本或版本范围"
         )
     return str(requirement)
+
+
+def _runtime_selector_requirements(
+    value: Iterable[str],
+    *,
+    label: str,
+) -> tuple[str, ...]:
+    if isinstance(value, (str, bytes)):
+        raise RuntimeError(f"{label} 必须是 requirement 列表")
+    requirements: list[str] = []
+    try:
+        iterator = iter(value)
+    except TypeError as exc:
+        raise RuntimeError(f"{label} 必须是 requirement 列表") from exc
+    for index, raw_requirement in enumerate(iterator):
+        if not isinstance(raw_requirement, str) or not raw_requirement.strip():
+            raise RuntimeError(f"{label}[{index}] 必须是非空字符串")
+        requirements.append(raw_requirement.strip())
+    if not requirements:
+        raise RuntimeError(f"{label} 不能为空")
+    # Canonicalization and duplicate/conflict validation are deliberately
+    # delegated to the same identity builder used by Runtime Pool.
+    build_runtime_id(requirements)
+    return tuple(requirements)
+
+
+def _selector_maafw_requirement(requirements: Iterable[str]) -> str:
+    matches = [
+        requirement
+        for requirement in requirements
+        if requirement_distribution_name(requirement) == "maafw"
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(
+            "完整 MaaFW runtime selector 必须且只能包含一个 maafw requirement"
+        )
+    return _normalize_maafw_requirement(
+        matches[0],
+        allow_unconstrained=False,
+    )
 
 
 def requirement_distribution_name(requirement: str) -> str | None:

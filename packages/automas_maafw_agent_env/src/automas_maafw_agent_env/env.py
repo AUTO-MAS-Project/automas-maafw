@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import uuid
 from pathlib import Path
 from typing import Callable
 
@@ -109,6 +110,17 @@ def prepare_agent_envs(
             report_plan_complete(index, plan)
             continue
 
+        if runtime_kind == "shared_runtime":
+            if not Path(resolved_python).is_file():
+                raise MaaFWAgentEnvError(
+                    "共享 MaaFW runtime Python 不存在或不可用："
+                    f"{python_exe}"
+                )
+            checked_python.add(resolved_python)
+            log(f"[Python环境] 共享 MaaFW runtime Python 已就绪: {python_exe}")
+            report_plan_complete(index, plan)
+            continue
+
         skipped.append(plan.childExec)
         log(f"[Python环境] 跳过外部或非 Python 环境检测: {python_exe}")
 
@@ -146,25 +158,37 @@ def build_agent_env_manifest(project_path: str | Path) -> dict[str, object]:
 def write_agent_compat_shims(venv_path: str | Path) -> Path:
     shim_dir = Path(venv_path) / AGENT_COMPAT_SHIM_DIR_NAME
     shim_dir.mkdir(parents=True, exist_ok=True)
-    (shim_dir / "sitecustomize.py").write_text(
-        "\n".join(
-            [
-                "def _patch_legacy_maafw_resource():",
-                "    try:",
-                "        import maa.resource as maa_resource_module",
-                "        if hasattr(maa_resource_module, 'resource'):",
-                "            return",
-                "        from maa.agent.agent_server import AgentServer",
-                "        maa_resource_module.resource = AgentServer",
-                "    except Exception:",
-                "        pass",
-                "",
-                "_patch_legacy_maafw_resource()",
-                "",
-            ]
-        ),
-        encoding="utf-8",
+    shim_path = shim_dir / "sitecustomize.py"
+    content = "\n".join(
+        [
+            "def _patch_legacy_maafw_resource():",
+            "    try:",
+            "        import maa.resource as maa_resource_module",
+            "        if hasattr(maa_resource_module, 'resource'):",
+            "            return",
+            "        from maa.agent.agent_server import AgentServer",
+            "        maa_resource_module.resource = AgentServer",
+            "    except Exception:",
+            "        pass",
+            "",
+            "_patch_legacy_maafw_resource()",
+            "",
+        ]
     )
+    try:
+        if shim_path.read_text(encoding="utf-8") == content:
+            return shim_dir
+    except (FileNotFoundError, OSError, UnicodeError):
+        pass
+
+    temporary_path = shim_path.with_name(
+        f"{shim_path.name}.tmp-{uuid.uuid4().hex}"
+    )
+    try:
+        temporary_path.write_text(content, encoding="utf-8")
+        temporary_path.replace(shim_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
     return shim_dir
 
 
