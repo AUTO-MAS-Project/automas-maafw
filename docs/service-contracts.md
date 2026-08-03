@@ -54,15 +54,15 @@ class Plugin:
 | PyPI 包 | 当前版本 | 服务名 | 主要职责 |
 |---|---:|---|---|
 | `automas-maafw-interface` | 0.2.0 | `maafw.interface.v1` | PI 加载、校验、预览、任务快照和 option 归一化 |
-| `automas-maafw-project-update` | 0.2.1 | `maafw.project_update.v1` | MirrorChyan/GitHub Release 版本发现、受限下载、可安装候选与更新 |
+| `automas-maafw-project-update` | 0.2.2 | `maafw.project_update.v1` | MirrorChyan/GitHub Release 版本发现、受限下载、临时包安全释放、可安装候选与更新 |
 | `automas-maafw-agent-env` | 0.1.3 | `maafw.agent_env.v1` | agent 运行方式识别、命令规划和 Python 环境准备 |
 | `automas-maafw-controller-adb` | 0.1.1 | `maafw.controller.adb` | ADB provider 与设备参数构建 |
 | `automas-maafw-controller-win32` | 0.1.2 | `maafw.controller.win32` | Win32 provider、窗口扫描与设备参数构建 |
-| `automas-maafw-project-store` | 0.2.0 | `maafw.project_store.v1` | 本地目录/ZIP 资源导入、不可变版本、能力摘要、引用和 GC |
-| `automas-maafw-runtime-pool` | 0.1.4 | `maafw.runtime_pool.v1` | 按 requirement selector 隔离环境并通过 uv cache/hardlink 复用依赖 |
+| `automas-maafw-project-store` | 0.2.1 | `maafw.project_store.v1` | 本地目录/ZIP 资源导入、不可变版本、隔离 checkout、全局盘点、引用和 GC |
+| `automas-maafw-runtime-pool` | 0.1.5 | `maafw.runtime_pool.v1` | 可配置根目录、稳定 pool 身份、按 requirement selector 隔离环境并复用 uv cache |
 | `automas-maafw-runner` | 0.3.4 | `maafw.runner.v1` | 运行计划、worker job、runtime 路由、环境预热和结果模型 |
 | `automas-script-maafw` | 0.1.10 | `maafw.registry.v1`、`maafw.configuration_reuse.v1` | MaaFW 脚本适配、能力注册、原生配置导入和用户复制 |
-| `automas-script-maafw-managed` | 0.2.0 | 无 | 单一 MaaFW 入口的原地托管转换、本地/远程资源管理、运行绑定与 pack 升级计划 |
+| `automas-script-maafw-managed` | 0.2.1 | 无 | 单一 MaaFW 入口的原地托管转换、全局资源盘点、本地/远程资源管理、运行绑定与 pack 升级计划 |
 | `automas-script-maafw-pack-m9a` | 0.1.4 | `maafw.pack.m9a.v1` | M9A 默认约定、资源 profile/升级规划和通知翻译 |
 | `automas-m9a` | 0.1.4 | 无 | 聚合安装上述 MaaFW/M9A 插件 |
 
@@ -71,12 +71,12 @@ class Plugin:
 `publish.yml` 每次只发布一个 distribution。当前版本按以下层级发布；同层可并行，
 下一层必须等待依赖版本已经可从 PyPI 安装：
 
-1. `automas-maafw-interface` 0.2.0、`automas-maafw-project-store` 0.2.0、
-   `automas-maafw-runtime-pool` 0.1.4。
-2. `automas-maafw-agent-env` 0.1.3、`automas-maafw-project-update` 0.2.1。
+1. `automas-maafw-interface` 0.2.0、`automas-maafw-project-store` 0.2.1、
+   `automas-maafw-runtime-pool` 0.1.5。
+2. `automas-maafw-agent-env` 0.1.3、`automas-maafw-project-update` 0.2.2。
 3. `automas-maafw-runner` 0.3.4。
 4. `automas-script-maafw` 0.1.10。
-5. `automas-script-maafw-managed` 0.2.0。
+5. `automas-script-maafw-managed` 0.2.1。
 
 首次发布 Project Store、Runtime Pool 和 Managed 前，仍须创建
 `pypi-project-store`、`pypi-runtime-pool`、`pypi-script-maafw-managed` GitHub
@@ -300,6 +300,11 @@ await download_package(
     progress=None,
 ) -> dict[str, Any]
 
+await release_download_package(
+    download_root,
+    package,
+) -> dict[str, Any]
+
 await update_if_needed(
     project_path,
     interface,
@@ -386,6 +391,13 @@ ZIP/SHA256 校验后以内容哈希文件名原子发布到调用方管理的目
 可变临时文件；相同内容复用同一归档，不同内容不会因版本名相同而互相覆盖。
 该方法不解压、不修改活动项目，Project Store 仍是安全解包与不可变导入的唯一
 权威。
+
+`release_download_package(download_root, package)` 只释放同一根目录下严格匹配
+`<24hex>/<package.sha256>.zip` 的普通文件。释放前重新校验完整 SHA-256，并拒绝
+越界路径、额外目录层级、符号链接、Windows reparse point、身份变化和非普通文件；
+缺失文件按已释放幂等返回。成功后只对已为空的 24hex 直接父目录调用 `rmdir()`，
+绝不递归删除。下载失败或取消同样只清理本次 UUID temp/provisional 文件和经相同
+边界校验确认的空目录，且清理不会吞掉原始异常或取消。
 
 `progress(event)` 是 best-effort、JSON-friendly 的观察回调；回调异常不会中断
 更新事务。`event.stage` 可能为 `checking`、`downloading`、`validating`、
@@ -1339,8 +1351,11 @@ import_project(
 
 update_project(source_path, project_id, version, **kwargs) -> dict
 resolve_project(project_id, version=None, *, touch=True) -> dict
+checkout_project(project_id, version, script_id) -> dict
 list_projects() -> list[dict]
 list_versions(project_id) -> list[dict]
+inventory() -> dict
+storage_info() -> dict
 switch_version(project_id, version) -> dict
 bind_runtime(project_id, version=None, *, binding=None, reference=None, pinned=None) -> dict
 release_runtime(project_id, version=None, *, reference=None, clear_binding=False) -> dict
@@ -1362,6 +1377,7 @@ ProjectInterface 的原始版本拼写。未显式给版本时必须能从 Proje
 projectId
 version
 dataPath
+storeId
 runtimeConstraint
 manifest
 summary
@@ -1372,11 +1388,33 @@ summary
 `shells`、`size`、`flags` 和 `warningCount`。`shells` 记录被剥离壳的类别与路径；
 `size` 同时给出输入、原树、最终投影与节省字节数。
 
-`dataPath` 内含根级 `interface.json[c]` 与私有
-`.auto_mas_maafw_project.json`。Project Store 不会覆盖已提交的投影 payload；
-私有 manifest 的引用、固定、runtime binding 和最后使用时间可以原子更新。
-Runner 运行时仍会在 `dataPath` 下创建 `debug/`、`logs/`、`temp/`，并更新
-`config/maa_option.json`；这些运行产物不参与版本内容身份。
+`resolve_project().dataPath` 是不可变 Store payload，内含根级
+`interface.json[c]` 与私有 `.auto_mas_maafw_project.json`；Runner 不得向该目录写
+`debug/`、`logs/`、`temp/` 或配置。实际运行必须调用
+`checkout_project(project_id, version, script_id)`，它在独立 RunRoot 中按
+`storeId + projectId + version + sourceHash + payloadHash + scriptId` 完整复制并原子发布可写副本，
+不使用 hardlink，也不复制私有 Store manifest。同一身份重复解析会复用 checkout 并
+保留运行产物；marker、接口或身份损坏时失败关闭且不覆盖原目录。Managed 0.2.1
+无条件要求 Project Store 提供 checkout，并要求稳定 `scriptId`、`runRootId` 和
+`payloadHash`；缺少任一能力或身份都拒绝运行，绝不回落到不可变 Store 路径。
+
+导入完成时还会为实际投影后的 Store payload 计算独立 `store-payload` SHA-256；
+checkout identity 同时绑定该 `payloadHash`，复制前后都重新校验。Store 文件被外部
+修改、复制期间发生变化或旧 manifest 缺少可验证 payload hash 时均拒绝发布运行目录，
+必须以新不可变版本重新导入。
+
+Project Store 插件实例的 `Root` 和 `RunRoot` 均可配置为空或绝对路径；为空分别使用
+`data/maafw_project_store` 和 `data/maafw_project_runs`。两棵路径树不得相交，非空
+自定义目录必须带有效 marker 或保持为空。`storage_info()` 返回实际路径、稳定
+`storeId`/`runRootId` 和默认位置标记；服务存活期间 marker 身份变化会失败关闭。
+脚本配置持久化 `StoreId`，目录切换后不能把同名 `projectId/version` 当作原绑定；
+旧绑定只在不可变 source hash 完全一致时兼容确认。
+
+`inventory()` 返回 `complete/items/checkouts/errors`，不会把损坏 manifest、异常
+Store 结构、损坏 checkout 或已失去 Store 版本的孤儿 checkout 静默藏掉。统一资源页
+可在没有任何脚本记录时调用无 `scriptId` 的
+`POST /plugin/maafw-managed/inventory`，查看 Project Store、RunRoot、Runtime Pool、
+全部版本、引用、租约和孤儿资源；该全局接口只读，不提供无脚本上下文的删除旁路。
 
 删除操作只处理 Project Store 自己的根目录，并拒绝当前版本、固定版本和有引用
 版本。`collect_garbage()` 默认 dry-run。跨多个异步调用的资源引用新增/释放、
@@ -1467,10 +1505,19 @@ Project Store/Runtime Pool 只发布真实阶段边界。外层操作在全部�
 请求取消后实际成功的动作仍是 `success`；只有 inner operation 自身被取消时才写入
 “操作已取消”的 `error`，且缓存不能永久留在 `running`。
 
+当 `activeOperationLookup=true` 时，前端必须以
+`POST /plugin/maafw-managed/operations/active` 的 `{scriptId}` 结果为权威状态，不把
+`sessionStorage` 当作锁。返回值含非空 `serverEpoch` 和当前 `activeOperation`；页面
+重载或 409 冲突后校验 epoch/scriptId 并接管真实进度。后端在同一锁内登记操作、
+写入终态并释放 active 槽，同一个 `scriptId` 的远程检查和所有 mutation 服务端排他；
+插件停止时先进入 draining、拒绝新操作并等待已登记任务越过资源/配置事务和终态。
+
 ## 16. `maafw.runtime_pool.v1`
 
 ```python
 list_runtimes() -> list[dict]
+inventory() -> dict
+storage_info() -> dict
 resolve_runtime(request) -> dict | None
 ensure_runtime(request) -> dict
 touch(runtime_id) -> dict
@@ -1487,6 +1534,7 @@ collect_garbage(*, dry_run=True, grace_seconds=604800, keep_latest=1) -> dict
 
 ```text
 runtimeId
+poolId
 pythonExecutable
 venvPath
 packages
@@ -1505,6 +1553,12 @@ runtime identity 由规范化 requirement selector 集合、Python ABI、操作�
 到范围内更新的依赖版本。包含本地路径、editable 或递归 requirements 的依赖不能
 安全跨项目共享，服务会拒绝创建共享 identity。删除与 GC 会保护固定、引用和活动
 lease。
+
+Runtime Pool 插件实例的 `Root` 可留空或配置绝对路径；留空使用
+`config/maafw_runtime_pool`。根目录带稳定 `poolId` marker，未知的非空自定义目录、
+重解析点、运行期 marker 换身以及损坏 runtime 均失败关闭。`inventory()` 通过
+`complete/items/errors` 显式报告损坏条目；Managed 在任何真实 GC 删除开始前同时
+预检 Project Store、checkout 与 Runtime Pool，盘点不完整时整次拒绝删除。
 
 每个完整 requirement selector 仍对应一个独立 venv；环境之间不共享
 `site-packages`，也不拼接 `PYTHONPATH`。使用 uv 时，它们共享 pool 内的
@@ -1558,7 +1612,7 @@ Controller 与 Tasker 前加载这些目录；任一路径越出项目根、缺�
 stage/apply/prepare 交错。原地转换的只读 source snapshot 是特例：它先单独取得并
 释放短宿主事务，随后资源导入与最终 CAS 提交仍严格按“资源生命周期 → 宿主配置”
 顺序执行，且不会在全局配置锁内做 Project Store I/O。
-Managed 0.2.0 在 Project Store 缺少该 Python 协调接口时失败关闭，不提供无锁
+Managed 0.2.1 在 Project Store 缺少该 Python 协调接口时失败关闭，不提供无锁
 兼容路径；它同时要求宿主提供 `Config.script_config_transaction()`、
 `Config.script_config_write_scope()` 和 ScriptConfigStore
 `write_transaction()`。原地转换还要求
@@ -1572,6 +1626,21 @@ Managed 的远程检查把“发现新版本”与“存在可安装候选”分
 `ImportProjectId` 与最小来源元数据，绑定后升级只信任 Project Store manifest
 和活动 ProjectInterface。下载 URL（可能包含短期签名或凭据）不会写入脚本配置，
 持久化发现结果只保留来源、版本、hash 与是否可下载。
+
+远程 ZIP 只作为本次请求的 staging：Project Store 导入/升级计划与宿主配置事务均
+成功后，Managed 通过 Project Update 0.2.2 的 `release_download_package()` 释放
+该内容寻址包。后续 apply、cancel 和启动恢复只解析不可变 Store 版本，不依赖 ZIP。
+`ManagedRemote.LastDownload` 仅保留来源、版本、大小、SHA-256、`retained` 和
+`cleanupStatus`，不保存本地 staging 路径；远程首次导入也会把
+`Managed.SourceArchive` 保持为空，本地手选 ZIP 的路径行为不变。释放失败只告警并
+持久化 `retained=true`，不能把已完成的资源导入改判失败。下载观察元数据
+`ManagedRemote` 不参与升级配置 CAS，真实脚本/任务/用户配置变化仍会使计划失效。
+
+MirrorChyan 的显式脚本 CDK 优先；留空时后端继承宿主全局
+`Update.MirrorChyanCDK`，GitHub 路径从不读取或携带 CDK。CDK/token/Authorization、
+Bearer 和带签名下载地址在 HTTP、WebSocket 进度、日志及持久化 DTO 中统一脱敏；
+全局和脚本都没有 CDK 时仍可发现 MirrorChyan 版本元数据，但没有可安装 URL 就不能
+执行导入或升级。
 
 普通脚本 0.1.10 的配置复用同样依赖上述宿主事务 API。M9A 集成下限必须为
 `automas-maafw-runner>=0.3.4` 与 `automas-script-maafw>=0.1.10`。
