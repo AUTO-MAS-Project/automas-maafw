@@ -4,16 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "automas-script-maafw-managed"
-version = "0.2.1"
+version = "0.3.0"
 description = "Declarative managed-project MaaFW script adapter for AUTO-MAS"
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.10"
 dependencies = [
-    "automas-script-maafw>=0.1.10",
-    "automas-maafw-runner>=0.3.4",
-    "automas-maafw-project-store>=0.2.1",
+    "automas-script-maafw>=0.1.11",
+    "automas-maafw-runner>=0.4.0",
+    "automas-maafw-project-store>=0.2.2",
     "automas-maafw-project-update>=0.2.2",
-    "automas-maafw-runtime-pool>=0.1.5",
+    "automas-maafw-runtime-pool>=0.2.0",
+    "packaging>=23",
     "pydantic>=2",
 ]
 

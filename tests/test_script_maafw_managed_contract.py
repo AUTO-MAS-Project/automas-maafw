@@ -29,7 +29,7 @@ class ScriptMaaFWManagedContractTest(unittest.TestCase):
             (PACKAGE_ROOT / "pyproject.toml").read_text(encoding="utf-8")
         )
         self.assertEqual(project["project"]["name"], "automas-script-maafw-managed")
-        self.assertEqual(project["project"]["version"], "0.2.1")
+        self.assertEqual(project["project"]["version"], "0.3.0")
         self.assertEqual(
             project["project"]["entry-points"]["auto_mas.plugins"],
             {
@@ -39,11 +39,13 @@ class ScriptMaaFWManagedContractTest(unittest.TestCase):
             },
         )
         dependencies = project["project"]["dependencies"]
-        self.assertIn("automas-script-maafw>=0.1.10", dependencies)
-        self.assertIn("automas-maafw-runner>=0.3.4", dependencies)
-        self.assertIn("automas-maafw-project-store>=0.2.1", dependencies)
-        self.assertIn("automas-maafw-runtime-pool>=0.1.5", dependencies)
+        self.assertIn("automas-script-maafw>=0.1.11", dependencies)
+        self.assertIn("automas-maafw-runner>=0.4.0", dependencies)
+        self.assertIn("automas-maafw-project-store>=0.2.2", dependencies)
+        self.assertIn("automas-maafw-runtime-pool>=0.2.0", dependencies)
         self.assertIn("automas-maafw-project-update>=0.2.2", dependencies)
+        plugin_source = (MODULE_ROOT / "plugin.py").read_text(encoding="utf-8")
+        self.assertIn('_DISTRIBUTION_VERSION_FALLBACK = "0.3.0"', plugin_source)
 
     def test_adapter_registration_is_declarative_and_reuses_icon(self) -> None:
         tree = ast.parse((MODULE_ROOT / "plugin.py").read_text(encoding="utf-8"))
@@ -249,7 +251,10 @@ class ScriptMaaFWManagedContractTest(unittest.TestCase):
         resolve_source = ast.unparse(resolve)
         self.assertIn("manifest_binding.get('maafwVersion')", resolve_source)
         self.assertIn("runtime_request.pop('runtimeId', None)", resolve_source)
-        self.assertIn("_runner_requirements(project_path, bound_maafw_version)", resolve_source)
+        self.assertIn(
+            "_runner_requirements(store_project_path, bound_maafw_version)",
+            resolve_source,
+        )
         self.assertIn("recovered_binding", resolve_source)
         self.assertIn("await self.bind_project_runtime", resolve_source)
 
@@ -820,6 +825,7 @@ def _load_managed_adapter_module():
         "app.plugins",
         "automas_script_maafw",
         "automas_script_maafw.adapter",
+        "automas_script_maafw.runtime_route",
         "automas_script_maafw.runner_task",
     )
     previous = {name: sys.modules.get(name, sentinel) for name in stub_names}
@@ -844,6 +850,7 @@ def _load_managed_adapter_module():
     app.plugins = app_plugins
 
     base_package = types.ModuleType("automas_script_maafw")
+    base_package.__path__ = [str(BASE_MODULE_ROOT)]
     base_adapter = types.ModuleType("automas_script_maafw.adapter")
     base_runner = types.ModuleType("automas_script_maafw.runner_task")
     base_adapter.MaaFWAdapterHooks = MaaFWAdapterHooks
@@ -866,7 +873,11 @@ def _load_managed_adapter_module():
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)
         sys.modules[module_name] = module
-        spec.loader.exec_module(module)
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            sys.modules.pop(module_name, None)
+            raise
         return module
     finally:
         for name, value in previous.items():
@@ -1404,6 +1415,143 @@ class ManagedUpgradeStateMachineTest(unittest.TestCase):
         self.assertTrue(last_download["retained"])
         self.assertEqual(last_download["cleanupStatus"], "cleanup-failed")
         self.assertNotIn("path", last_download)
+        self.assertTrue(any("释放临时下载包失败" in item for item in warnings))
+
+    def test_remote_store_import_failure_still_releases_download(self) -> None:
+        config = self._fake_config(manual_user=False)
+        self.module.Config = config
+        gateway = self._Gateway(self.old_project, self.new_project, config.events)
+        plugin = self.module.Plugin(self._context())
+        plugin._gateway = lambda: gateway
+        released: list[dict] = []
+        original_progress_stage = plugin._progress_stage
+
+        async def progress_stage(stage, *args, **kwargs):
+            if stage == "download-cleanup":
+                raise asyncio.CancelledError
+            return await original_progress_stage(stage, *args, **kwargs)
+
+        plugin._progress_stage = progress_stage
+
+        async def discover(_script_id, _payload):
+            return {
+                "latestVersion": "2.0",
+                "installable": True,
+                "candidate": {
+                    "source": "github_release",
+                    "version": "2.0",
+                    "download_url": "https://example.invalid/m9a.zip",
+                },
+            }
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            package_path = Path(temporary_directory) / "failed-import.zip"
+            package_path.write_bytes(b"failed import package")
+
+            async def download(_root, _candidate, *, progress=None):
+                del progress
+                return {
+                    "source": "github_release",
+                    "version": "2.0",
+                    "path": str(package_path),
+                    "size": package_path.stat().st_size,
+                    "sha256": "a" * 64,
+                }
+
+            async def release(_root, package):
+                released.append(dict(package))
+                package_path.unlink()
+                return {"released": True, "retained": False}
+
+            async def fail_import(*_args, **_kwargs):
+                raise RuntimeError("synthetic store import failure")
+
+            gateway.download_remote_package = download
+            gateway.release_remote_package = release
+            plugin._discover_remote_project = discover
+            plugin._import_initial_project = fail_import
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "synthetic store import failure",
+            ):
+                asyncio.run(
+                    plugin._download_and_import_remote(
+                        self.script_id,
+                        {"projectId": "m9a", "source": "github_release"},
+                        initial=True,
+                    )
+                )
+            self.assertFalse(package_path.exists())
+
+        self.assertEqual(len(released), 1)
+        self.assertNotIn("ManagedRemote", config.script.config)
+
+    def test_remote_config_failure_cleanup_error_does_not_mask_original(
+        self,
+    ) -> None:
+        config = self._fake_config(manual_user=False)
+        self.module.Config = config
+        warnings: list[str] = []
+        context = self._context()
+        context.logger.warning = lambda message: warnings.append(str(message))
+        gateway = self._Gateway(self.old_project, self.new_project, config.events)
+        plugin = self.module.Plugin(context)
+        plugin._gateway = lambda: gateway
+        release_attempted = 0
+
+        async def discover(_script_id, _payload):
+            return {
+                "latestVersion": "2.0",
+                "installable": True,
+                "candidate": {
+                    "source": "github_release",
+                    "version": "2.0",
+                    "download_url": "https://example.invalid/m9a.zip",
+                },
+            }
+
+        async def download(_root, _candidate, *, progress=None):
+            del progress
+            return {
+                "source": "github_release",
+                "version": "2.0",
+                "path": "C:/managed-downloads/transient.zip",
+                "size": 10,
+                "sha256": "d" * 64,
+            }
+
+        async def fail_release(_root, _package):
+            nonlocal release_attempted
+            release_attempted += 1
+            raise RuntimeError("synthetic cleanup failure")
+
+        async def imported(*_args, **_kwargs):
+            return {"project": {"projectId": "m9a", "version": "2.0"}}
+
+        async def fail_persist(*_args, **_kwargs):
+            raise RuntimeError("synthetic config persistence failure")
+
+        gateway.download_remote_package = download
+        gateway.release_remote_package = fail_release
+        plugin._discover_remote_project = discover
+        plugin._import_initial_project = imported
+        plugin._persist_remote_result = fail_persist
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "synthetic config persistence failure",
+        ):
+            asyncio.run(
+                plugin._download_and_import_remote(
+                    self.script_id,
+                    {"projectId": "m9a", "source": "github_release"},
+                    initial=True,
+                )
+            )
+
+        self.assertEqual(release_attempted, 1)
+        self.assertNotIn("ManagedRemote", config.script.config)
         self.assertTrue(any("释放临时下载包失败" in item for item in warnings))
 
     def test_remote_postcommit_cleanup_finishes_before_cancellation_reraises(
@@ -2352,6 +2500,9 @@ class ManagedUpgradeStateMachineTest(unittest.TestCase):
         app = types.ModuleType("app")
         app_core = types.ModuleType("app.core")
         app_plugins = types.ModuleType("app.plugins")
+        app_plugins.__path__ = []
+        app_plugins_pypi_site = types.ModuleType("app.plugins.pypi_site")
+        app_plugins_pypi_site.get_plugin_import_paths = lambda: ()
         app_core.Config = object()
 
         class ScriptAdapterPlugin:
@@ -2372,11 +2523,13 @@ class ManagedUpgradeStateMachineTest(unittest.TestCase):
         app_plugins.ScriptAdapterPlugin = ScriptAdapterPlugin
         app_plugins.ScriptAdapterDefinition = ScriptAdapterDefinition
         app_plugins.PluginHttpRequest = object
+        app_plugins.pypi_site = app_plugins_pypi_site
         app.core = app_core
         app.plugins = app_plugins
         sys.modules.setdefault("app", app)
         sys.modules.setdefault("app.core", app_core)
         sys.modules.setdefault("app.plugins", app_plugins)
+        sys.modules.setdefault("app.plugins.pypi_site", app_plugins_pypi_site)
 
         adapter = types.ModuleType(f"{package_name}.adapter")
         adapter.MaaFWManagedAdapterHooks = type(
@@ -2387,6 +2540,20 @@ class ManagedUpgradeStateMachineTest(unittest.TestCase):
         schema = types.ModuleType(f"{package_name}.schema")
         schema.SCRIPT_GROUPS = ()
         schema.USER_GROUPS = ()
+        environment_service = types.ModuleType(
+            f"{package_name}.environment_service"
+        )
+        environment_service.MANAGED_ENVIRONMENT_SERVICE = (
+            "maafw.managed.environment.v1"
+        )
+
+        class MaaFWManagedEnvironmentService:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        environment_service.MaaFWManagedEnvironmentService = (
+            MaaFWManagedEnvironmentService
+        )
         services_source = ScriptMaaFWManagedContractTest._load_services_module()
         services = types.ModuleType(f"{package_name}.services")
         for name in (
@@ -2401,6 +2568,7 @@ class ManagedUpgradeStateMachineTest(unittest.TestCase):
             setattr(services, name, getattr(services_source, name))
         sys.modules[adapter.__name__] = adapter
         sys.modules[schema.__name__] = schema
+        sys.modules[environment_service.__name__] = environment_service
         sys.modules[services.__name__] = services
 
         spec = importlib.util.spec_from_file_location(
@@ -2411,7 +2579,11 @@ class ManagedUpgradeStateMachineTest(unittest.TestCase):
         module = importlib.util.module_from_spec(spec)
         module.__package__ = package_name
         sys.modules[module_name] = module
-        spec.loader.exec_module(module)
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            sys.modules.pop(module_name, None)
+            raise
         return module
 
 
@@ -3653,6 +3825,7 @@ class ManagedInPlaceConversionTest(unittest.TestCase):
     def _context(self):
         return SimpleNamespace(
             get=lambda _key: None,
+            set=lambda _key, _value: None,
             logger=SimpleNamespace(
                 warning=lambda *_args, **_kwargs: None,
                 error=lambda *_args, **_kwargs: None,

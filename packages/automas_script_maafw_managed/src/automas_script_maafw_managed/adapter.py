@@ -7,6 +7,7 @@ from typing import Any
 from app.core import Config
 from app.plugins import ScriptAdapterRuntime
 from automas_script_maafw.adapter import MaaFWAdapterHooks
+from automas_script_maafw.runtime_route import managed_execution_route
 from automas_script_maafw.runner_task import MaaFWPluginAutoProxyTask
 
 from .services import (
@@ -25,12 +26,6 @@ _PROJECT_LEASE_KEY = "maafw_managed_project_lease"
 _CHECKOUT_LEASE_KEY = "maafw_managed_checkout_lease"
 _POLICY_KEY = "maafw_managed_gc_policy"
 _MINIMUM_LEASE_TTL_SECONDS = 24 * 60 * 60
-_UPGRADE_BLOCKING_STATES = {
-    "applying",
-    "committing",
-    "recovery_required",
-    "rollback_failed",
-}
 
 
 class MaaFWManagedAdapterHooks(MaaFWAdapterHooks):
@@ -90,9 +85,21 @@ class MaaFWManagedAdapterHooks(MaaFWAdapterHooks):
         if not isinstance(task, MaaFWPluginAutoProxyTask):
             raise RuntimeError("MaaFW 托管适配器未获得 MaaFWPluginAutoProxyTask")
         resolution = runtime.extra.get(_RESOLUTION_KEY)
-        if isinstance(resolution, Mapping):
-            task.maafw_managed_project = dict(resolution.get("project") or {})
-            task.maafw_managed_runtime_binding = dict(resolution.get("runtime") or {})
+        if not isinstance(resolution, Mapping):
+            raise RuntimeError("MaaFW 托管执行缺少已解析的 Project Store resolution")
+        project = resolution.get("project")
+        runtime_binding = resolution.get("runtime")
+        if not isinstance(project, Mapping) or not isinstance(runtime_binding, Mapping):
+            raise RuntimeError("MaaFW 托管 resolution 缺少 project/runtime DTO")
+        task.maafw_managed_execution = True
+        task.maafw_managed_project = dict(project)
+        task.maafw_managed_runtime_binding = dict(runtime_binding)
+        task.maafw_managed_route = managed_execution_route(
+            managed_execution=True,
+            project=task.maafw_managed_project,
+            runtime_binding=task.maafw_managed_runtime_binding,
+            expected_pool_id=task.maafw_runtime_pool_id,
+        )
         return task
 
     async def finalize(self, runtime: ScriptAdapterRuntime) -> None:
@@ -120,7 +127,7 @@ class MaaFWManagedAdapterHooks(MaaFWAdapterHooks):
         managed = _mapping(script_data.get("Managed"))
         pending_upgrade = _mapping(managed.get("PendingUpgrade"))
         upgrade_state = str(pending_upgrade.get("state") or "").strip()
-        if upgrade_state in _UPGRADE_BLOCKING_STATES:
+        if upgrade_state in ManagedServiceGateway.UPGRADE_BLOCKING_STATES:
             raise ManagedServiceError(
                 f"资源升级事务处于 {upgrade_state}，"
                 "恢复完成前拒绝启动新任务"

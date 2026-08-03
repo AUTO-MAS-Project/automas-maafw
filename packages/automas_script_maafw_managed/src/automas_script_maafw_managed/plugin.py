@@ -20,12 +20,17 @@ from app.plugins import (
     ScriptAdapterDefinition,
     ScriptAdapterPlugin,
 )
+from app.plugins.pypi_site import get_plugin_import_paths
 from automas_script_maafw.project_path import (
     release_project_path,
     try_reserve_project_path,
 )
 
 from .adapter import MaaFWManagedAdapterHooks
+from .environment_service import (
+    MANAGED_ENVIRONMENT_SERVICE,
+    MaaFWManagedEnvironmentService,
+)
 from .schema import SCRIPT_GROUPS, USER_GROUPS
 from .services import (
     INTERFACE_SERVICE,
@@ -59,7 +64,7 @@ _USER_PENDING_KIND = "maafw.managed-user-upgrade-pending"
 _CONVERSION_KIND = "maafw.managed-conversion"
 _CONVERSION_API_VERSION = "maafw-managed.v1"
 _DISTRIBUTION_NAME = "automas-script-maafw-managed"
-_DISTRIBUTION_VERSION_FALLBACK = "0.2.1"
+_DISTRIBUTION_VERSION_FALLBACK = "0.3.0"
 _SOURCE_TYPE = "MaaFW"
 _TARGET_TYPE = "MaaFWManaged"
 _PROGRESS_EVENT_TYPE = "maafw.managed.progress"
@@ -67,12 +72,6 @@ _PROGRESS_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,200}$")
 _PROGRESS_MAX_STATES = 128
 _PROGRESS_MAX_LOGS = 80
 _PROGRESS_TERMINAL_STATES = frozenset({"success", "error"})
-_INTERRUPTED_STATES = {
-    "applying",
-    "committing",
-    "recovery_required",
-    "rollback_failed",
-}
 _JSON_OBJECT_FIELDS = frozenset(
     (str(getattr(group, "key", "")), str(getattr(field, "name", "")))
     for group in (*SCRIPT_GROUPS, *USER_GROUPS)
@@ -94,6 +93,8 @@ class _PluginDrainingError(ManagedServiceError):
 
 class Plugin(ScriptAdapterPlugin):
     """Declarative adapter for resource-only, versioned MaaFW projects."""
+
+    provides = [MANAGED_ENVIRONMENT_SERVICE]
 
     needs = [
         PROJECT_STORE_SERVICE,
@@ -123,6 +124,15 @@ class Plugin(ScriptAdapterPlugin):
                 f"maafw_managed_progress_{id(self)}",
                 default=None,
             )
+        )
+        self.environment_service = MaaFWManagedEnvironmentService(
+            config=Config,
+            gateway_provider=self._gateway,
+            runner_provider=lambda: self.ctx.get("maafw.runner.v1"),
+            reserve_project_path=try_reserve_project_path,
+            release_project_path=release_project_path,
+            import_paths_provider=get_plugin_import_paths,
+            operation_runner=self._run_drain_protected,
         )
 
     def _upgrade_lock(self, script_id: str) -> asyncio.Lock:
@@ -303,12 +313,18 @@ class Plugin(ScriptAdapterPlugin):
         )
         await self._recover_interrupted_upgrades()
         await self._repair_upgrade_artifacts_on_start()
+        # Publish the service only after startup recovery has restored every
+        # authoritative project/config transaction to a runnable state.
+        self.ctx.set(MANAGED_ENVIRONMENT_SERVICE, self.environment_service)
 
     async def on_stop(self, reason: str) -> None:
         cancellation_requested = False
         current_task = asyncio.current_task()
         async with self._progress_lock:
             self._draining = True
+        service_setter = getattr(self.ctx, "set", None)
+        if callable(service_setter):
+            service_setter(MANAGED_ENVIRONMENT_SERVICE, None)
 
         while True:
             async with self._progress_lock:
@@ -1373,24 +1389,48 @@ class Plugin(ScriptAdapterPlugin):
             )
             return {**result, "download": public_download}
 
-        result = await self._run_config_transaction(
-            script_id,
-            (
-                f"maafw-remote-import:{script_id}"
-                if initial
-                else f"maafw-remote-stage:{script_id}"
-            ),
-            persist,
-        )
-        cleanup_task = asyncio.create_task(
-            self._release_remote_download(
+        result: dict[str, Any]
+        released_download = public_download
+        cancellation_requested = False
+        committed = False
+        try:
+            result = await self._run_config_transaction(
                 script_id,
-                download_root,
-                downloaded,
+                (
+                    f"maafw-remote-import:{script_id}"
+                    if initial
+                    else f"maafw-remote-stage:{script_id}"
+                ),
+                persist,
             )
-        )
-        cancellation_requested = await self._wait_for_progress_task(cleanup_task)
-        released_download = cleanup_task.result()
+            committed = True
+        finally:
+            # The updater package is request-scoped staging.  Once download
+            # succeeds it must be released even when Store import, upgrade
+            # planning or host config persistence fails.  Shield the cleanup
+            # task because cancelling this HTTP request cannot be allowed to
+            # strand the content-addressed ZIP.  Cleanup telemetry is only
+            # persisted after the resource/config transaction committed.
+            cleanup_task = asyncio.create_task(
+                self._release_remote_download(
+                    script_id,
+                    download_root,
+                    downloaded,
+                    persist_status=committed,
+                )
+            )
+            cancellation_requested = await self._wait_for_progress_task(
+                cleanup_task
+            )
+            try:
+                released_download = cleanup_task.result()
+            except Exception as cleanup_exc:
+                # Never replace the operation's authoritative exception (or a
+                # completed import) with best-effort staging cleanup failure.
+                self._warn_remote_cleanup(
+                    "MaaFW 临时下载包释放任务异常："
+                    f"{_sanitize_public_message(str(cleanup_exc))}"
+                )
         if cancellation_requested:
             raise asyncio.CancelledError
         return {**result, "download": released_download}
@@ -1498,10 +1538,16 @@ class Plugin(ScriptAdapterPlugin):
         script_id: str,
         download_root: Path,
         downloaded: Mapping[str, Any],
+        *,
+        persist_status: bool,
     ) -> dict[str, Any]:
-        await self._progress_stage(
+        await self._remote_cleanup_progress(
             "download-cleanup",
-            "资源与配置已持久化，正在释放临时下载包",
+            (
+                "资源与配置已持久化，正在释放临时下载包"
+                if persist_status
+                else "资源操作未完成，正在释放临时下载包"
+            ),
             percent=96,
         )
         cleanup_status = "cleanup-failed"
@@ -1539,35 +1585,67 @@ class Plugin(ScriptAdapterPlugin):
             }
         )
 
-        async def persist_cleanup_status() -> dict[str, Any]:
-            await self._persist_remote_download_status(
-                script_id,
-                public_download,
-            )
-            return public_download
+        if persist_status:
+            async def persist_cleanup_status() -> dict[str, Any]:
+                await self._persist_remote_download_status(
+                    script_id,
+                    public_download,
+                )
+                return public_download
 
-        try:
-            await self._run_config_transaction(
-                script_id,
-                f"maafw-remote-cleanup-status:{script_id}",
-                persist_cleanup_status,
-            )
-        except Exception as exc:
-            self._warn_remote_cleanup(
-                "MaaFW 临时下载包状态回写失败，资源导入结果保持成功："
-                f"{_sanitize_public_message(str(exc))}"
-            )
+            try:
+                await self._run_config_transaction(
+                    script_id,
+                    f"maafw-remote-cleanup-status:{script_id}",
+                    persist_cleanup_status,
+                )
+            except Exception as exc:
+                self._warn_remote_cleanup(
+                    "MaaFW 临时下载包状态回写失败，资源导入结果保持成功："
+                    f"{_sanitize_public_message(str(exc))}"
+                )
 
-        await self._progress_stage(
+        await self._remote_cleanup_progress(
             "download-retained" if retained else "download-released",
             (
-                "远程资源已导入；临时下载包清理失败并已保留"
+                (
+                    "远程资源已导入；临时下载包清理失败并已保留"
+                    if persist_status
+                    else "资源操作未完成；临时下载包清理失败并已保留"
+                )
                 if retained
-                else "远程资源已导入，临时下载包已释放"
+                else (
+                    "远程资源已导入，临时下载包已释放"
+                    if persist_status
+                    else "资源操作未完成，临时下载包已释放"
+                )
             ),
             percent=98,
         )
         return public_download
+
+    async def _remote_cleanup_progress(
+        self,
+        stage: str,
+        message: str,
+        *,
+        percent: float | int,
+    ) -> None:
+        """Keep observational progress failures out of staging cleanup."""
+
+        try:
+            await self._progress_stage(stage, message, percent=percent)
+        except asyncio.CancelledError:
+            # This helper runs inside the separately shielded cleanup task.
+            # Cancellation of progress publication must not skip ZIP release.
+            self._warn_remote_cleanup(
+                "MaaFW 临时下载包清理进度发布被取消，继续执行清理"
+            )
+        except Exception as exc:
+            self._warn_remote_cleanup(
+                "MaaFW 临时下载包清理进度发布失败，继续执行清理："
+                f"{_sanitize_public_message(str(exc))}"
+            )
 
     def _warn_remote_cleanup(self, message: str) -> None:
         """Never let best-effort cleanup telemetry change a committed result."""
@@ -2153,7 +2231,7 @@ class Plugin(ScriptAdapterPlugin):
         )
         _record, current_script, pending = await self._load_pending_upgrade(script_id)
         state = str(pending.get("state") or "")
-        if state in _INTERRUPTED_STATES:
+        if state in ManagedServiceGateway.UPGRADE_BLOCKING_STATES:
             await self._rollback_pending_upgrade(script_id, pending)
             raise ManagedServiceError(
                 "检测到上次升级在提交中中断，已恢复旧版本与旧配置；"
@@ -2364,7 +2442,10 @@ class Plugin(ScriptAdapterPlugin):
             percent=20,
         )
         _record, _config, pending = await self._load_pending_upgrade(script_id)
-        if str(pending.get("state") or "") in _INTERRUPTED_STATES:
+        if (
+            str(pending.get("state") or "")
+            in ManagedServiceGateway.UPGRADE_BLOCKING_STATES
+        ):
             await self._rollback_pending_upgrade(script_id, pending)
             _record, _config, pending = await self._load_pending_upgrade(script_id)
         project = _mapping(pending.get("project"))
@@ -2461,7 +2542,10 @@ class Plugin(ScriptAdapterPlugin):
                 pending = _mapping(
                     _mapping(config.get("Managed")).get("PendingUpgrade")
                 )
-                if str(pending.get("state") or "") not in _INTERRUPTED_STATES:
+                if (
+                    str(pending.get("state") or "")
+                    not in ManagedServiceGateway.UPGRADE_BLOCKING_STATES
+                ):
                     continue
                 candidate_plan_id = str(pending.get("planId") or "").strip()
                 if not candidate_plan_id:
@@ -2482,7 +2566,7 @@ class Plugin(ScriptAdapterPlugin):
                                 str(fresh_pending.get("planId") or "").strip()
                                 != candidate_plan_id
                                 or str(fresh_pending.get("state") or "")
-                                not in _INTERRUPTED_STATES
+                                not in ManagedServiceGateway.UPGRADE_BLOCKING_STATES
                             ):
                                 continue
                             await self._rollback_pending_upgrade(

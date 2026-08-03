@@ -32,14 +32,18 @@ workflow. Actions also cover capability inspection, version listing/switching,
 project/runtime deletion, pinning and garbage collection.
 
 The downloaded ZIP is request-scoped staging, not a durable project resource.
-After Project Store import/upgrade-plan persistence and the host config
-transaction both succeed, Managed asks Project Update 0.2.2 to release the
-exact content-addressed package. Apply, cancel and restart recovery use only
+Once a download succeeds, Managed releases the exact content-addressed package
+in a cancellation-shielded `finally` path even when Project Store import,
+upgrade planning, or host config persistence fails. Apply, cancel and restart
+recovery use only
 the immutable Store version and never need the ZIP. `LastDownload` retains
 source/version/size/SHA256 plus an explicit `retained` cleanup result, but no
 local staging path; remote imports also never persist that transient path as
 `Managed.SourceArchive`. A cleanup failure is warned and reported as
 `retained=true` without changing a completed resource import into failure.
+Cleanup telemetry is written back only after the resource and host config
+transaction committed, so a failed import never publishes a successful
+`LastDownload` record.
 Locally selected ZIP paths keep their existing persistence behavior.
 
 When `features.operationProgress=true`, every mutating manager action accepts a
@@ -59,6 +63,20 @@ operation lookup. It returns a server epoch and the currently registered
 operation; all mutations and remote checks are excluded by `scriptId`, and
 plugin shutdown drains registered work before releasing the active slot.
 Browser session storage is only a compatibility hint for older hosts.
+
+Managed 0.3.0 registers `maafw.managed.environment.v1` for host-side
+preparation by `scriptId`. The service resolves the authoritative Store
+version, reserves the writable checkout, and invokes
+Runner's exact prewarm route without starting the project Agent, controller, or
+game. Only after preparation succeeds does it commit a reversible Store/runtime
+binding and persist the host script record. If that host write fails, it
+restores the previous Project Store binding plus the exact Store/Runtime Pool
+reference deltas before either transaction unlocks; incomplete compensation is
+attached to the original failure and never reported ready. The later run
+consumes the same complete selector, `poolId`, `runtimeId`,
+and `runtime.python` constraint, so an existing matching CP312/CP313 runtime is
+reused instead of rebuilt. Managed 0.3.0 requires Script MaaFW 0.1.11, Runner
+0.4.0, Project Store 0.2.2 and Runtime Pool 0.2.0 or newer compatible releases.
 
 `ImportProjectId` is a first-import input only and is cleared after a successful
 bind. The displayed `ProjectId` and `Version` are read-only. Once bound,
@@ -100,7 +118,7 @@ or runtime bind cannot lose its new reference before the matching script config
 is durable. Import, stage, apply, cancel, delete and runtime installation use
 resource-lifecycle → per-script upgrade → host-config ordering; destructive GC
 holds the host's global config write gate from snapshot through collection.
-Managed 0.2.1 requires this Project Store 0.2.1 capability and fails closed
+Managed 0.3.0 requires this Project Store 0.2.2 capability and fails closed
 instead of falling back to an unlocked older service.
 
 It also requires an AUTO-MAS host that provides
@@ -120,7 +138,7 @@ exact retry reuses the artifact but a changed target cannot do so accidentally.
 Failures known to be pre-commit release the project reference; uncertain commit
 states retain the reference for idempotent recovery. Hosts without both
 conversion methods report `inPlaceConversion=false` and the convert action fails
-closed. Do not enable or publish Managed 0.2.1 before these host transaction and
+closed. Do not enable or publish Managed 0.3.0 before these host transaction and
 conversion changes are merged.
 
 MirrorChyan uses an explicit per-script CDK when provided and otherwise inherits

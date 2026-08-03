@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import inspect
+import re
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import asdict, is_dataclass
@@ -14,12 +15,22 @@ from automas_maafw_runner.environment import (
     build_runner_packages,
     requirement_distribution_name,
 )
+from packaging.specifiers import InvalidSpecifier, SpecifierSet
+from packaging.version import InvalidVersion, Version
 
 
 PROJECT_STORE_SERVICE = "maafw.project_store.v1"
 RUNTIME_POOL_SERVICE = "maafw.runtime_pool.v1"
 PROJECT_UPDATE_SERVICE = "maafw.project_update.v1"
 INTERFACE_SERVICE = "maafw.interface.v1"
+MANAGED_UPGRADE_BLOCKING_STATES = frozenset(
+    {
+        "applying",
+        "committing",
+        "recovery_required",
+        "rollback_failed",
+    }
+)
 
 
 class ManagedServiceError(RuntimeError):
@@ -28,6 +39,8 @@ class ManagedServiceError(RuntimeError):
 
 class ManagedServiceGateway:
     """Keep service-version tolerance at one JSON-friendly boundary."""
+
+    UPGRADE_BLOCKING_STATES = MANAGED_UPGRADE_BLOCKING_STATES
 
     def __init__(
         self,
@@ -69,8 +82,13 @@ class ManagedServiceGateway:
     async def resolve_execution(self, request: Mapping[str, Any]) -> dict[str, Any]:
         project_id = _required_text(request, "projectId", "项目 ID")
         requested_version = _optional_text(request.get("version"))
+        defer_runtime_binding = request.get("deferRuntimeBinding") is True
         project = await self.resolve_project(project_id, requested_version)
         _validate_project_store_binding(request, project)
+        # Runtime identity must be derived from the immutable Store payload.
+        # A checkout is writable execution state and may have been changed by
+        # a previous run; it is never an authoritative dependency selector.
+        store_project_path = _project_path(project)
         script_id = _optional_text(request.get("scriptId"))
         if not callable(getattr(self.project_store, "checkout_project", None)):
             raise ManagedServiceError(
@@ -108,7 +126,7 @@ class ManagedServiceGateway:
                 "拒绝创建未约束的 MaaFW 运行时。请先声明版本约束或绑定已验证运行时。"
             )
         requirements = (
-            _runner_requirements(project_path, constraint)
+            _runner_requirements(store_project_path, constraint)
             if constraint
             else []
         )
@@ -124,6 +142,9 @@ class ManagedServiceGateway:
                 "runRootId": _optional_text(checkout.get("runRootId")),
             },
         }
+        python_request = _project_python_runtime_request(project)
+        if python_request is not None:
+            runtime_request["python"] = python_request
         if requirements:
             runtime_request["requirements"] = requirements
         if bound_runtime_id:
@@ -138,7 +159,7 @@ class ManagedServiceGateway:
                 runtime_request = dict(runtime_request)
                 runtime_request.pop("runtimeId", None)
                 runtime_request["requirements"] = _runner_requirements(
-                    project_path,
+                    store_project_path,
                     bound_maafw_version,
                 )
                 runtime_request["metadata"] = {
@@ -173,9 +194,10 @@ class ManagedServiceGateway:
             raise ManagedServiceError(
                 "运行时服务返回值缺少 runtimeId 或 pythonExecutable"
             )
+        _validate_python_constraint(project, runtime)
         _validate_python_abi(project, runtime)
         _validate_platform_arch(project, runtime)
-        if recovered_binding:
+        if recovered_binding and not defer_runtime_binding:
             project = await self.bind_project_runtime(
                 project_id,
                 str(project.get("version") or requested_version or "") or None,
@@ -193,6 +215,11 @@ class ManagedServiceGateway:
                 "available": True,
                 "used": True,
             },
+            # Environment prewarming uses this acknowledgement to fail closed
+            # unless first-use/stale-runtime recovery was kept read-only.  The
+            # caller can then prepare before committing Project Store and Pool
+            # references.
+            "bindingPersistenceDeferred": defer_runtime_binding,
         }
 
     async def resolve_project(
@@ -1050,6 +1077,291 @@ class ManagedServiceGateway:
                 result["referenceCleanupWarning"] = str(exc)
         return result
 
+    async def bind_project_runtime_reversible(
+        self,
+        project_id: str,
+        version: str | None,
+        binding: Mapping[str, Any],
+        *,
+        project_reference: str | None = None,
+    ) -> dict[str, Any]:
+        """Bind a runtime and return the exact pre-bind rollback receipt.
+
+        Callers must hold ``resource_transaction()`` for the complete
+        bind/config-write/rollback sequence.  The receipt records only the
+        references this bind may add or remove, so compensation never erases
+        unrelated references.
+        """
+
+        runtime_id = _required_text(binding, "runtimeId", "运行时 ID")
+        resolved_version = _optional_text(version)
+        if not resolved_version:
+            raise ManagedServiceError("绑定运行时前必须解析出项目版本")
+        stable_project_reference = _project_script_reference(project_reference)
+        project_runtime_reference = _project_runtime_reference(
+            project_id,
+            resolved_version,
+        )
+
+        previous_project = await self.resolve_project(
+            project_id,
+            resolved_version,
+        )
+        manifest = previous_project.get("manifest")
+        previous_binding = _manifest_runtime_binding(manifest)
+        previous_runtime_id = _optional_text(previous_binding.get("runtimeId"))
+        project_references = _manifest_runtime_references(
+            manifest,
+            "Project Store manifest",
+        )
+        target_runtime = await self.resolve_runtime(
+            {"runtimeId": runtime_id, "touch": False}
+        )
+        if target_runtime is None:
+            raise ManagedServiceError(
+                f"绑定 MaaFW 项目前无法解析运行时 {runtime_id}"
+            )
+        target_references = _runtime_references(
+            target_runtime,
+            f"运行时 {runtime_id}",
+        )
+
+        previous_runtime_reference_preexisting = False
+        if previous_runtime_id and previous_runtime_id != runtime_id:
+            previous_runtime = await self.resolve_runtime(
+                {"runtimeId": previous_runtime_id, "touch": False}
+            )
+            if previous_runtime is not None:
+                previous_runtime_reference_preexisting = (
+                    project_runtime_reference
+                    in _runtime_references(
+                        previous_runtime,
+                        f"运行时 {previous_runtime_id}",
+                    )
+                )
+
+        rollback = {
+            "apiVersion": "maafw-managed-runtime-binding-rollback.v1",
+            "projectId": project_id,
+            "version": resolved_version,
+            "targetRuntimeId": runtime_id,
+            "previousBinding": _json_value(previous_binding),
+            "projectRuntimeReference": project_runtime_reference,
+            "stableProjectReference": stable_project_reference,
+            "stableProjectReferencePreexisting": (
+                stable_project_reference is None
+                or stable_project_reference in project_references
+            ),
+            "targetRuntimeReferencePreexisting": (
+                project_runtime_reference in target_references
+            ),
+            "previousRuntimeId": previous_runtime_id,
+            "previousRuntimeReferencePreexisting": (
+                previous_runtime_reference_preexisting
+            ),
+        }
+        project = await self.bind_project_runtime(
+            project_id,
+            resolved_version,
+            binding,
+            project_reference=stable_project_reference,
+        )
+        return {"project": project, "rollback": rollback}
+
+    async def rollback_project_runtime_binding(
+        self,
+        receipt: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Restore Store binding/references and Pool references from a receipt.
+
+        This is deliberately a compensating operation rather than a generic
+        manifest overwrite.  It restores the previous runtime reference before
+        pointing the Store back to it, and removes the target reference only
+        after the Store restore succeeded.  Every safe step is attempted and a
+        partial rollback raises a fail-closed ``ManagedServiceError``.
+        """
+
+        if receipt.get("apiVersion") != (
+            "maafw-managed-runtime-binding-rollback.v1"
+        ):
+            raise ManagedServiceError("未知的 MaaFW runtime binding 回滚凭据")
+        project_id = _required_text(receipt, "projectId", "项目 ID")
+        version = _required_text(receipt, "version", "项目版本")
+        target_runtime_id = _required_text(
+            receipt,
+            "targetRuntimeId",
+            "目标运行时 ID",
+        )
+        project_runtime_reference = _required_text(
+            receipt,
+            "projectRuntimeReference",
+            "项目运行时引用",
+        )
+        expected_reference = _project_runtime_reference(project_id, version)
+        if project_runtime_reference != expected_reference:
+            raise ManagedServiceError("runtime binding 回滚凭据的项目引用不匹配")
+        stable_project_reference = _project_script_reference(
+            _optional_text(receipt.get("stableProjectReference"))
+        )
+        previous_binding_value = receipt.get("previousBinding")
+        if not isinstance(previous_binding_value, Mapping):
+            raise ManagedServiceError("runtime binding 回滚凭据缺少 previousBinding")
+        previous_binding = _json_value(previous_binding_value)
+        previous_runtime_id = _optional_text(receipt.get("previousRuntimeId"))
+        if previous_runtime_id != _optional_text(previous_binding.get("runtimeId")):
+            raise ManagedServiceError("runtime binding 回滚凭据的旧运行时不一致")
+
+        errors: list[str] = []
+        previous_reference_ready = True
+        if (
+            previous_runtime_id
+            and previous_runtime_id != target_runtime_id
+            and receipt.get("previousRuntimeReferencePreexisting") is True
+        ):
+            try:
+                await _call_variants(
+                    self.runtime_pool,
+                    ("add_reference",),
+                    (
+                        ((previous_runtime_id, project_runtime_reference), {}),
+                        (
+                            (
+                                {
+                                    "runtimeId": previous_runtime_id,
+                                    "reference": project_runtime_reference,
+                                },
+                            ),
+                            {},
+                        ),
+                    ),
+                    operation="恢复旧 MaaFW 项目运行时引用",
+                )
+            except BaseException as exc:
+                previous_reference_ready = False
+                errors.append(
+                    "恢复旧运行时引用失败："
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+        store_restored = False
+        if previous_reference_ready:
+            try:
+                if previous_binding:
+                    await _call_variants(
+                        self.project_store,
+                        ("bind_runtime", "bind_project_runtime"),
+                        (
+                            (
+                                (project_id, version),
+                                {
+                                    "binding": previous_binding,
+                                    "touch": False,
+                                },
+                            ),
+                            (
+                                (
+                                    {
+                                        "projectId": project_id,
+                                        "version": version,
+                                        "binding": previous_binding,
+                                        "touch": False,
+                                    },
+                                ),
+                                {},
+                            ),
+                        ),
+                        operation="恢复 MaaFW 项目原运行时绑定",
+                    )
+                else:
+                    await _call_variants(
+                        self.project_store,
+                        ("release_runtime", "release_reference"),
+                        (
+                            (
+                                (project_id, version),
+                                {"clear_binding": True},
+                            ),
+                            (
+                                (
+                                    {
+                                        "projectId": project_id,
+                                        "version": version,
+                                        "clearBinding": True,
+                                    },
+                                ),
+                                {},
+                            ),
+                        ),
+                        operation="清除 MaaFW 项目本次运行时绑定",
+                    )
+                store_restored = True
+            except BaseException as exc:
+                errors.append(
+                    "恢复 Project Store 运行时绑定失败："
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+        if (
+            store_restored
+            and stable_project_reference is not None
+            and receipt.get("stableProjectReferencePreexisting") is not True
+        ):
+            try:
+                await _call_variants(
+                    self.project_store,
+                    ("release_runtime", "release_reference"),
+                    (
+                        (
+                            (project_id, version),
+                            {"reference": stable_project_reference},
+                        ),
+                        (
+                            (
+                                {
+                                    "projectId": project_id,
+                                    "version": version,
+                                    "reference": stable_project_reference,
+                                },
+                            ),
+                            {},
+                        ),
+                    ),
+                    operation="回滚 MaaFW 脚本项目引用",
+                )
+            except BaseException as exc:
+                errors.append(
+                    "回滚 Project Store 脚本引用失败："
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+        if (
+            store_restored
+            and receipt.get("targetRuntimeReferencePreexisting") is not True
+        ):
+            try:
+                await _call_variants(
+                    self.runtime_pool,
+                    ("remove_reference",),
+                    (((target_runtime_id, project_runtime_reference), {}),),
+                    operation="回滚目标 MaaFW 项目运行时引用",
+                )
+            except BaseException as exc:
+                errors.append(
+                    "回滚目标运行时引用失败："
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+        if errors:
+            raise ManagedServiceError(
+                "MaaFW runtime binding 补偿未完整完成；" + "；".join(errors)
+            )
+        return {
+            "restored": True,
+            "projectId": project_id,
+            "version": version,
+            "runtimeId": previous_runtime_id,
+        }
+
     async def acquire_project_lease(
         self,
         project_id: str,
@@ -1690,6 +2002,47 @@ def _manifest_runtime_binding(value: Any) -> dict[str, Any]:
     return dict(binding)
 
 
+def _manifest_runtime_references(value: Any, source: str) -> set[str]:
+    if not isinstance(value, Mapping):
+        raise ManagedServiceError(f"{source} 必须是 JSON object")
+    runtime = value.get("runtime")
+    if runtime is None:
+        return set()
+    if not isinstance(runtime, Mapping):
+        raise ManagedServiceError(f"{source}.runtime 必须是 JSON object")
+    references = runtime.get("references")
+    if references is None:
+        return set()
+    if not isinstance(references, Sequence) or isinstance(
+        references,
+        (str, bytes, bytearray),
+    ):
+        raise ManagedServiceError(f"{source}.runtime.references 必须是字符串数组")
+    normalized: set[str] = set()
+    for item in references:
+        if not isinstance(item, str) or not item.strip():
+            raise ManagedServiceError(
+                f"{source}.runtime.references 必须只包含非空字符串"
+            )
+        normalized.add(item.strip())
+    return normalized
+
+
+def _runtime_references(value: Mapping[str, Any], source: str) -> set[str]:
+    references = value.get("references")
+    if not isinstance(references, Sequence) or isinstance(
+        references,
+        (str, bytes, bytearray),
+    ):
+        raise ManagedServiceError(f"{source} 未返回 references 字符串数组")
+    normalized: set[str] = set()
+    for item in references:
+        if not isinstance(item, str) or not item.strip():
+            raise ManagedServiceError(f"{source} references 包含非法值")
+        normalized.add(item.strip())
+    return normalized
+
+
 def _project_runtime_reference(project_id: str, version: str) -> str:
     return f"maafw-project:{project_id}@{version}"
 
@@ -1720,6 +2073,72 @@ def _local_source_path(payload: Mapping[str, Any]) -> str:
     if source is None:
         raise ManagedServiceError("请选择待导入的本地 ZIP 或资源目录")
     return source
+
+
+def _project_python_runtime_request(
+    project: Mapping[str, Any],
+) -> dict[str, str] | None:
+    manifest = project.get("manifest")
+    manifest_data = dict(manifest) if isinstance(manifest, Mapping) else {}
+    runtime = manifest_data.get("runtime")
+    runtime_data = dict(runtime) if isinstance(runtime, Mapping) else {}
+    python = runtime_data.get("python")
+    if python is None:
+        return None
+    if not isinstance(python, Mapping):
+        raise ManagedServiceError(
+            "Project Store manifest runtime.python 必须是 JSON object"
+        )
+    implementation = str(python.get("implementation") or "").strip().casefold()
+    constraint = str(
+        python.get("constraint") or python.get("requires") or ""
+    ).strip()
+    if implementation != "cpython" or not constraint:
+        raise ManagedServiceError(
+            "Project Store manifest runtime.python 缺少受支持的 "
+            "implementation/constraint"
+        )
+    try:
+        normalized_constraint = str(SpecifierSet(constraint))
+    except InvalidSpecifier as exc:
+        raise ManagedServiceError(
+            f"Project Store Python constraint 无效: {constraint}"
+        ) from exc
+    if not normalized_constraint:
+        raise ManagedServiceError("Project Store Python constraint 不能为空")
+    return {
+        "implementation": implementation,
+        "constraint": normalized_constraint,
+    }
+
+
+def _validate_python_constraint(
+    project: Mapping[str, Any],
+    runtime: Mapping[str, Any],
+) -> None:
+    request = _project_python_runtime_request(project)
+    if request is None:
+        return
+    identity = runtime.get("identity")
+    identity_data = dict(identity) if isinstance(identity, Mapping) else {}
+    runtime_abi = str(identity_data.get("pythonAbi") or "").strip().casefold()
+    if not runtime_abi.startswith("cpython:"):
+        raise ManagedServiceError(
+            "共享运行时不是 Project Store 要求的 CPython 解释器"
+        )
+    runtime_version = str(identity_data.get("pythonVersion") or "").strip()
+    try:
+        compatible = Version(runtime_version) in SpecifierSet(request["constraint"])
+    except (InvalidVersion, InvalidSpecifier) as exc:
+        raise ManagedServiceError(
+            "共享运行时缺少可验证的 Python identity.pythonVersion"
+        ) from exc
+    if not compatible:
+        raise ManagedServiceError(
+            "项目 Python 约束与共享运行时不兼容："
+            f"项目要求 {request['constraint']}，运行时为 "
+            f"{runtime_version or 'missing'}。"
+        )
 
 
 def _validate_python_abi(
@@ -1854,9 +2273,17 @@ def _abi_tag_matches(required: str, runtime_abi: str) -> bool:
         return False
     if required in runtime_abi:
         return True
-    # A compact extension tag (cp312) corresponds to cache tag cpython-312.
-    if required.startswith("cp") and required[2:].isdigit():
-        return f"cpython-{required[2:]}" in runtime_abi
+    # Compact wheel/extension tags may include the platform after the Python
+    # ABI (for example cp313-win_amd64). Platform and architecture are checked
+    # independently by _validate_platform_arch; this helper matches the
+    # interpreter ABI family only.
+    compact = re.fullmatch(r"cp(?P<digits>\d{2,3})(?:-.+)?", required)
+    if compact is not None:
+        digits = compact.group("digits")
+        return (
+            f"cpython-{digits}" in runtime_abi
+            or f"cp{digits}" in runtime_abi
+        )
     if required.startswith("cpython-"):
         parts = required.split("-", 2)
         if len(parts) >= 2 and parts[1].isdigit():

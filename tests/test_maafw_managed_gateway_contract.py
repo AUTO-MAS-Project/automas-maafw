@@ -4,12 +4,15 @@ import asyncio
 import importlib.util
 import json
 import os
+import platform
 import sys
+import sysconfig
 import tempfile
 import threading
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,6 +29,7 @@ for source_root in reversed(SOURCE_ROOTS):
 
 from automas_maafw_project_store import MaaFWProjectStoreService  # noqa: E402
 from automas_maafw_runtime_pool import MaaFWRuntimePoolService  # noqa: E402
+from automas_maafw_runtime_pool import pool as runtime_pool  # noqa: E402
 
 
 def _load_managed_services_module():
@@ -55,6 +59,14 @@ class MaaFWManagedGatewayContractTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.temp_root = Path(self.temporary_directory.name)
+        self.fake_python_identities: dict[str, dict[str, str]] = {}
+        self.real_python_probe = runtime_pool.probe_python_identity
+        self.python_probe_patch = mock.patch.object(
+            runtime_pool,
+            "probe_python_identity",
+            side_effect=self._probe_fake_python,
+        )
+        self.python_probe_patch.start()
         self.source = self.temp_root / "release"
         (self.source / "Bundle").mkdir(parents=True)
         (self.source / "interface.json").write_text(
@@ -94,15 +106,15 @@ class MaaFWManagedGatewayContractTest(unittest.TestCase):
         )
 
     def tearDown(self) -> None:
+        self.python_probe_patch.stop()
         self.temporary_directory.cleanup()
 
-    @staticmethod
     def _fake_installer(
+        self,
         environment_path: Path,
         requirements: tuple[str, ...] | list[str],
         identity: dict[str, Any],
     ) -> dict[str, Any]:
-        del identity
         scripts_dir = environment_path / (
             "Scripts" if os.name == "nt" else "bin"
         )
@@ -111,6 +123,17 @@ class MaaFWManagedGatewayContractTest(unittest.TestCase):
             "python.exe" if os.name == "nt" else "python"
         )
         python_executable.write_text("fake runtime", encoding="utf-8")
+        implementation, cache_tag, soabi = str(identity["pythonAbi"]).split(":", 2)
+        version = str(identity["pythonVersion"])
+        self.fake_python_identities[self._runtime_key(python_executable)] = {
+            "implementation": implementation,
+            "cacheTag": cache_tag,
+            "soabi": soabi,
+            "version": version,
+            "shortVersion": ".".join(version.split(".")[:2]),
+            "platform": str(identity["platform"]),
+            "architecture": str(identity["architecture"]),
+        }
         maafw_version = next(
             (
                 requirement.split("==", 1)[1]
@@ -123,6 +146,22 @@ class MaaFWManagedGatewayContractTest(unittest.TestCase):
             "pythonExecutable": str(python_executable),
             "maafwVersion": maafw_version,
         }
+
+    def _probe_fake_python(self, python_executable: str | Path) -> dict[str, str]:
+        identity = self.fake_python_identities.get(
+            self._runtime_key(python_executable)
+        )
+        if identity is not None:
+            return dict(identity)
+        return self.real_python_probe(python_executable)
+
+    @staticmethod
+    def _runtime_key(path: str | Path) -> str:
+        prefix = "maafw-runtime-"
+        for part in Path(path).parts:
+            if part.startswith(prefix) and len(part) >= len(prefix) + 24:
+                return part[: len(prefix) + 24]
+        return str(Path(path).resolve())
 
     def test_binding_protects_runtime_until_project_version_is_deleted(self) -> None:
         asyncio.run(self._binding_lifecycle())
@@ -152,6 +191,124 @@ class MaaFWManagedGatewayContractTest(unittest.TestCase):
             self.assertEqual(
                 resolution["runtime"]["poolId"],
                 self.runtime_pool.storage_info()["poolId"],
+            )
+
+        asyncio.run(scenario())
+
+    def test_resolve_execution_uses_immutable_store_selector_not_checkout(
+        self,
+    ) -> None:
+        async def scenario() -> None:
+            (self.source / "requirements.txt").write_text(
+                "requests==2.31.0\n",
+                encoding="utf-8",
+            )
+            self.project_store.import_project(
+                self.source,
+                "demo",
+                "1.0",
+                runtime_constraint="==4.3.0",
+            )
+            checkout = self.project_store.checkout_project(
+                "demo",
+                "1.0",
+                "script-one",
+            )
+            checkout_requirements = Path(checkout["dataPath"]) / "requirements.txt"
+            checkout_requirements.write_text(
+                "requests==99.0.0\ncheckout-only==1.0\n",
+                encoding="utf-8",
+            )
+
+            resolution = await self.gateway.resolve_execution(
+                {
+                    "projectId": "demo",
+                    "version": "1.0",
+                    "scriptId": "script-one",
+                }
+            )
+
+            selector = resolution["runtime"]["selectorRequirements"]
+            self.assertIn("requests==2.31.0", selector)
+            self.assertNotIn("requests==99.0.0", selector)
+            self.assertNotIn("checkout-only==1.0", selector)
+            self.assertEqual(
+                set(resolution["runtimeRequest"]["requirements"]),
+                set(selector),
+            )
+            self.assertEqual(
+                checkout_requirements.read_text(encoding="utf-8"),
+                "requests==99.0.0\ncheckout-only==1.0\n",
+            )
+
+        asyncio.run(scenario())
+
+    def test_resolve_execution_routes_store_python_constraint_to_cp313(self) -> None:
+        interface = json.loads(
+            (self.source / "interface.json").read_text(encoding="utf-8")
+        )
+        interface["runtime"] = {
+            "python": {
+                "implementation": "cpython",
+                "requires": "==3.13.*",
+            }
+        }
+        (self.source / "interface.json").write_text(
+            json.dumps(interface, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        self.project_store.import_project(
+            self.source,
+            "cp313-demo",
+            "1.0",
+            runtime_constraint="==5.12.2",
+        )
+        cp313 = {
+            "implementation": "cpython",
+            "cacheTag": "cpython-313",
+            "soabi": "cp313-win_amd64",
+            "version": "3.13.14",
+            "shortVersion": "3.13",
+            "platform": sysconfig.get_platform() or sys.platform,
+            "architecture": platform.machine() or "unknown",
+        }
+
+        async def scenario() -> None:
+            with (
+                mock.patch.object(
+                    self.runtime_pool.pool,
+                    "resolve_python",
+                    return_value={
+                        "executable": "C:/pool/python/cpython-3.13/python.exe",
+                        "identity": cp313,
+                        "source": "pool-managed",
+                        "constraint": "==3.13.*",
+                    },
+                ),
+                mock.patch.object(
+                    runtime_pool,
+                    "probe_python_identity",
+                    return_value=cp313,
+                ),
+            ):
+                resolution = await self.gateway.resolve_execution(
+                    {
+                        "projectId": "cp313-demo",
+                        "version": "1.0",
+                        "scriptId": "script-cp313",
+                    }
+                )
+
+            self.assertEqual(
+                resolution["runtimeRequest"]["python"],
+                {
+                    "implementation": "cpython",
+                    "constraint": "==3.13.*",
+                },
+            )
+            self.assertEqual(
+                resolution["runtime"]["identity"]["pythonVersion"],
+                "3.13.14",
             )
 
         asyncio.run(scenario())
@@ -702,6 +859,202 @@ class MaaFWManagedGatewayContractTest(unittest.TestCase):
         already_present = asyncio.run(scenario(True))
         self.assertIn(reference, already_present.references)
         self.assertEqual(already_present.remove_calls, 0)
+
+    def test_reversible_bind_restores_store_and_pool_reference_deltas(self) -> None:
+        project_reference = "maafw-project:demo@1.0"
+        script_reference = "maafw-script:script-one"
+
+        class ProjectStore:
+            def __init__(self) -> None:
+                self.binding: dict[str, Any] | None = {
+                    "runtimeId": "runtime-old",
+                    "poolId": "pool-one",
+                }
+                self.references = {"external-project-reference"}
+
+            def resolve_project(self, project_id, version, *, touch=True):
+                del touch
+                return {
+                    "projectId": project_id,
+                    "version": version,
+                    "dataPath": "C:/store/demo/1.0",
+                    "manifest": {
+                        "runtime": {
+                            "binding": (
+                                dict(self.binding)
+                                if self.binding is not None
+                                else None
+                            ),
+                            "references": sorted(self.references),
+                        }
+                    },
+                }
+
+            def bind_runtime(
+                self,
+                _project_id,
+                _version,
+                *,
+                binding=None,
+                reference=None,
+                touch=True,
+            ):
+                del touch
+                if binding is not None:
+                    self.binding = dict(binding)
+                if reference is not None:
+                    self.references.add(reference)
+                return self.resolve_project("demo", "1.0")
+
+            def release_runtime(
+                self,
+                _project_id,
+                _version,
+                *,
+                reference=None,
+                clear_binding=False,
+            ):
+                if reference is not None:
+                    self.references.discard(reference)
+                if clear_binding:
+                    self.binding = None
+                return self.resolve_project("demo", "1.0")
+
+        class RuntimePool:
+            def __init__(self) -> None:
+                self.references = {
+                    "runtime-old": {
+                        project_reference,
+                        "external-old-reference",
+                    },
+                    "runtime-new": {"external-new-reference"},
+                }
+
+            def resolve_runtime(self, request):
+                runtime_id = request["runtimeId"]
+                return {
+                    "runtimeId": runtime_id,
+                    "pythonExecutable": "C:/runtime/python.exe",
+                    "references": sorted(self.references[runtime_id]),
+                }
+
+            def add_reference(self, runtime_id, value):
+                self.references[runtime_id].add(value)
+                return self.resolve_runtime({"runtimeId": runtime_id})
+
+            def remove_reference(self, runtime_id, value):
+                self.references[runtime_id].discard(value)
+                return self.resolve_runtime({"runtimeId": runtime_id})
+
+        async def scenario():
+            project_store = ProjectStore()
+            runtime_pool = RuntimePool()
+            gateway = ManagedServiceGateway(project_store, runtime_pool)
+            committed = await gateway.bind_project_runtime_reversible(
+                "demo",
+                "1.0",
+                {
+                    "runtimeId": "runtime-new",
+                    "poolId": "pool-one",
+                    "pythonExecutable": "C:/runtime/python.exe",
+                },
+                project_reference=script_reference,
+            )
+            self.assertEqual(
+                project_store.binding["runtimeId"],
+                "runtime-new",
+            )
+            self.assertIn(script_reference, project_store.references)
+            self.assertIn(
+                project_reference,
+                runtime_pool.references["runtime-new"],
+            )
+            self.assertNotIn(
+                project_reference,
+                runtime_pool.references["runtime-old"],
+            )
+
+            restored = await gateway.rollback_project_runtime_binding(
+                committed["rollback"]
+            )
+            return project_store, runtime_pool, restored
+
+        project_store, runtime_pool, restored = asyncio.run(scenario())
+        self.assertTrue(restored["restored"])
+        self.assertEqual(
+            project_store.binding,
+            {"runtimeId": "runtime-old", "poolId": "pool-one"},
+        )
+        self.assertEqual(
+            project_store.references,
+            {"external-project-reference"},
+        )
+        self.assertEqual(
+            runtime_pool.references["runtime-old"],
+            {project_reference, "external-old-reference"},
+        )
+        self.assertEqual(
+            runtime_pool.references["runtime-new"],
+            {"external-new-reference"},
+        )
+
+    def test_reversible_first_bind_clears_binding_and_new_references(self) -> None:
+        async def scenario() -> None:
+            self.project_store.import_project(
+                self.source,
+                "demo",
+                "1.0",
+                runtime_constraint="==4.3.0",
+                activate=True,
+            )
+            resolution = await self.gateway.resolve_execution(
+                {
+                    "projectId": "demo",
+                    "version": "1.0",
+                    "scriptId": "script-first-bind",
+                    "deferRuntimeBinding": True,
+                }
+            )
+            runtime = resolution["runtime"]
+            committed = await self.gateway.bind_project_runtime_reversible(
+                "demo",
+                "1.0",
+                runtime,
+                project_reference="maafw-script:script-first-bind",
+            )
+            self.assertEqual(
+                committed["project"]["manifest"]["runtime"]["binding"][
+                    "runtimeId"
+                ],
+                runtime["runtimeId"],
+            )
+
+            await self.gateway.rollback_project_runtime_binding(
+                committed["rollback"]
+            )
+            restored_project = await self.gateway.resolve_project(
+                "demo",
+                "1.0",
+            )
+            restored_runtime = await self.gateway.resolve_runtime(
+                {"runtimeId": runtime["runtimeId"], "touch": False}
+            )
+            self.assertIsNone(
+                restored_project["manifest"]["runtime"].get("binding")
+            )
+            self.assertNotIn(
+                "maafw-script:script-first-bind",
+                restored_project["manifest"]["runtime"].get(
+                    "references",
+                    [],
+                ),
+            )
+            self.assertNotIn(
+                "maafw-project:demo@1.0",
+                restored_runtime["references"],
+            )
+
+        asyncio.run(scenario())
 
 
 class MaaFWManagedGatewayEventLoopContractTest(unittest.TestCase):
