@@ -22,6 +22,7 @@ _RESOLUTION_KEY = "maafw_managed_resolution"
 _GATEWAY_KEY = "maafw_managed_gateway"
 _LEASE_KEY = "maafw_managed_runtime_lease"
 _PROJECT_LEASE_KEY = "maafw_managed_project_lease"
+_CHECKOUT_LEASE_KEY = "maafw_managed_checkout_lease"
 _POLICY_KEY = "maafw_managed_gc_policy"
 _MINIMUM_LEASE_TTL_SECONDS = 24 * 60 * 60
 _UPGRADE_BLOCKING_STATES = {
@@ -55,6 +56,7 @@ class MaaFWManagedAdapterHooks(MaaFWAdapterHooks):
                 resolution = await self._resolve_and_inject(runtime)
                 await self._acquire_runtime_lease(runtime, resolution)
                 await self._acquire_project_lease(runtime, resolution)
+                await self._acquire_checkout_lease(runtime, resolution)
                 await self._bind_project_runtime(runtime, resolution)
                 await super().prepare(runtime)
 
@@ -98,12 +100,14 @@ class MaaFWManagedAdapterHooks(MaaFWAdapterHooks):
             await super().finalize(runtime)
         finally:
             async with self._gateway(runtime).resource_transaction():
+                await self._release_checkout_lease(runtime)
                 await self._release_project_lease(runtime)
                 await self._release_runtime_lease(runtime)
                 await self._auto_collect_garbage(runtime)
 
     async def on_crash(self, runtime: ScriptAdapterRuntime, error: Exception) -> None:
         async with self._gateway(runtime).resource_transaction():
+            await self._release_checkout_lease(runtime)
             await self._release_project_lease(runtime)
             await self._release_runtime_lease(runtime)
         await super().on_crash(runtime, error)
@@ -130,6 +134,9 @@ class MaaFWManagedAdapterHooks(MaaFWAdapterHooks):
             "channel": managed.get("Channel"),
             "runtimeConstraint": managed.get("RuntimeConstraint"),
             "projectReference": _script_reference(runtime),
+            "scriptId": _script_id(runtime),
+            "expectedStoreId": managed.get("StoreId"),
+            "expectedProjectManifest": managed.get("ProjectManifest"),
         }
         gateway = self._gateway(runtime)
         resolution = await gateway.resolve_execution(request)
@@ -149,6 +156,11 @@ class MaaFWManagedAdapterHooks(MaaFWAdapterHooks):
                 "Managed": {
                     "ImportProjectId": "",
                     "ProjectId": project_id,
+                    "StoreId": str(project.get("storeId") or ""),
+                    "RunRootId": str(
+                        _mapping(resolution.get("checkout")).get("runRootId")
+                        or ""
+                    ),
                     "Version": version,
                     "RuntimeConstraint": resolution.get("runtimeConstraint") or "",
                     "Status": f"就绪 · {project_label} · {runtime_id}",
@@ -156,6 +168,7 @@ class MaaFWManagedAdapterHooks(MaaFWAdapterHooks):
                 },
                 "ManagedRuntime": {
                     "RuntimeId": runtime_id,
+                    "PoolId": str(runtime_binding.get("poolId") or ""),
                     "PythonExecutable": str(
                         runtime_binding.get("pythonExecutable") or ""
                     ),
@@ -200,24 +213,34 @@ class MaaFWManagedAdapterHooks(MaaFWAdapterHooks):
             raise ManagedServiceError("运行时绑定缺少 runtimeId")
         lease_id = f"maafw-managed-run-{uuid.uuid4().hex}"
         owner = _runtime_owner(runtime)
-        await self._gateway(runtime).acquire_runtime_lease(
-            runtime_id,
-            lease_id,
-            owner=owner,
-            ttl_seconds=max(
-                float(_MINIMUM_LEASE_TTL_SECONDS),
-                float(
-                    _mapping(runtime.extra.get(_POLICY_KEY)).get(
-                        "leaseTtlSeconds",
-                        _MINIMUM_LEASE_TTL_SECONDS,
-                    )
-                ),
-            ),
-        )
-        runtime.extra[_LEASE_KEY] = {
+        intent = {
             "runtimeId": runtime_id,
             "leaseId": lease_id,
         }
+        # Register the intent before crossing the service boundary.  A sync
+        # service mutation may commit in its worker thread and then re-raise a
+        # pending cancellation; finalize still needs the exact lease id in that
+        # case.
+        runtime.extra[_LEASE_KEY] = intent
+        try:
+            await self._gateway(runtime).acquire_runtime_lease(
+                runtime_id,
+                lease_id,
+                owner=owner,
+                ttl_seconds=max(
+                    float(_MINIMUM_LEASE_TTL_SECONDS),
+                    float(
+                        _mapping(runtime.extra.get(_POLICY_KEY)).get(
+                            "leaseTtlSeconds",
+                            _MINIMUM_LEASE_TTL_SECONDS,
+                        )
+                    ),
+                ),
+            )
+        except BaseException:
+            # release_lease is idempotent when the acquire did not commit.
+            await self._release_runtime_lease(runtime)
+            raise
 
     async def _acquire_project_lease(
         self,
@@ -246,18 +269,23 @@ class MaaFWManagedAdapterHooks(MaaFWAdapterHooks):
                 )
             ),
         )
-        await self._gateway(runtime).acquire_project_lease(
-            project_id,
-            version,
-            lease_id,
-            owner=_runtime_owner(runtime),
-            ttl_seconds=ttl_seconds,
-        )
-        runtime.extra[_PROJECT_LEASE_KEY] = {
+        intent = {
             "projectId": project_id,
             "version": version,
             "leaseId": lease_id,
         }
+        runtime.extra[_PROJECT_LEASE_KEY] = intent
+        try:
+            await self._gateway(runtime).acquire_project_lease(
+                project_id,
+                version,
+                lease_id,
+                owner=_runtime_owner(runtime),
+                ttl_seconds=ttl_seconds,
+            )
+        except BaseException:
+            await self._release_project_lease(runtime)
+            raise
 
     async def _bind_project_runtime(
         self,
@@ -286,8 +314,74 @@ class MaaFWManagedAdapterHooks(MaaFWAdapterHooks):
             }
         )
 
+    async def _acquire_checkout_lease(
+        self,
+        runtime: ScriptAdapterRuntime,
+        resolution: Mapping[str, Any],
+    ) -> None:
+        if runtime.extra.get(_CHECKOUT_LEASE_KEY):
+            return
+        checkout = _mapping(resolution.get("checkout"))
+        runtime_lease = runtime.extra.get(_LEASE_KEY)
+        checkout_id = str(checkout.get("checkoutId") or "").strip()
+        script_id = _script_id(runtime)
+        lease_id = (
+            str(runtime_lease.get("leaseId") or "")
+            if isinstance(runtime_lease, Mapping)
+            else ""
+        )
+        if not checkout_id or not lease_id:
+            raise ManagedServiceError("checkout lease 缺少 checkoutId 或 leaseId")
+        ttl_seconds = max(
+            float(_MINIMUM_LEASE_TTL_SECONDS),
+            float(
+                _mapping(runtime.extra.get(_POLICY_KEY)).get(
+                    "leaseTtlSeconds",
+                    _MINIMUM_LEASE_TTL_SECONDS,
+                )
+            ),
+        )
+        intent = {
+            "checkoutId": checkout_id,
+            "scriptId": script_id,
+            "leaseId": lease_id,
+        }
+        runtime.extra[_CHECKOUT_LEASE_KEY] = intent
+        try:
+            await self._gateway(runtime).acquire_checkout_lease(
+                checkout_id,
+                script_id,
+                lease_id,
+                owner=_runtime_owner(runtime),
+                ttl_seconds=ttl_seconds,
+            )
+        except BaseException:
+            await self._release_checkout_lease(runtime)
+            raise
+
+    async def _release_checkout_lease(self, runtime: ScriptAdapterRuntime) -> None:
+        lease = runtime.extra.get(_CHECKOUT_LEASE_KEY)
+        if not isinstance(lease, Mapping):
+            return
+        checkout_id = str(lease.get("checkoutId") or "")
+        script_id = str(lease.get("scriptId") or "")
+        lease_id = str(lease.get("leaseId") or "")
+        if not checkout_id or not script_id or not lease_id:
+            return
+        try:
+            await self._gateway(runtime).release_checkout_lease(
+                checkout_id,
+                script_id,
+                lease_id,
+            )
+        except ManagedServiceError as exc:
+            self._emit_log(runtime, f"释放 MaaFW checkout lease 失败：{exc}")
+            return
+        if runtime.extra.get(_CHECKOUT_LEASE_KEY) is lease:
+            runtime.extra.pop(_CHECKOUT_LEASE_KEY, None)
+
     async def _release_project_lease(self, runtime: ScriptAdapterRuntime) -> None:
-        lease = runtime.extra.pop(_PROJECT_LEASE_KEY, None)
+        lease = runtime.extra.get(_PROJECT_LEASE_KEY)
         if not isinstance(lease, Mapping):
             return
         project_id = str(lease.get("projectId") or "")
@@ -303,9 +397,12 @@ class MaaFWManagedAdapterHooks(MaaFWAdapterHooks):
             )
         except ManagedServiceError as exc:
             self._emit_log(runtime, f"释放 MaaFW 项目 lease 失败：{exc}")
+            return
+        if runtime.extra.get(_PROJECT_LEASE_KEY) is lease:
+            runtime.extra.pop(_PROJECT_LEASE_KEY, None)
 
     async def _release_runtime_lease(self, runtime: ScriptAdapterRuntime) -> None:
-        lease = runtime.extra.pop(_LEASE_KEY, None)
+        lease = runtime.extra.get(_LEASE_KEY)
         if not isinstance(lease, Mapping):
             return
         runtime_id = str(lease.get("runtimeId") or "")
@@ -316,6 +413,9 @@ class MaaFWManagedAdapterHooks(MaaFWAdapterHooks):
             await self._gateway(runtime).release_runtime_lease(runtime_id, lease_id)
         except ManagedServiceError as exc:
             self._emit_log(runtime, f"释放共享 MaaFW 运行时 lease 失败：{exc}")
+            return
+        if runtime.extra.get(_LEASE_KEY) is lease:
+            runtime.extra.pop(_LEASE_KEY, None)
 
     async def _auto_collect_garbage(self, runtime: ScriptAdapterRuntime) -> None:
         policy = runtime.extra.get(_POLICY_KEY)

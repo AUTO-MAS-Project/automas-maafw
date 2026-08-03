@@ -20,14 +20,27 @@ inspection, import, commit and compensation, and fails fast while that path is
 running, preparing or updating.
 
 The adapter resolves an immutable Project Store version, routes it to a shared
-runtime selector, persists the exact runtime binding, and delegates execution
-to the existing MaaFW runner. Its declarative actions accept a local project
+runtime selector, materializes a per-script writable checkout under the
+configured RunRoot, persists the Store/runtime identities, and delegates
+execution to the existing MaaFW runner. The immutable Store payload is never a
+runtime working directory. Its declarative actions accept a local project
 folder or ZIP for import/upgrade, or discover and download an installable
 MirrorChyan/GitHub Release candidate through `maafw.project_update.v1`.
 Remote archives are validated without overwriting the active project, then
 passed to Project Store through the same immutable import and confirmation
 workflow. Actions also cover capability inspection, version listing/switching,
 project/runtime deletion, pinning and garbage collection.
+
+The downloaded ZIP is request-scoped staging, not a durable project resource.
+After Project Store import/upgrade-plan persistence and the host config
+transaction both succeed, Managed asks Project Update 0.2.2 to release the
+exact content-addressed package. Apply, cancel and restart recovery use only
+the immutable Store version and never need the ZIP. `LastDownload` retains
+source/version/size/SHA256 plus an explicit `retained` cleanup result, but no
+local staging path; remote imports also never persist that transient path as
+`Managed.SourceArchive`. A cleanup failure is warned and reported as
+`retained=true` without changing a completed resource import into failure.
+Locally selected ZIP paths keep their existing persistence behavior.
 
 When `features.operationProgress=true`, every mutating manager action accepts a
 fresh `progressId`. `POST /plugin/maafw-managed/progress` polls the bounded
@@ -41,11 +54,27 @@ inner operation (including commit/compensation) has really finished. Progress
 then records that real result—so a mutation that completed remains `success`—
 before `CancelledError` is re-raised to the caller.
 
+`POST /plugin/maafw-managed/operations/active` is the authoritative same-script
+operation lookup. It returns a server epoch and the currently registered
+operation; all mutations and remote checks are excluded by `scriptId`, and
+plugin shutdown drains registered work before releasing the active slot.
+Browser session storage is only a compatibility hint for older hosts.
+
 `ImportProjectId` is a first-import input only and is cleared after a successful
 bind. The displayed `ProjectId` and `Version` are read-only. Once bound,
 execution, upgrade validation, runtime installation and reference
 reconciliation use the immutable Project Store manifest identity rather than
 editable form data.
+
+`POST /plugin/maafw-managed/inventory` requires no script context and reports
+the configured Store, RunRoot and Runtime Pool identities plus every project,
+version, checkout, runtime, reference, pin and lease. Corrupt entries are
+returned as explicit errors and make the snapshot incomplete. This endpoint is
+read-only; deletion still requires a selected Managed script and a complete
+preflight inventory. Project Store `Root`/`RunRoot` and Runtime Pool `Root` are
+configured on their plugin instances as absolute paths; changing them does not
+migrate data, and a stored `StoreId` prevents accidental reuse of a same-name
+project from another root.
 
 Task, user and pack-owned configuration stays outside the immutable resource
 tree. A local upgrade imports the candidate as an inactive version, then asks
@@ -71,7 +100,7 @@ or runtime bind cannot lose its new reference before the matching script config
 is durable. Import, stage, apply, cancel, delete and runtime installation use
 resource-lifecycle → per-script upgrade → host-config ordering; destructive GC
 holds the host's global config write gate from snapshot through collection.
-Managed 0.2.0 requires this Project Store 0.2.0 capability and fails closed
+Managed 0.2.1 requires this Project Store 0.2.1 capability and fails closed
 instead of falling back to an unlocked older service.
 
 It also requires an AUTO-MAS host that provides
@@ -91,5 +120,10 @@ exact retry reuses the artifact but a changed target cannot do so accidentally.
 Failures known to be pre-commit release the project reference; uncertain commit
 states retain the reference for idempotent recovery. Hosts without both
 conversion methods report `inPlaceConversion=false` and the convert action fails
-closed. Do not enable or publish Managed 0.2.0 before these host transaction and
+closed. Do not enable or publish Managed 0.2.1 before these host transaction and
 conversion changes are merged.
+
+MirrorChyan uses an explicit per-script CDK when provided and otherwise inherits
+the host's global update CDK. GitHub never reads that value. Secret-bearing
+fields and signed download URLs are redacted from HTTP responses, progress,
+logs and persisted discovery/import payloads.

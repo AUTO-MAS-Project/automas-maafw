@@ -6,6 +6,7 @@ import inspect
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import asdict, is_dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -69,7 +70,30 @@ class ManagedServiceGateway:
         project_id = _required_text(request, "projectId", "项目 ID")
         requested_version = _optional_text(request.get("version"))
         project = await self.resolve_project(project_id, requested_version)
-        project_path = _project_path(project)
+        _validate_project_store_binding(request, project)
+        script_id = _optional_text(request.get("scriptId"))
+        if not callable(getattr(self.project_store, "checkout_project", None)):
+            raise ManagedServiceError(
+                "当前 Project Store 不支持隔离拆壳运行；"
+                "拒绝把不可变 Store payload 直接作为执行目录。"
+            )
+        if not script_id:
+            raise ManagedServiceError(
+                "解析 MaaFW 执行环境时必须提供稳定 scriptId；"
+                "拒绝回落到不可变 Store 目录。"
+            )
+        checkout = await self.checkout_project(
+            project_id,
+            str(project.get("version") or requested_version or "") or None,
+            script_id,
+        )
+        project_path = _project_path(checkout)
+        for field, label in (
+            ("runRootId", "RunRoot 身份"),
+            ("payloadHash", "Store payload 哈希"),
+        ):
+            if not _optional_text(checkout.get(field)):
+                raise ManagedServiceError(f"Project Store checkout 缺少{label}")
 
         constraint = (
             _optional_text(request.get("runtimeConstraint"))
@@ -96,6 +120,8 @@ class ManagedServiceGateway:
                 "version": str(project.get("version") or requested_version or ""),
                 "channel": _optional_text(request.get("channel")),
                 "projectPath": project_path,
+                "storeId": _optional_text(project.get("storeId")),
+                "runRootId": _optional_text(checkout.get("runRootId")),
             },
         }
         if requirements:
@@ -162,6 +188,11 @@ class ManagedServiceGateway:
             "projectPath": project_path,
             "runtimeConstraint": constraint or "",
             "runtimeRequest": runtime_request,
+            "checkout": checkout,
+            "projectCheckout": {
+                "available": True,
+                "used": True,
+            },
         }
 
     async def resolve_project(
@@ -188,6 +219,38 @@ class ManagedServiceGateway:
         project = _as_dict(value, "project_store resolve")
         _project_path(project)
         return project
+
+    async def checkout_project(
+        self,
+        project_id: str,
+        version: str | None,
+        script_id: str,
+    ) -> dict[str, Any]:
+        value = await _call_variants(
+            self.project_store,
+            ("checkout_project",),
+            (
+                ((project_id, version, script_id), {}),
+                (
+                    (project_id, version),
+                    {"script_id": script_id},
+                ),
+                (
+                    (
+                        {
+                            "projectId": project_id,
+                            "version": version,
+                            "scriptId": script_id,
+                        },
+                    ),
+                    {},
+                ),
+            ),
+            operation="准备 MaaFW 脱壳运行目录",
+        )
+        checkout = _as_dict(value, "project_store checkout")
+        _project_path(checkout)
+        return checkout
 
     async def resolve_runtime(
         self,
@@ -267,6 +330,196 @@ class ManagedServiceGateway:
         )
         return _as_dict_list(value, "project_store list projects")
 
+    async def project_storage_info(self) -> dict[str, Any]:
+        return await self._storage_info(self.project_store, "Project Store")
+
+    async def runtime_storage_info(self) -> dict[str, Any]:
+        return await self._storage_info(self.runtime_pool, "Runtime Pool")
+
+    async def global_inventory(
+        self,
+        script_records: Sequence[Any],
+    ) -> dict[str, Any]:
+        """Return an authoritative resource inventory without a script context.
+
+        A fail-closed inventory is taken before reference reconciliation.  A
+        damaged Store or Pool therefore remains observable through ``errors``
+        without allowing reconciliation to write against an incomplete view.
+        When the initial snapshot is complete, MAS-owned references are
+        reconciled and the returned inventory is refreshed.  External
+        references are preserved by the reconciliation methods.
+        """
+
+        project_inventory = await self._resource_inventory(
+            self.project_store,
+            "Project Store",
+            self.list_projects,
+        )
+        runtime_inventory = await self._resource_inventory(
+            self.runtime_pool,
+            "Runtime Pool",
+            self.list_runtimes,
+        )
+        inventory_errors = [
+            *project_inventory["errors"],
+            *runtime_inventory["errors"],
+        ]
+        project_reconciliation: dict[str, Any] = {
+            "skipped": True,
+            "reason": "资源盘点不完整，未修改项目引用",
+        }
+        runtime_reconciliation: dict[str, Any] = {
+            "skipped": True,
+            "reason": "资源盘点不完整，未修改运行时引用",
+        }
+        if (
+            project_inventory["complete"]
+            and runtime_inventory["complete"]
+            and not inventory_errors
+        ):
+            try:
+                project_reconciliation = await self.reconcile_project_references(
+                    script_records
+                )
+                runtime_reconciliation = await self.reconcile_runtime_references()
+                project_inventory = await self._resource_inventory(
+                    self.project_store,
+                    "Project Store",
+                    self.list_projects,
+                )
+                runtime_inventory = await self._resource_inventory(
+                    self.runtime_pool,
+                    "Runtime Pool",
+                    self.list_runtimes,
+                )
+                inventory_errors = [
+                    *project_inventory["errors"],
+                    *runtime_inventory["errors"],
+                ]
+            except Exception as exc:
+                inventory_errors.append(
+                    {
+                        "scope": "reference-reconciliation",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+                project_reconciliation = {
+                    "skipped": True,
+                    "reason": "项目引用对账失败",
+                }
+                runtime_reconciliation = {
+                    "skipped": True,
+                    "reason": "运行时引用对账未完整完成",
+                }
+
+        projects = project_inventory["items"]
+        versions: list[dict[str, Any]] = []
+        for project in projects:
+            project_id = _optional_text(project.get("projectId"))
+            if not project_id:
+                inventory_errors.append(
+                    {
+                        "scope": "project-store",
+                        "error": "Project Store inventory returned an item without projectId",
+                    }
+                )
+                continue
+            try:
+                versions.extend(await self.list_versions(project_id))
+            except Exception as exc:
+                inventory_errors.append(
+                    {
+                        "scope": f"project:{project_id}",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+        runtimes = runtime_inventory["items"]
+        checkout_inventory = _annotate_checkout_inventory(
+            project_inventory.get("checkouts", []),
+            script_records,
+        )
+        return {
+            "complete": bool(
+                project_inventory["complete"]
+                and runtime_inventory["complete"]
+                and not inventory_errors
+            ),
+            "generatedAt": datetime.now(timezone.utc).isoformat(),
+            "storage": {
+                "projectStore": await self._storage_info(
+                    self.project_store,
+                    "Project Store",
+                ),
+                "runtimePool": await self._storage_info(
+                    self.runtime_pool,
+                    "Runtime Pool",
+                ),
+            },
+            "projects": projects,
+            "versions": versions,
+            "checkouts": checkout_inventory,
+            "runtimes": runtimes,
+            "references": {
+                "scripts": project_reconciliation,
+                "runtimes": runtime_reconciliation,
+            },
+            "errors": inventory_errors,
+        }
+
+    @staticmethod
+    async def _resource_inventory(
+        service: Any,
+        label: str,
+        fallback: Any,
+    ) -> dict[str, Any]:
+        method = getattr(service, "inventory", None)
+        if not callable(method):
+            return {
+                "complete": True,
+                "items": await fallback(),
+                "errors": [],
+                "checkouts": [],
+            }
+        value = await _invoke(method, (), {}, f"盘点 {label}")
+        snapshot = _as_dict(value, f"{label} inventory")
+        items = _as_dict_list(snapshot.get("items"), f"{label} inventory items")
+        raw_errors = snapshot.get("errors")
+        if not isinstance(raw_errors, list):
+            raise ManagedServiceError(f"{label} inventory errors 必须是列表")
+        errors = [
+            dict(item) if isinstance(item, Mapping) else {"error": str(item)}
+            for item in raw_errors
+        ]
+        return {
+            "complete": bool(snapshot.get("complete")) and not errors,
+            "items": items,
+            "errors": errors,
+            "checkouts": _as_dict_list(
+                snapshot.get("checkouts", []),
+                f"{label} inventory checkouts",
+            ),
+        }
+
+    @staticmethod
+    async def _storage_info(service: Any, label: str) -> dict[str, Any]:
+        method = next(
+            (
+                candidate
+                for name in ("storage_info", "get_storage_info")
+                if callable(candidate := getattr(service, name, None))
+            ),
+            None,
+        )
+        if method is None:
+            return {
+                "available": False,
+                "reason": f"{label} 服务版本未提供 storage_info",
+            }
+        value = await _invoke(method, (), {}, f"读取 {label} 存储位置")
+        result = _as_dict(value, f"{label} storage_info")
+        result["available"] = True
+        return result
+
     async def load_interface(self, project_path: str) -> dict[str, Any]:
         if self.interface_service is None:
             raise ManagedServiceError(f"缺少服务 {INTERFACE_SERVICE}")
@@ -334,6 +587,33 @@ class ManagedServiceGateway:
         if not Path(path).is_file():
             raise ManagedServiceError("远程下载服务未返回可读取的本地 ZIP")
         return package
+
+    async def release_remote_package(
+        self,
+        download_root: str | Path,
+        package: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        if self.project_update is None:
+            raise ManagedServiceError(f"缺少服务 {PROJECT_UPDATE_SERVICE}")
+        method = getattr(self.project_update, "release_download_package", None)
+        if not callable(method):
+            raise ManagedServiceError(
+                f"{PROJECT_UPDATE_SERVICE} 未提供 release_download_package；"
+                "临时下载包将保留，请升级 automas-maafw-project-update"
+            )
+        value = await _invoke(
+            method,
+            (Path(download_root), dict(package)),
+            {},
+            "释放 MaaFW 远程临时资源包",
+        )
+        result = _as_dict(
+            value,
+            "maafw.project_update.v1 release_download_package",
+        )
+        if not isinstance(result.get("retained"), bool):
+            raise ManagedServiceError("远程下载释放服务未返回 retained 状态")
+        return result
 
     async def delete_runtime(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         runtime_id = _required_text(payload, "runtimeId", "运行时 ID")
@@ -674,43 +954,90 @@ class ManagedServiceGateway:
         stable_project_reference = _project_script_reference(project_reference)
         previous_project = await self.resolve_project(project_id, resolved_version)
         previous_runtime_id = _manifest_runtime_id(previous_project.get("manifest"))
-        await _call_variants(
-            self.runtime_pool,
-            ("add_reference",),
-            (
-                ((runtime_id, reference), {}),
-                ((({"runtimeId": runtime_id, "reference": reference}),), {}),
-            ),
-            operation="记录 MaaFW 项目运行时引用",
+        target_runtime = await self.resolve_runtime(
+            {"runtimeId": runtime_id, "touch": False}
         )
-        value = await _call_variants(
-            self.project_store,
-            ("bind_runtime", "bind_project_runtime"),
-            (
+        if target_runtime is None:
+            raise ManagedServiceError(
+                f"绑定 MaaFW 项目前无法解析运行时 {runtime_id}"
+            )
+        target_references = target_runtime.get("references")
+        if not isinstance(target_references, Sequence) or isinstance(
+            target_references,
+            (str, bytes, bytearray),
+        ):
+            raise ManagedServiceError(
+                "运行时服务未返回 references 数组；"
+                "无法安全判断项目引用是否由本次绑定创建"
+            )
+        reference_preexisting = reference in {
+            str(item) for item in target_references if str(item)
+        }
+        try:
+            await _call_variants(
+                self.runtime_pool,
+                ("add_reference",),
                 (
-                    (project_id, resolved_version),
-                    {
-                        "binding": dict(binding),
-                        "reference": stable_project_reference,
-                        "touch": True,
-                    },
+                    ((runtime_id, reference), {}),
+                    ((({"runtimeId": runtime_id, "reference": reference}),), {}),
                 ),
+                operation="记录 MaaFW 项目运行时引用",
+            )
+            value = await _call_variants(
+                self.project_store,
+                ("bind_runtime", "bind_project_runtime"),
                 (
                     (
+                        (project_id, resolved_version),
                         {
-                            "projectId": project_id,
-                            "version": resolved_version,
                             "binding": dict(binding),
                             "reference": stable_project_reference,
                             "touch": True,
                         },
                     ),
-                    {},
+                    (
+                        (
+                            {
+                                "projectId": project_id,
+                                "version": resolved_version,
+                                "binding": dict(binding),
+                                "reference": stable_project_reference,
+                                "touch": True,
+                            },
+                        ),
+                        {},
+                    ),
                 ),
-            ),
-            operation="绑定 MaaFW 项目运行时",
-        )
-        result = _as_dict(value, "project_store bind runtime")
+                operation="绑定 MaaFW 项目运行时",
+            )
+            result = _as_dict(value, "project_store bind runtime")
+        except BaseException as exc:
+            # A cancelled sync bind may already have committed in its worker.
+            # Re-read the authoritative project binding before compensating,
+            # and only remove a reference that was absent before this attempt.
+            if not reference_preexisting:
+                try:
+                    current_project = await self.resolve_project(
+                        project_id,
+                        resolved_version,
+                    )
+                    bind_committed = (
+                        _manifest_runtime_id(current_project.get("manifest"))
+                        == runtime_id
+                    )
+                    if not bind_committed:
+                        await _call_variants(
+                            self.runtime_pool,
+                            ("remove_reference",),
+                            (((runtime_id, reference), {}),),
+                            operation="回滚 MaaFW 项目运行时引用",
+                        )
+                except BaseException as cleanup_exc:
+                    exc.add_note(
+                        "MaaFW 项目运行时引用补偿未完成："
+                        f"{type(cleanup_exc).__name__}: {cleanup_exc}"
+                    )
+            raise
         if previous_runtime_id and previous_runtime_id != runtime_id:
             try:
                 await _call_variants(
@@ -787,6 +1114,66 @@ class ManagedServiceGateway:
         )
         return _as_dict(value, "project_store release lease")
 
+    async def acquire_checkout_lease(
+        self,
+        checkout_id: str,
+        script_id: str,
+        lease_id: str,
+        *,
+        owner: str,
+        ttl_seconds: float,
+    ) -> dict[str, Any]:
+        value = await _call_variants(
+            self.project_store,
+            ("acquire_checkout_lease",),
+            (
+                (
+                    (checkout_id, script_id, lease_id),
+                    {"owner": owner, "ttl_seconds": ttl_seconds},
+                ),
+                (
+                    (
+                        {
+                            "checkoutId": checkout_id,
+                            "scriptId": script_id,
+                            "leaseId": lease_id,
+                            "owner": owner,
+                            "ttlSeconds": ttl_seconds,
+                        },
+                    ),
+                    {},
+                ),
+            ),
+            operation="锁定 MaaFW 脱壳运行目录",
+        )
+        return _as_dict(value, "project_store acquire checkout lease")
+
+    async def release_checkout_lease(
+        self,
+        checkout_id: str,
+        script_id: str,
+        lease_id: str,
+    ) -> dict[str, Any]:
+        value = await _call_variants(
+            self.project_store,
+            ("release_checkout_lease",),
+            (
+                ((checkout_id, script_id, lease_id), {}),
+                (
+                    (
+                        {
+                            "checkoutId": checkout_id,
+                            "scriptId": script_id,
+                            "leaseId": lease_id,
+                        },
+                    ),
+                    {},
+                ),
+            ),
+            operation="释放 MaaFW 脱壳运行目录",
+        )
+        return _as_dict(value, "project_store release checkout lease")
+
     async def release_runtime_lease(
         self,
         runtime_id: str,
@@ -814,9 +1201,30 @@ class ManagedServiceGateway:
         keep_latest: int,
         project_id: str | None = None,
         script_records: Sequence[Any] | None = None,
+        active_script_ids: Sequence[str] | None = None,
+        checkout_gc_confirmed: bool = False,
     ) -> dict[str, Any]:
         grace_seconds = max(0, int(grace_days)) * 24 * 60 * 60
         keep = max(0, int(keep_latest))
+        if not dry_run:
+            project_inventory = await self._resource_inventory(
+                self.project_store,
+                "Project Store",
+                self.list_projects,
+            )
+            runtime_inventory = await self._resource_inventory(
+                self.runtime_pool,
+                "Runtime Pool",
+                self.list_runtimes,
+            )
+            if (
+                not project_inventory["complete"]
+                or not runtime_inventory["complete"]
+            ):
+                raise ManagedServiceError(
+                    "资源盘点不完整，拒绝执行真实 GC；"
+                    "请先在统一资源页处理损坏或无法识别的项目、checkout、运行时。"
+                )
         project_kwargs = {
             "dry_run": bool(dry_run),
             "grace_seconds": grace_seconds,
@@ -824,6 +1232,11 @@ class ManagedServiceGateway:
         }
         if project_id:
             project_kwargs["project_id"] = project_id
+        project_kwargs["checkout_context"] = _checkout_gc_context(
+            script_records or [],
+            active_script_ids or [],
+            confirmed=bool(checkout_gc_confirmed and not dry_run),
+        )
         project_reconciliation = None
         if script_records is not None:
             project_reconciliation = await self.reconcile_project_references(
@@ -841,6 +1254,7 @@ class ManagedServiceGateway:
                             "graceSeconds": grace_seconds,
                             "keepLatest": keep,
                             "projectId": project_id,
+                            "checkoutContext": project_kwargs["checkout_context"],
                         },
                     ),
                     {},
@@ -1115,6 +1529,62 @@ def _project_path(project: Mapping[str, Any]) -> str:
     )
 
 
+def _validate_project_store_binding(
+    request: Mapping[str, Any],
+    project: Mapping[str, Any],
+) -> None:
+    """Reject a same-name project resolved from a different configured Store.
+
+    Managed callers provide the stable Store ID.  A legacy binding without the
+    ID may be adopted only when its persisted immutable source identity exactly
+    matches the currently resolved manifest.  Generic gateway callers that do
+    not provide either expectation retain the older service-level contract.
+    """
+
+    expected_store_id = _optional_text(request.get("expectedStoreId"))
+    actual_store_id = _optional_text(project.get("storeId"))
+    binding_context = (
+        "expectedStoreId" in request or "expectedProjectManifest" in request
+    )
+    if expected_store_id:
+        if not actual_store_id or actual_store_id != expected_store_id:
+            raise ManagedServiceError(
+                "当前 Project Store 身份与脚本绑定不一致；"
+                "目录可能已切换，拒绝按同名 projectId/version 继续运行。"
+            )
+        return
+    if not binding_context:
+        return
+    expected_identity = _manifest_source_identity(
+        request.get("expectedProjectManifest")
+    )
+    actual_identity = _manifest_source_identity(project.get("manifest"))
+    if expected_identity is None or actual_identity != expected_identity:
+        raise ManagedServiceError(
+            "脚本缺少可验证的 Project Store 身份，且资源清单来源哈希"
+            "无法与当前 Store 精确匹配；请重新导入或显式转换托管项目。"
+        )
+
+
+def _manifest_source_identity(value: Any) -> tuple[str, str, str] | None:
+    if not isinstance(value, Mapping):
+        return None
+    source = value.get("source")
+    if not isinstance(source, Mapping):
+        return None
+    hash_value = source.get("hash")
+    if not isinstance(hash_value, Mapping):
+        return None
+    algorithm = str(hash_value.get("algorithm") or "").strip().casefold()
+    scope = str(hash_value.get("scope") or "").strip()
+    digest = str(hash_value.get("value") or "").strip().casefold()
+    if algorithm != "sha256" or not scope or len(digest) != 64:
+        return None
+    if any(character not in "0123456789abcdef" for character in digest):
+        return None
+    return algorithm, scope, digest
+
+
 def _manifest_runtime_constraint(value: Any) -> str | None:
     if not isinstance(value, Mapping):
         return None
@@ -1129,6 +1599,83 @@ def _manifest_runtime_constraint(value: Any) -> str | None:
 
 def _manifest_runtime_id(value: Any) -> str | None:
     return _optional_text(_manifest_runtime_binding(value).get("runtimeId"))
+
+
+def _managed_checkout_bindings(
+    script_records: Sequence[Any],
+) -> dict[str, dict[str, str]]:
+    bindings: dict[str, dict[str, str]] = {}
+    for raw_record in script_records:
+        record = dict(raw_record) if isinstance(raw_record, Mapping) else {}
+        if _optional_text(record.get("type")) != "MaaFWManaged":
+            continue
+        script_id = _optional_text(record.get("id"))
+        if not script_id:
+            continue
+        config = record.get("config")
+        config_data = dict(config) if isinstance(config, Mapping) else {}
+        managed = config_data.get("Managed")
+        managed_data = dict(managed) if isinstance(managed, Mapping) else {}
+        project_id, version = managed_project_identity(managed_data)
+        bindings[script_id] = {
+            "projectId": project_id,
+            "version": version,
+        }
+    return bindings
+
+
+def _annotate_checkout_inventory(
+    checkouts: Sequence[Mapping[str, Any]],
+    script_records: Sequence[Any],
+) -> list[dict[str, Any]]:
+    bindings = _managed_checkout_bindings(script_records)
+    result: list[dict[str, Any]] = []
+    for raw_checkout in checkouts:
+        checkout = dict(raw_checkout)
+        script_id = _optional_text(checkout.get("scriptId")) or ""
+        binding = bindings.get(script_id)
+        binding_current = bool(
+            binding is not None
+            and binding.get("projectId")
+            == _optional_text(checkout.get("projectId"))
+            and binding.get("version")
+            == _optional_text(checkout.get("version"))
+        )
+        orphan_reason = None
+        if binding is None:
+            orphan_reason = "managed-script-missing"
+        elif not binding_current:
+            orphan_reason = "script-binding-moved"
+        elif not checkout.get("storeAvailable"):
+            orphan_reason = "store-version-missing"
+        checkout.update(
+            {
+                "scriptAvailable": binding is not None,
+                "bindingCurrent": binding_current,
+                "orphanReason": orphan_reason,
+            }
+        )
+        result.append(checkout)
+    return result
+
+
+def _checkout_gc_context(
+    script_records: Sequence[Any],
+    active_script_ids: Sequence[str],
+    *,
+    confirmed: bool,
+) -> dict[str, Any]:
+    return {
+        "managedBindings": _managed_checkout_bindings(script_records),
+        "activeScriptIds": sorted(
+            {
+                item.strip()
+                for item in active_script_ids
+                if isinstance(item, str) and item.strip()
+            }
+        ),
+        "confirmed": bool(confirmed),
+    }
 
 
 def _manifest_runtime_binding(value: Any) -> dict[str, Any]:

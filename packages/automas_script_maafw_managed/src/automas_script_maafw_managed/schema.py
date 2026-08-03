@@ -63,6 +63,21 @@ PROJECT_GROUP = PluginField.group(
             help="由不可变 Project Store manifest 写入，不能作为导入输入修改。",
         ),
         PluginField.string(
+            "StoreId",
+            "Project Store 身份",
+            "",
+            readonly=True,
+            hidden=True,
+            help="用于阻止目录切换后误绑定同名项目。",
+        ),
+        PluginField.string(
+            "RunRootId",
+            "脱壳运行目录身份",
+            "",
+            readonly=True,
+            hidden=True,
+        ),
+        PluginField.string(
             "Version",
             "当前资源版本",
             "",
@@ -367,6 +382,13 @@ RUNTIME_GROUP = PluginField.group(
     "共享运行时与空间策略",
     [
         PluginField.string("RuntimeId", "运行时 ID", "", readonly=True),
+        PluginField.string(
+            "PoolId",
+            "Runtime Pool 身份",
+            "",
+            readonly=True,
+            hidden=True,
+        ),
         PluginField.string(
             "PythonExecutable",
             "Python 可执行文件",

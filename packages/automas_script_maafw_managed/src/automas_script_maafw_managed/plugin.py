@@ -59,7 +59,7 @@ _USER_PENDING_KIND = "maafw.managed-user-upgrade-pending"
 _CONVERSION_KIND = "maafw.managed-conversion"
 _CONVERSION_API_VERSION = "maafw-managed.v1"
 _DISTRIBUTION_NAME = "automas-script-maafw-managed"
-_DISTRIBUTION_VERSION_FALLBACK = "0.2.0"
+_DISTRIBUTION_VERSION_FALLBACK = "0.2.1"
 _SOURCE_TYPE = "MaaFW"
 _TARGET_TYPE = "MaaFWManaged"
 _PROGRESS_EVENT_TYPE = "maafw.managed.progress"
@@ -82,6 +82,16 @@ _JSON_OBJECT_FIELDS = frozenset(
 )
 
 
+class _ActiveOperationConflict(ManagedServiceError):
+    def __init__(self, active_operation: Mapping[str, Any]) -> None:
+        super().__init__("该脚本已有 MaaFW 托管操作正在执行")
+        self.active_operation = _json_clone(active_operation)
+
+
+class _PluginDrainingError(ManagedServiceError):
+    pass
+
+
 class Plugin(ScriptAdapterPlugin):
     """Declarative adapter for resource-only, versioned MaaFW projects."""
 
@@ -102,8 +112,12 @@ class Plugin(ScriptAdapterPlugin):
         super().__init__(ctx)
         self._upgrade_locks: dict[str, asyncio.Lock] = {}
         self._progress_states: dict[str, dict[str, Any]] = {}
+        self._active_operations: dict[str, str] = {}
         self._progress_lock = asyncio.Lock()
+        self._operation_tasks: set[asyncio.Task[Any]] = set()
         self._progress_tasks: set[asyncio.Task[None]] = set()
+        self._server_epoch = uuid.uuid4().hex
+        self._draining = False
         self._progress_context: ContextVar[dict[str, str] | None] = (
             ContextVar(
                 f"maafw_managed_progress_{id(self)}",
@@ -193,6 +207,16 @@ class Plugin(ScriptAdapterPlugin):
             methods=("POST",),
         )
         self.ctx.server.http(
+            "/maafw-managed/operations/active",
+            self._read_active_operation,
+            methods=("POST",),
+        )
+        self.ctx.server.http(
+            "/maafw-managed/inventory",
+            self._global_inventory,
+            methods=("GET", "POST"),
+        )
+        self.ctx.server.http(
             "/maafw-managed/convert",
             self._convert_project,
             methods=("POST",),
@@ -280,14 +304,84 @@ class Plugin(ScriptAdapterPlugin):
         await self._recover_interrupted_upgrades()
         await self._repair_upgrade_artifacts_on_start()
 
+    async def on_stop(self, reason: str) -> None:
+        cancellation_requested = False
+        current_task = asyncio.current_task()
+        async with self._progress_lock:
+            self._draining = True
+
+        while True:
+            async with self._progress_lock:
+                pending = tuple(
+                    task
+                    for task in self._operation_tasks
+                    if task is not current_task and not task.done()
+                )
+            if not pending:
+                break
+            for task in pending:
+                cancellation_requested = (
+                    await self._wait_for_progress_task(task)
+                    or cancellation_requested
+                )
+
+        await self._flush_progress_updates()
+        await super().on_stop(reason)
+        if cancellation_requested:
+            raise asyncio.CancelledError
+
     async def _capabilities(
         self,
         _request: PluginHttpRequest,
     ) -> dict[str, Any]:
+        data = _managed_capabilities()
+        data["serverEpoch"] = self._server_epoch
         return {
             "code": 200,
             "status": "success",
-            "data": _managed_capabilities(),
+            "data": data,
+        }
+
+    async def _read_active_operation(
+        self,
+        request: PluginHttpRequest,
+    ) -> dict[str, Any]:
+        payload = _payload(request)
+        try:
+            script_id = _required_script_id(payload)
+        except ManagedServiceError as exc:
+            return {
+                "code": 400,
+                "status": "error",
+                "message": str(exc),
+            }
+        async with self._progress_lock:
+            operation_id = self._active_operations.get(script_id)
+            state = (
+                self._progress_states.get(operation_id)
+                if operation_id is not None
+                else None
+            )
+            if (
+                state is None
+                or state.get("scriptId") != script_id
+                or state.get("status") in _PROGRESS_TERMINAL_STATES
+            ):
+                if operation_id is not None:
+                    self._active_operations.pop(script_id, None)
+                active_operation = None
+            else:
+                active_operation = _json_clone(state)
+            draining = self._draining
+        return {
+            "code": 200,
+            "status": "success",
+            "data": {
+                "scriptId": script_id,
+                "serverEpoch": self._server_epoch,
+                "draining": draining,
+                "activeOperation": active_operation,
+            },
         }
 
     async def _read_progress(
@@ -324,6 +418,8 @@ class Plugin(ScriptAdapterPlugin):
         payload: Mapping[str, Any],
         operation: str,
         message: str,
+        *,
+        owner_task: asyncio.Task[Any] | None = None,
     ) -> dict[str, str]:
         script_id = _required_script_id(payload)
         operation_id = _required_progress_id(payload, required=False)
@@ -334,6 +430,7 @@ class Plugin(ScriptAdapterPlugin):
             "operationId": operation_id,
             "scriptId": script_id,
             "operation": operation,
+            "serverEpoch": self._server_epoch,
             "status": "running",
             "stage": "queued",
             "message": message,
@@ -345,15 +442,36 @@ class Plugin(ScriptAdapterPlugin):
             "updatedAt": now,
         }
         async with self._progress_lock:
+            if self._draining:
+                raise _PluginDrainingError(
+                    "MaaFW 托管插件正在停止，暂不接受新的资源操作"
+                )
             if operation_id in self._progress_states:
                 raise ManagedServiceError(
                     "progressId 已被使用；每次操作必须使用新的 progressId"
                 )
+            active_operation_id = self._active_operations.get(script_id)
+            active_state = (
+                self._progress_states.get(active_operation_id)
+                if active_operation_id is not None
+                else None
+            )
+            if (
+                active_state is not None
+                and active_state.get("scriptId") == script_id
+                and active_state.get("status")
+                not in _PROGRESS_TERMINAL_STATES
+            ):
+                raise _ActiveOperationConflict(active_state)
+            if active_operation_id is not None:
+                self._active_operations.pop(script_id, None)
             if len(self._progress_states) >= _PROGRESS_MAX_STATES:
+                active_ids = set(self._active_operations.values())
                 terminal_id = next(
                     (
                         key
                         for key, item in self._progress_states.items()
+                        if key not in active_ids
                         if item.get("status") in _PROGRESS_TERMINAL_STATES
                     ),
                     None,
@@ -364,6 +482,9 @@ class Plugin(ScriptAdapterPlugin):
                     )
                 self._progress_states.pop(terminal_id)
             self._progress_states[operation_id] = state
+            self._active_operations[script_id] = operation_id
+            if owner_task is not None:
+                self._operation_tasks.add(owner_task)
         return {
             "operationId": operation_id,
             "scriptId": script_id,
@@ -401,12 +522,16 @@ class Plugin(ScriptAdapterPlugin):
                 and next_percent < current_percent
             ):
                 return
-            state["stage"] = str(stage or state.get("stage") or "running")
-            if message:
-                state["message"] = message
+            safe_stage = _sanitize_public_message(
+                str(stage or state.get("stage") or "running")
+            )
+            safe_message = _sanitize_public_message(message)
+            state["stage"] = safe_stage
+            if safe_message:
+                state["message"] = safe_message
                 logs = list(state.get("logs") or [])
-                if not logs or logs[-1] != message:
-                    logs.append(message)
+                if not logs or logs[-1] != safe_message:
+                    logs.append(safe_message)
                 state["logs"] = logs[-_PROGRESS_MAX_LOGS:]
             if next_percent is not None:
                 state["percent"] = min(99.0, max(0.0, next_percent))
@@ -433,20 +558,28 @@ class Plugin(ScriptAdapterPlugin):
             if (
                 state is None
                 or state.get("scriptId") != script_id
-                or state.get("status") in _PROGRESS_TERMINAL_STATES
             ):
+                if self._active_operations.get(script_id) == operation_id:
+                    self._active_operations.pop(script_id, None)
+                return
+            if state.get("status") in _PROGRESS_TERMINAL_STATES:
+                if self._active_operations.get(script_id) == operation_id:
+                    self._active_operations.pop(script_id, None)
                 return
             state["status"] = status
             state["stage"] = "completed" if status == "success" else "failed"
-            state["message"] = message
+            safe_message = _sanitize_public_message(message)
+            state["message"] = safe_message
             if status == "success":
                 state["percent"] = 100
             logs = list(state.get("logs") or [])
-            if message and (not logs or logs[-1] != message):
-                logs.append(message)
+            if safe_message and (not logs or logs[-1] != safe_message):
+                logs.append(safe_message)
             state["logs"] = logs[-_PROGRESS_MAX_LOGS:]
             state["updatedAt"] = datetime.now(timezone.utc).isoformat()
             snapshot = _json_clone(state)
+            if self._active_operations.get(script_id) == operation_id:
+                self._active_operations.pop(script_id, None)
         await self._publish_progress(snapshot)
 
     @staticmethod
@@ -542,6 +675,32 @@ class Plugin(ScriptAdapterPlugin):
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
 
+    async def _run_drain_protected(
+        self,
+        operation: Callable[[], Awaitable[Any]],
+    ) -> Any:
+        """Finish a non-progress request before plugin shutdown completes."""
+
+        async with self._progress_lock:
+            if self._draining:
+                raise _PluginDrainingError(
+                    "MaaFW 托管插件正在停止，暂不接受新的资源操作"
+                )
+            operation_task = asyncio.create_task(operation())
+            self._operation_tasks.add(operation_task)
+        cancellation_requested = False
+        try:
+            cancellation_requested = await self._wait_for_progress_task(
+                operation_task
+            )
+            result = operation_task.result()
+        finally:
+            async with self._progress_lock:
+                self._operation_tasks.discard(operation_task)
+        if cancellation_requested:
+            raise asyncio.CancelledError
+        return result
+
     @staticmethod
     async def _wait_for_progress_task(task: asyncio.Task[Any]) -> bool:
         """Wait for a protected operation while remembering request cancellation."""
@@ -565,17 +724,32 @@ class Plugin(ScriptAdapterPlugin):
         initial_message: str,
         operation: Callable[[], Awaitable[Any]],
     ) -> dict[str, Any]:
+        owner_task = asyncio.current_task()
         try:
             progress = await self._begin_progress(
                 payload,
                 operation_name,
                 initial_message,
+                owner_task=owner_task,
             )
+        except _ActiveOperationConflict as exc:
+            return {
+                "code": 409,
+                "status": "error",
+                "message": _sanitize_public_message(str(exc)),
+                "data": {"activeOperation": exc.active_operation},
+            }
+        except _PluginDrainingError as exc:
+            return {
+                "code": 503,
+                "status": "error",
+                "message": _sanitize_public_message(str(exc)),
+            }
         except ManagedServiceError as exc:
             return {
                 "code": 400,
                 "status": "error",
-                "message": str(exc),
+                "message": _sanitize_public_message(str(exc)),
             }
 
         token = self._progress_context.set(progress)
@@ -608,7 +782,7 @@ class Plugin(ScriptAdapterPlugin):
             cancellation_requested = True
         except ManagedServiceError as exc:
             terminal_status = "error"
-            terminal_message = str(exc)
+            terminal_message = _sanitize_public_message(str(exc))
             response = {
                 "code": 400,
                 "status": "error",
@@ -616,7 +790,9 @@ class Plugin(ScriptAdapterPlugin):
             }
         except Exception as exc:
             terminal_status = "error"
-            terminal_message = f"托管 MaaFW 动作执行失败：{exc}"
+            terminal_message = _sanitize_public_message(
+                f"托管 MaaFW 动作执行失败：{exc}"
+            )
             response = {
                 "code": 500,
                 "status": "error",
@@ -639,6 +815,10 @@ class Plugin(ScriptAdapterPlugin):
                 finish_task.result()
             except asyncio.CancelledError:
                 cancellation_requested = True
+            finally:
+                if owner_task is not None:
+                    async with self._progress_lock:
+                        self._operation_tasks.discard(owner_task)
         if cancellation_requested:
             raise asyncio.CancelledError
         return response
@@ -1035,6 +1215,8 @@ class Plugin(ScriptAdapterPlugin):
                 script_id,
                 lambda: self._check_remote_project_locked(script_id, payload),
             ),
+            progress_operation="remote-check",
+            progress_message="正在检查 MaaFW 远程资源版本",
         )
 
     async def _check_remote_project_locked(
@@ -1131,6 +1313,13 @@ class Plugin(ScriptAdapterPlugin):
             progress=self._download_progress_callback(),
         )
         await self._flush_progress_updates()
+        public_download = _public_remote_download(
+            {
+                **downloaded,
+                "retained": True,
+                "cleanupStatus": "pending",
+            }
+        )
         await self._progress_stage(
             "download:validated",
             "远程 MaaFW 资源包已下载并校验",
@@ -1138,7 +1327,11 @@ class Plugin(ScriptAdapterPlugin):
             downloaded_bytes=_progress_int(downloaded.get("size")),
             total_bytes=_progress_int(downloaded.get("size")),
         )
-        imported_payload = dict(payload)
+        imported_payload = {
+            str(key): value
+            for key, value in payload.items()
+            if str(key).strip().casefold() not in _SENSITIVE_REMOTE_KEYS
+        }
         imported_payload.update(
             {
                 "sourcePath": "",
@@ -1157,6 +1350,7 @@ class Plugin(ScriptAdapterPlugin):
                 result = await self._import_initial_project(
                     script_id,
                     imported_payload,
+                    transient_source_archive=True,
                 )
                 status = "远程资源已下载、校验并导入"
             else:
@@ -1170,16 +1364,16 @@ class Plugin(ScriptAdapterPlugin):
                 script_id,
                 _public_remote_discovery(discovery),
                 status=status,
-                downloaded=downloaded,
+                downloaded=public_download,
             )
             await self._progress_stage(
                 "config-persisted",
                 "远程资源状态已写入脚本配置",
                 percent=92,
             )
-            return {**result, "download": downloaded}
+            return {**result, "download": public_download}
 
-        return await self._run_config_transaction(
+        result = await self._run_config_transaction(
             script_id,
             (
                 f"maafw-remote-import:{script_id}"
@@ -1188,6 +1382,18 @@ class Plugin(ScriptAdapterPlugin):
             ),
             persist,
         )
+        cleanup_task = asyncio.create_task(
+            self._release_remote_download(
+                script_id,
+                download_root,
+                downloaded,
+            )
+        )
+        cancellation_requested = await self._wait_for_progress_task(cleanup_task)
+        released_download = cleanup_task.result()
+        if cancellation_requested:
+            raise asyncio.CancelledError
+        return {**result, "download": released_download}
 
     async def _discover_remote_project(
         self,
@@ -1273,17 +1479,116 @@ class Plugin(ScriptAdapterPlugin):
         status: str,
         downloaded: Mapping[str, Any] | None = None,
     ) -> None:
+        public_discovery = _public_remote_discovery(discovery)
         update: dict[str, Any] = {
-            "LatestVersion": str(discovery.get("latestVersion") or ""),
-            "Installable": discovery.get("installable") is True,
-            "Status": status,
-            "Discovery": dict(discovery),
+            "LatestVersion": str(public_discovery.get("latestVersion") or ""),
+            "Installable": public_discovery.get("installable") is True,
+            "Status": _sanitize_public_message(status),
+            "Discovery": public_discovery,
         }
         if downloaded is not None:
-            update["LastDownload"] = dict(downloaded)
+            update["LastDownload"] = _public_remote_download(downloaded)
         await Config.update_script(
             script_id,
             {"ManagedRemote": update},
+        )
+
+    async def _release_remote_download(
+        self,
+        script_id: str,
+        download_root: Path,
+        downloaded: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        await self._progress_stage(
+            "download-cleanup",
+            "资源与配置已持久化，正在释放临时下载包",
+            percent=96,
+        )
+        cleanup_status = "cleanup-failed"
+        retained = True
+        try:
+            released = await self._gateway().release_remote_package(
+                download_root,
+                downloaded,
+            )
+            retained = released.get("retained") is True
+            cleanup_status = (
+                "cleanup-failed"
+                if retained
+                else (
+                    "released"
+                    if released.get("released") is True
+                    else "already-released"
+                )
+            )
+            if retained:
+                self._warn_remote_cleanup(
+                    "MaaFW 远程资源已导入，但临时下载包仍被保留"
+                )
+        except Exception as exc:
+            self._warn_remote_cleanup(
+                "MaaFW 远程资源已导入，但释放临时下载包失败："
+                f"{_sanitize_public_message(str(exc))}"
+            )
+
+        public_download = _public_remote_download(
+            {
+                **downloaded,
+                "retained": retained,
+                "cleanupStatus": cleanup_status,
+            }
+        )
+
+        async def persist_cleanup_status() -> dict[str, Any]:
+            await self._persist_remote_download_status(
+                script_id,
+                public_download,
+            )
+            return public_download
+
+        try:
+            await self._run_config_transaction(
+                script_id,
+                f"maafw-remote-cleanup-status:{script_id}",
+                persist_cleanup_status,
+            )
+        except Exception as exc:
+            self._warn_remote_cleanup(
+                "MaaFW 临时下载包状态回写失败，资源导入结果保持成功："
+                f"{_sanitize_public_message(str(exc))}"
+            )
+
+        await self._progress_stage(
+            "download-retained" if retained else "download-released",
+            (
+                "远程资源已导入；临时下载包清理失败并已保留"
+                if retained
+                else "远程资源已导入，临时下载包已释放"
+            ),
+            percent=98,
+        )
+        return public_download
+
+    def _warn_remote_cleanup(self, message: str) -> None:
+        """Never let best-effort cleanup telemetry change a committed result."""
+
+        try:
+            self.ctx.logger.warning(message)
+        except Exception:
+            pass
+
+    @staticmethod
+    async def _persist_remote_download_status(
+        script_id: str,
+        downloaded: Mapping[str, Any],
+    ) -> None:
+        await Config.update_script(
+            script_id,
+            {
+                "ManagedRemote": {
+                    "LastDownload": _public_remote_download(downloaded),
+                }
+            },
         )
 
     async def _import_project(self, request: PluginHttpRequest) -> dict[str, Any]:
@@ -1429,6 +1734,8 @@ class Plugin(ScriptAdapterPlugin):
         self,
         script_id: str,
         payload: Mapping[str, Any],
+        *,
+        transient_source_archive: bool = False,
     ) -> dict[str, Any]:
         await self._progress_stage(
             "import-validation",
@@ -1474,10 +1781,13 @@ class Plugin(ScriptAdapterPlugin):
                 "正在写入项目绑定与可用版本",
                 percent=80,
             )
+            persisted_payload = dict(payload)
+            if transient_source_archive:
+                persisted_payload["sourceArchive"] = ""
             await self._persist_project(
                 script_id,
                 result,
-                payload,
+                persisted_payload,
                 status="资源版本已导入并激活",
             )
         except Exception:
@@ -2451,6 +2761,19 @@ class Plugin(ScriptAdapterPlugin):
             ),
         )
 
+    async def _global_inventory(
+        self,
+        _request: PluginHttpRequest,
+    ) -> dict[str, Any]:
+        async def snapshot() -> dict[str, Any]:
+            gateway = self._gateway()
+            async with gateway.resource_transaction():
+                async with Config.script_config_write_scope(None):
+                    records = await _managed_script_record_dtos()
+                    return await gateway.global_inventory(records)
+
+        return await self._respond(snapshot)
+
     async def _delete_version(self, request: PluginHttpRequest) -> dict[str, Any]:
         payload = _payload(request)
         return await self._respond_for_script(
@@ -2541,7 +2864,7 @@ class Plugin(ScriptAdapterPlugin):
         payload = _payload(request)
         dry_run = _as_bool(payload.get("dryRun"), True)
 
-        async def collect(_script_id: str) -> dict[str, Any]:
+        async def collect(script_id: str) -> dict[str, Any]:
             if (
                 not dry_run
                 and str(payload.get("confirmation") or "")
@@ -2553,6 +2876,7 @@ class Plugin(ScriptAdapterPlugin):
             return await self._collect_garbage_with_script_references(
                 payload,
                 dry_run=dry_run,
+                requesting_script_id=script_id,
             )
 
         return await self._respond_for_script(
@@ -2585,6 +2909,7 @@ class Plugin(ScriptAdapterPlugin):
     ) -> dict[str, Any]:
         request = dict(payload)
         request["projectReference"] = f"maafw-script:{script_id}"
+        request["scriptId"] = script_id
         await self._progress_stage(
             "runtime-resolve",
             "正在解析项目依赖并安装或复用共享运行时",
@@ -2659,11 +2984,18 @@ class Plugin(ScriptAdapterPlugin):
         payload: Mapping[str, Any],
         *,
         dry_run: bool,
+        requesting_script_id: str,
     ) -> dict[str, Any]:
         gateway = self._gateway()
         async with gateway.resource_transaction():
             async with Config.script_config_write_scope(None):
                 script_records = await _managed_script_record_dtos()
+                async with self._progress_lock:
+                    active_script_ids = sorted(
+                        script_id
+                        for script_id in self._active_operations
+                        if script_id != requesting_script_id
+                    )
                 return await gateway.collect_garbage(
                     dry_run=dry_run,
                     grace_days=_as_int(payload.get("graceDays"), 30),
@@ -2672,6 +3004,8 @@ class Plugin(ScriptAdapterPlugin):
                         str(payload.get("projectId") or "").strip() or None
                     ),
                     script_records=script_records,
+                    active_script_ids=active_script_ids,
+                    checkout_gc_confirmed=not dry_run,
                 )
 
     def _gateway(self) -> ManagedServiceGateway:
@@ -2682,27 +3016,39 @@ class Plugin(ScriptAdapterPlugin):
             self.ctx.get(INTERFACE_SERVICE),
         )
 
-    @staticmethod
     async def _respond(
+        self,
         operation: Callable[[], Awaitable[Any]],
         *,
         after_success: Callable[[Any], Awaitable[None]] | None = None,
     ) -> dict[str, Any]:
-        try:
+        async def protected_operation() -> Any:
             data = await operation()
             if after_success is not None:
                 await after_success(data)
+            return data
+
+        try:
+            data = await self._run_drain_protected(protected_operation)
+        except _PluginDrainingError as exc:
+            return {
+                "code": 503,
+                "status": "error",
+                "message": _sanitize_public_message(str(exc)),
+            }
         except ManagedServiceError as exc:
             return {
                 "code": 400,
                 "status": "error",
-                "message": str(exc),
+                "message": _sanitize_public_message(str(exc)),
             }
         except Exception as exc:
             return {
                 "code": 500,
                 "status": "error",
-                "message": f"托管 MaaFW 动作执行失败：{exc}",
+                "message": _sanitize_public_message(
+                    f"托管 MaaFW 动作执行失败：{exc}"
+                ),
             }
         return {
             "code": 200,
@@ -2735,8 +3081,7 @@ class Plugin(ScriptAdapterPlugin):
             )
         return await self._respond(validated_operation)
 
-    @staticmethod
-    async def _require_managed_script(payload: Mapping[str, Any]) -> str:
+    async def _require_managed_script(self, payload: Mapping[str, Any]) -> str:
         script_id = _required_script_id(payload)
         try:
             records = await Config.get_script_records(script_id)
@@ -2749,6 +3094,25 @@ class Plugin(ScriptAdapterPlugin):
             raise ManagedServiceError(
                 f"scriptId {script_id} 不是 MaaFWManaged 脚本，拒绝跨类型写入"
             )
+        config = _record_config(records[0], f"脚本 {script_id}")
+        managed = _mapping(config.get("Managed"))
+        project_id, version = managed_project_identity(managed)
+        if project_id and version:
+            storage = await self._gateway().project_storage_info()
+            actual_store_id = str(storage.get("storeId") or "").strip()
+            expected_store_id = str(managed.get("StoreId") or "").strip()
+            if expected_store_id:
+                if not actual_store_id or actual_store_id != expected_store_id:
+                    raise ManagedServiceError(
+                        "当前 Project Store 身份与脚本绑定不一致；"
+                        "目录可能已切换，拒绝对同名项目执行操作。"
+                    )
+            else:
+                project = await self._gateway().resolve_project(
+                    project_id,
+                    version,
+                )
+                _validate_legacy_project_store_binding(managed, project)
         return script_id
 
     async def _persist_project(
@@ -2783,8 +3147,13 @@ class Plugin(ScriptAdapterPlugin):
             payload,
             status=f"共享运行时已就绪 · {runtime.get('runtimeId') or ''}",
         )
+        checkout = _mapping(resolution.get("checkout"))
+        update["Managed"]["RunRootId"] = str(
+            checkout.get("runRootId") or ""
+        )
         update["ManagedRuntime"] = {
             "RuntimeId": str(runtime.get("runtimeId") or ""),
+            "PoolId": str(runtime.get("poolId") or ""),
             "PythonExecutable": str(runtime.get("pythonExecutable") or ""),
             "VenvPath": str(runtime.get("venvPath") or ""),
             "RuntimeBinding": runtime,
@@ -3035,6 +3404,10 @@ def _managed_capabilities() -> dict[str, Any]:
             "pinning": True,
             "garbageCollection": True,
             "operationProgress": True,
+            "activeOperationLookup": True,
+            "serverMutationExclusion": True,
+            "globalInventory": True,
+            "storageLocations": True,
         },
         "hostApis": {
             "conversionSnapshot": snapshot_available,
@@ -3359,6 +3732,72 @@ async def _conversion_commit_state(
     return "source" if current_snapshot == expected_snapshot else "unknown"
 
 
+_SENSITIVE_REMOTE_KEYS = frozenset(
+    {
+        "authorization",
+        "cdk",
+        "githubtoken",
+        "github_token",
+        "mirrorchyancdk",
+        "mirror_cdk",
+        "password",
+        "secret",
+        "token",
+    }
+)
+
+
+def _sanitize_public_message(message: Any) -> str:
+    sanitized = str(message or "")
+    patterns = (
+        (
+            r"((?:https?://)?(?:www\.)?mirrorchyan\.com/api/resources/download/)"
+            r"[^/?#\s\"']+",
+            r"\1***",
+        ),
+        (
+            r"(authorization[\"']?\s*[:=]\s*[\"']?)"
+            r"(?:(?:basic|bearer)\s+)?[^,;\s}\]\"']+",
+            r"\1***",
+        ),
+        (r"(bearer\s+)[A-Za-z0-9._~+/=-]+", r"\1***"),
+        (
+            r"((?:[?&]|\b)(?:api[_-]?key|cdk|password|secret|token)=)"
+            r"[^&\s\"']+",
+            r"\1***",
+        ),
+        (
+            r"((?:api[_-]?key|cdk|password|secret|token)[\"']?"
+            r"\s*[:=]\s*[\"']?)[^,;&\s}\]\"']+",
+            r"\1***",
+        ),
+    )
+    for pattern, replacement in patterns:
+        sanitized = re.sub(
+            pattern,
+            replacement,
+            sanitized,
+            flags=re.IGNORECASE,
+        )
+    return sanitized
+
+
+def _sanitize_public_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _sanitize_public_value(item)
+            for key, item in value.items()
+            if str(key).strip().casefold() not in _SENSITIVE_REMOTE_KEYS
+        }
+    if isinstance(value, list):
+        return [_sanitize_public_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [_sanitize_public_value(item) for item in value]
+    if isinstance(value, str):
+        return _sanitize_public_message(value)
+    return value
+
+
 def _remote_source_config(payload: Mapping[str, Any]) -> dict[str, Any]:
     source = str(payload.get("source") or "").strip().casefold()
     if source in {"github", "github_release"}:
@@ -3372,9 +3811,20 @@ def _remote_source_config(payload: Mapping[str, Any]) -> dict[str, Any]:
             "channel": str(payload.get("channel") or "stable").strip(),
         }
     if source in {"mirrorchyan", "mirror_chyan", "mirror酱"}:
+        explicit_cdk = str(payload.get("mirrorChyanCDK") or "").strip()
+        inherited_cdk = ""
+        if not explicit_cdk:
+            try:
+                inherited_cdk = str(
+                    Config.get("Update", "MirrorChyanCDK") or ""
+                ).strip()
+            except Exception as exc:
+                raise ManagedServiceError(
+                    "读取 AUTO-MAS 全局 MirrorChyan CDK 失败"
+                ) from exc
         return {
             "source": "mirrorchyan",
-            "cdk": str(payload.get("mirrorChyanCDK") or "").strip(),
+            "cdk": explicit_cdk or inherited_cdk,
             "channel": str(payload.get("channel") or "stable").strip(),
         }
     raise ManagedServiceError("远程来源必须是 MirrorChyan 或 GitHub")
@@ -3412,7 +3862,7 @@ def _public_remote_discovery(discovery: Mapping[str, Any]) -> dict[str, Any]:
         raise ManagedServiceError("远程发现结果必须是 JSON object")
     candidate = _mapping(result.get("candidate"))
     if candidate:
-        had_url = bool(
+        had_url = candidate.get("downloadAvailable") is True or bool(
             str(
                 candidate.pop("download_url", None)
                 or candidate.pop("downloadUrl", None)
@@ -3421,7 +3871,25 @@ def _public_remote_discovery(discovery: Mapping[str, Any]) -> dict[str, Any]:
         )
         candidate["downloadAvailable"] = had_url
         result["candidate"] = candidate
-    return result
+    sanitized = _sanitize_public_value(result)
+    if not isinstance(sanitized, dict):
+        raise ManagedServiceError("远程发现结果必须是 JSON object")
+    return sanitized
+
+
+def _public_remote_download(downloaded: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        key: _sanitize_public_value(downloaded[key])
+        for key in (
+            "source",
+            "version",
+            "size",
+            "sha256",
+            "retained",
+            "cleanupStatus",
+        )
+        if key in downloaded
+    }
 
 
 def _with_project_reference(
@@ -3495,6 +3963,10 @@ def _runtime_install_request(
         "runtimeConstraint": str(
             managed.get("RuntimeConstraint") or ""
         ).strip(),
+        "expectedStoreId": str(managed.get("StoreId") or "").strip(),
+        "expectedProjectManifest": _mapping(
+            managed.get("ProjectManifest")
+        ),
     }
     if not authoritative["projectId"] or not authoritative["version"]:
         raise ManagedServiceError(
@@ -3515,7 +3987,13 @@ def _upgrade_source_config(config: Mapping[str, Any]) -> dict[str, Any]:
     value = _json_clone(config)
     if not isinstance(value, dict):
         raise ManagedServiceError("升级配置必须是 JSON object")
-    for key in ("Managed", "ManagedRuntime", "ManagedActions", "ManagedUpgrade"):
+    for key in (
+        "Managed",
+        "ManagedRuntime",
+        "ManagedActions",
+        "ManagedUpgrade",
+        "ManagedRemote",
+    ):
         value.pop(key, None)
     return value
 
@@ -3831,6 +4309,7 @@ def _project_form_update(
     managed = {
         "ImportProjectId": "",
         "ProjectId": project_id,
+        "StoreId": str(project.get("storeId") or ""),
         "Version": version,
         "RuntimeConstraint": str(
             project.get("runtimeConstraint")
@@ -3854,6 +4333,38 @@ def _project_form_update(
             ),
         }
     return update
+
+
+def _validate_legacy_project_store_binding(
+    managed: Mapping[str, Any],
+    project: Mapping[str, Any],
+) -> None:
+    expected_identity = _project_manifest_source_identity(
+        managed.get("ProjectManifest")
+    )
+    actual_identity = _project_manifest_source_identity(project.get("manifest"))
+    if expected_identity is None or actual_identity != expected_identity:
+        raise ManagedServiceError(
+            "脚本尚未记录 Project Store 身份，且旧资源清单来源哈希"
+            "无法与当前 Store 精确匹配；请重新导入或显式转换托管项目。"
+        )
+
+
+def _project_manifest_source_identity(
+    value: Any,
+) -> tuple[str, str, str] | None:
+    manifest = _mapping(value)
+    source = _mapping(manifest.get("source"))
+    hash_value = _mapping(source.get("hash"))
+    algorithm = str(hash_value.get("algorithm") or "").strip().casefold()
+    scope = str(hash_value.get("scope") or "").strip()
+    digest = str(hash_value.get("value") or "").strip().casefold()
+    if algorithm != "sha256" or not scope or not re.fullmatch(
+        r"[0-9a-f]{64}",
+        digest,
+    ):
+        return None
+    return algorithm, scope, digest
 
 
 def _project_capability_form(project: Mapping[str, Any]) -> dict[str, Any]:

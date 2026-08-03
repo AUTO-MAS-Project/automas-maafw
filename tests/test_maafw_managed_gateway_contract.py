@@ -81,7 +81,8 @@ class MaaFWManagedGatewayContractTest(unittest.TestCase):
             encoding="utf-8",
         )
         self.project_store = MaaFWProjectStoreService(
-            self.temp_root / "project-store"
+            self.temp_root / "project-store",
+            run_root=self.temp_root / "project-runs",
         )
         self.runtime_pool = MaaFWRuntimePoolService(
             self.temp_root / "runtime-pool",
@@ -126,6 +127,317 @@ class MaaFWManagedGatewayContractTest(unittest.TestCase):
     def test_binding_protects_runtime_until_project_version_is_deleted(self) -> None:
         asyncio.run(self._binding_lifecycle())
 
+    def test_resolve_execution_prefers_script_isolated_checkout(self) -> None:
+        async def scenario() -> None:
+            imported = self.project_store.import_project(
+                self.source,
+                "demo",
+                "1.0",
+                runtime_constraint="==4.3.0",
+            )
+            resolution = await self.gateway.resolve_execution(
+                {
+                    "projectId": "demo",
+                    "version": "1.0",
+                    "scriptId": "script-one",
+                }
+            )
+            self.assertTrue(resolution["projectCheckout"]["available"])
+            self.assertTrue(resolution["projectCheckout"]["used"])
+            self.assertNotEqual(resolution["projectPath"], imported["dataPath"])
+            self.assertEqual(
+                resolution["checkout"]["scriptId"],
+                "script-one",
+            )
+            self.assertEqual(
+                resolution["runtime"]["poolId"],
+                self.runtime_pool.storage_info()["poolId"],
+            )
+
+        asyncio.run(scenario())
+
+    def test_resolve_execution_rejects_store_identity_mismatch(self) -> None:
+        async def scenario() -> None:
+            imported = self.project_store.import_project(
+                self.source,
+                "demo",
+                "1.0",
+                runtime_constraint="==4.3.0",
+            )
+            with self.assertRaisesRegex(
+                ManagedServiceError,
+                "Project Store 身份",
+            ):
+                await self.gateway.resolve_execution(
+                    {
+                        "projectId": "demo",
+                        "version": "1.0",
+                        "scriptId": "script-one",
+                        "expectedStoreId": (
+                            "00000000-0000-0000-0000-000000000000"
+                        ),
+                        "expectedProjectManifest": imported["manifest"],
+                    }
+                )
+
+            adopted = await self.gateway.resolve_execution(
+                {
+                    "projectId": "demo",
+                    "version": "1.0",
+                    "scriptId": "script-one",
+                    "expectedStoreId": "",
+                    "expectedProjectManifest": imported["manifest"],
+                }
+            )
+            self.assertEqual(adopted["project"]["storeId"], imported["storeId"])
+
+            stale_manifest = json.loads(json.dumps(imported["manifest"]))
+            stale_manifest["source"]["hash"]["value"] = "0" * 64
+            with self.assertRaisesRegex(
+                ManagedServiceError,
+                "来源哈希",
+            ):
+                await self.gateway.resolve_execution(
+                    {
+                        "projectId": "demo",
+                        "version": "1.0",
+                        "scriptId": "script-two",
+                        "expectedStoreId": "",
+                        "expectedProjectManifest": stale_manifest,
+                    }
+                )
+
+        asyncio.run(scenario())
+
+    def test_resolve_execution_refuses_store_without_checkout(self) -> None:
+        class StoreWithoutCheckout:
+            def __init__(self, store):
+                self._store = store
+
+            def resolve_project(self, project_id, version=None, *, touch=False):
+                return self._store.resolve_project(
+                    project_id,
+                    version,
+                    touch=touch,
+                )
+
+        async def scenario() -> None:
+            self.project_store.import_project(
+                self.source,
+                "demo",
+                "1.0",
+                runtime_constraint="==4.3.0",
+            )
+            gateway = ManagedServiceGateway(
+                StoreWithoutCheckout(self.project_store),
+                self.runtime_pool,
+            )
+            with self.assertRaisesRegex(
+                ManagedServiceError,
+                "拒绝把不可变 Store payload",
+            ):
+                await gateway.resolve_execution(
+                    {
+                        "projectId": "demo",
+                        "version": "1.0",
+                        "scriptId": "script-one",
+                    }
+                )
+
+        asyncio.run(scenario())
+
+    def test_real_gc_rejects_incomplete_inventory_before_deleting(self) -> None:
+        async def scenario() -> None:
+            self.project_store.import_project(
+                self.source,
+                "demo",
+                "1.0",
+                runtime_constraint="==4.3.0",
+            )
+            checkout = self.project_store.checkout_project(
+                "demo",
+                "1.0",
+                "script-one",
+            )
+            marker = Path(checkout["dataPath"]).parent / (
+                ".auto_mas_maafw_checkout.json"
+            )
+            marker.write_text("{}", encoding="utf-8")
+            runtime = self.runtime_pool.ensure(["maafw==4.3.0"])
+
+            with self.assertRaisesRegex(
+                ManagedServiceError,
+                "资源盘点不完整",
+            ):
+                await self.gateway.collect_garbage(
+                    dry_run=False,
+                    grace_days=0,
+                    keep_latest=0,
+                )
+
+            self.assertIsNotNone(
+                self.runtime_pool.resolve_runtime(
+                    {"runtimeId": runtime["runtimeId"]}
+                )
+            )
+
+        asyncio.run(scenario())
+
+    def test_global_inventory_reports_corrupt_manifest_without_reconciliation(
+        self,
+    ) -> None:
+        async def scenario() -> None:
+            imported = self.project_store.import_project(
+                self.source,
+                "demo",
+                "1.0",
+                runtime_constraint="==4.3.0",
+            )
+            Path(imported["manifestPath"]).write_text(
+                "{broken",
+                encoding="utf-8",
+            )
+
+            result = await self.gateway.global_inventory([])
+
+            self.assertFalse(result["complete"])
+            self.assertTrue(result["errors"])
+            self.assertTrue(result["references"]["scripts"]["skipped"])
+            self.assertTrue(result["references"]["runtimes"]["skipped"])
+
+        asyncio.run(scenario())
+
+    def test_global_inventory_exposes_authoritative_project_active_lease_ids(
+        self,
+    ) -> None:
+        async def scenario() -> None:
+            self.project_store.import_project(
+                self.source,
+                "demo",
+                "1.0",
+                runtime_constraint="==4.3.0",
+            )
+            self.project_store.acquire_lease(
+                "demo",
+                "1.0",
+                owner="managed:test",
+                lease_id="project-lease",
+            )
+
+            result = await self.gateway.global_inventory([])
+
+            self.assertTrue(result["complete"])
+            self.assertEqual(
+                result["versions"][0]["activeLeaseIds"],
+                ["project-lease"],
+            )
+
+        asyncio.run(scenario())
+
+    def test_global_inventory_annotates_checkout_binding_and_orphan_state(
+        self,
+    ) -> None:
+        async def scenario() -> None:
+            self.project_store.import_project(
+                self.source,
+                "demo",
+                "1.0",
+                runtime_constraint="==4.3.0",
+            )
+            checkout = self.project_store.checkout_project(
+                "demo",
+                "1.0",
+                "script-one",
+            )
+            script_record = {
+                "id": "script-one",
+                "type": "MaaFWManaged",
+                "config": {
+                    "Managed": {
+                        "ProjectId": "demo",
+                        "Version": "1.0",
+                    }
+                },
+            }
+
+            current = await self.gateway.global_inventory([script_record])
+            current_checkout = current["checkouts"][0]
+            self.assertEqual(current_checkout["checkoutId"], checkout["checkoutId"])
+            self.assertTrue(current_checkout["scriptAvailable"])
+            self.assertTrue(current_checkout["bindingCurrent"])
+            self.assertIsNone(current_checkout["orphanReason"])
+
+            orphaned = await self.gateway.global_inventory([])
+            orphan_checkout = orphaned["checkouts"][0]
+            self.assertFalse(orphan_checkout["scriptAvailable"])
+            self.assertFalse(orphan_checkout["bindingCurrent"])
+            self.assertEqual(
+                orphan_checkout["orphanReason"],
+                "managed-script-missing",
+            )
+
+        asyncio.run(scenario())
+
+    def test_gateway_checkout_gc_requires_explicit_confirmation(self) -> None:
+        async def scenario() -> None:
+            self.project_store.import_project(
+                self.source,
+                "demo",
+                "1.0",
+                runtime_constraint="==4.3.0",
+            )
+            checkout = self.project_store.checkout_project(
+                "demo",
+                "1.0",
+                "script-orphan",
+            )
+            checkout_root = Path(checkout["dataPath"]).parent
+            active_checkout = self.project_store.checkout_project(
+                "demo",
+                "1.0",
+                "script-active",
+            )
+            active_checkout_root = Path(active_checkout["dataPath"]).parent
+
+            conservative = await self.gateway.collect_garbage(
+                dry_run=False,
+                grace_days=0,
+                keep_latest=1,
+                script_records=[],
+                active_script_ids=[],
+                checkout_gc_confirmed=False,
+            )
+            kept = conservative["projectStore"]["checkoutGarbageCollection"]
+            self.assertIn(
+                "explicit-confirmation-required",
+                kept["kept"][0]["reasons"],
+            )
+            self.assertTrue(checkout_root.is_dir())
+
+            applied = await self.gateway.collect_garbage(
+                dry_run=False,
+                grace_days=0,
+                keep_latest=1,
+                script_records=[],
+                active_script_ids=["script-active"],
+                checkout_gc_confirmed=True,
+            )
+            deleted = applied["projectStore"]["checkoutGarbageCollection"]
+            self.assertEqual(
+                [item["checkoutId"] for item in deleted["deleted"]],
+                [checkout["checkoutId"]],
+            )
+            self.assertFalse(checkout_root.exists())
+            self.assertTrue(active_checkout_root.is_dir())
+            active_kept = next(
+                item
+                for item in deleted["kept"]
+                if item["checkoutId"] == active_checkout["checkoutId"]
+            )
+            self.assertIn("active-operation", active_kept["reasons"])
+
+        asyncio.run(scenario())
+
     async def _binding_lifecycle(self) -> None:
         self.project_store.import_project(
             self.source,
@@ -138,7 +450,11 @@ class MaaFWManagedGatewayContractTest(unittest.TestCase):
             "拒绝创建未约束的 MaaFW 运行时",
         ):
             await self.gateway.resolve_execution(
-                {"projectId": "demo", "version": "unbounded"}
+                {
+                    "projectId": "demo",
+                    "version": "unbounded",
+                    "scriptId": "script-binding",
+                }
             )
 
         self.project_store.import_project(
@@ -149,7 +465,11 @@ class MaaFWManagedGatewayContractTest(unittest.TestCase):
             activate=True,
         )
         resolution_v1 = await self.gateway.resolve_execution(
-            {"projectId": "demo", "version": "1.0"}
+            {
+                "projectId": "demo",
+                "version": "1.0",
+                "scriptId": "script-binding",
+            }
         )
         runtime_v1 = resolution_v1["runtime"]
         bound_v1 = await self.gateway.bind_project_runtime(
@@ -243,7 +563,11 @@ class MaaFWManagedGatewayContractTest(unittest.TestCase):
             activate=True,
         )
         first = await self.gateway.resolve_execution(
-            {"projectId": "demo", "version": "1.0"}
+            {
+                "projectId": "demo",
+                "version": "1.0",
+                "scriptId": "script-recovery",
+            }
         )
         first_runtime_id = first["runtime"]["runtimeId"]
         bound = await self.gateway.bind_project_runtime(
@@ -288,7 +612,11 @@ class MaaFWManagedGatewayContractTest(unittest.TestCase):
         # 重建后会得到相同 ID；关键验证是 manifest binding 已被回写
         # 并包含 maafwVersion。
         recovered = await self.gateway.resolve_execution(
-            {"projectId": "demo", "version": "1.0"}
+            {
+                "projectId": "demo",
+                "version": "1.0",
+                "scriptId": "script-recovery",
+            }
         )
         recovered_runtime_id = recovered["runtime"]["runtimeId"]
         self.assertEqual(
@@ -307,6 +635,73 @@ class MaaFWManagedGatewayContractTest(unittest.TestCase):
         refreshed_binding = refreshed["manifest"]["runtime"]["binding"]
         self.assertEqual(refreshed_binding["runtimeId"], recovered_runtime_id)
         self.assertEqual(refreshed_binding.get("maafwVersion"), "4.3.0")
+
+    def test_bind_failure_compensates_only_reference_added_by_attempt(self) -> None:
+        reference = "maafw-project:demo@1.0"
+
+        class ProjectStore:
+            def resolve_project(self, project_id, version, *, touch=True):
+                del touch
+                return {
+                    "projectId": project_id,
+                    "version": version,
+                    "dataPath": "C:/store/demo/1.0",
+                    "manifest": {
+                        "runtime": {"binding": {"runtimeId": "runtime-old"}}
+                    },
+                }
+
+            def bind_runtime(self, *_args, **_kwargs):
+                raise RuntimeError("injected bind failure")
+
+        class RuntimePool:
+            def __init__(self, references):
+                self.references = set(references)
+                self.remove_calls = 0
+
+            def resolve_runtime(self, request):
+                return {
+                    "runtimeId": request["runtimeId"],
+                    "pythonExecutable": "C:/runtime/python.exe",
+                    "references": sorted(self.references),
+                }
+
+            def add_reference(self, runtime_id, value):
+                self.references.add(value)
+                return {
+                    "runtimeId": runtime_id,
+                    "references": sorted(self.references),
+                }
+
+            def remove_reference(self, runtime_id, value):
+                self.remove_calls += 1
+                self.references.discard(value)
+                return {
+                    "runtimeId": runtime_id,
+                    "references": sorted(self.references),
+                }
+
+        async def scenario(preexisting: bool):
+            runtime_pool = RuntimePool([reference] if preexisting else [])
+            gateway = ManagedServiceGateway(ProjectStore(), runtime_pool)
+            with self.assertRaisesRegex(ManagedServiceError, "injected bind failure"):
+                await gateway.bind_project_runtime(
+                    "demo",
+                    "1.0",
+                    {
+                        "runtimeId": "runtime-new",
+                        "pythonExecutable": "C:/runtime/python.exe",
+                    },
+                )
+            return runtime_pool
+
+        newly_added = asyncio.run(scenario(False))
+        self.assertNotIn(reference, newly_added.references)
+        self.assertEqual(newly_added.remove_calls, 1)
+
+        already_present = asyncio.run(scenario(True))
+        self.assertIn(reference, already_present.references)
+        self.assertEqual(already_present.remove_calls, 0)
 
 
 class MaaFWManagedGatewayEventLoopContractTest(unittest.TestCase):
