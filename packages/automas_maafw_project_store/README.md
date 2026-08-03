@@ -2,6 +2,25 @@
 
 Versioned, resource-only MaaFW project storage for AUTO-MAS.
 
+The plugin instance exposes `Root` and `RunRoot` settings. Empty values keep the legacy
+`data/maafw_project_store` location under the AUTO-MAS working directory; a
+configured value is fixed for the lifetime of that plugin instance and takes
+effect after restart. The selected root contains a stable
+`.auto_mas_maafw_project_store.json` identity marker. Empty roots are initialized
+safely, while unknown non-empty directories, invalid markers, symlinks and
+Windows reparse-point chains are rejected. An existing markerless layout is
+adopted only at the legacy default location and no project content is moved.
+`storage_info()` exposes the resolved path, persistent `storeId`, default-root
+flag and JSON-friendly `rootIdentity`.
+
+`RunRoot` defaults to the separate `data/maafw_project_runs` tree. It carries a
+stable run-root identity and cannot equal, contain, or be contained by the Store
+root. `checkout_project(project_id, version, script_id)` atomically copies the
+immutable stripped payload into a script-isolated writable checkout. Matching
+checkouts are reused without replacing user output; invalid markers, conflicts,
+reparse points, and incomplete copies fail closed. Store private manifests are
+never copied and files are copied rather than hardlinked.
+
 The plugin provides the JSON-friendly `maafw.project_store.v1` service. It
 accepts either an unpacked release directory or a ZIP release. Each import
 creates an immutable project version, keeps the ProjectInterface,

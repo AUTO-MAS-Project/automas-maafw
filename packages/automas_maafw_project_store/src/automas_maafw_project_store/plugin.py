@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any
 
 from .service import MaaFWProjectStoreService
 
@@ -11,16 +12,23 @@ if TYPE_CHECKING:
 DEFAULT_INSTANCE = {
     "name": "MaaFW Project Store",
     "enabled": True,
-    "config": {},
+    "config": {"Root": "", "RunRoot": ""},
 }
 
 schema = {
-    "__no_plugin_config__": {
-        "type": "boolean",
-        "default": True,
-        "hidden": True,
-        "configurable": False,
-        "title": "No plugin-level configuration",
+    "Root": {
+        "type": "folder",
+        "path_kind": "folder",
+        "default": "",
+        "title": "Project Store 根目录",
+        "description": "留空使用 AUTO-MAS 工作目录下的 data/maafw_project_store；修改后需重启插件。",
+    },
+    "RunRoot": {
+        "type": "folder",
+        "path_kind": "folder",
+        "default": "",
+        "title": "MaaFW 脱壳运行目录",
+        "description": "留空使用 AUTO-MAS 工作目录下的 data/maafw_project_runs；必须与 Project Store 分离，修改后需重启插件。",
     },
 }
 
@@ -30,7 +38,10 @@ class Plugin:
 
     def __init__(self, ctx: "PluginContext") -> None:
         self.ctx = ctx
-        self.service = MaaFWProjectStoreService()
+        self.service = MaaFWProjectStoreService(
+            _configured_value(ctx, "Root"),
+            run_root=_configured_value(ctx, "RunRoot"),
+        )
 
     async def on_start(self) -> None:
         self.ctx.set("maafw.project_store.v1", self.service)
@@ -40,3 +51,13 @@ class Plugin:
         self.ctx.logger.info(
             f"maafw.project_store.v1 stopped, reason={reason}"
         )
+
+
+def _configured_value(ctx: Any, name: str) -> str | None:
+    config = getattr(ctx, "config", None)
+    if isinstance(config, Mapping):
+        value = config.get(name)
+    else:
+        value = getattr(config, name, None)
+    normalized = str(value or "").strip()
+    return normalized or None

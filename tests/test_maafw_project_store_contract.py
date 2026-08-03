@@ -20,7 +20,11 @@ if str(PACKAGE_SRC) not in sys.path:
     sys.path.insert(0, str(PACKAGE_SRC))
 
 from automas_maafw_project_store import (  # noqa: E402
+    CHECKOUT_MARKER_NAME,
     MANIFEST_FILE_NAME,
+    STORE_KIND,
+    STORE_MARKER_NAME,
+    STORE_SCHEMA_VERSION,
     MaaFWProjectStoreError,
     MaaFWProjectStoreService,
 )
@@ -33,7 +37,10 @@ class MaaFWProjectStoreContractTest(unittest.TestCase):
         self.temp_root = Path(self.temp_dir.name)
         self.source = self.temp_root / "release"
         self.source.mkdir()
-        self.store = MaaFWProjectStoreService(self.temp_root / "store")
+        self.store = MaaFWProjectStoreService(
+            self.temp_root / "store",
+            run_root=self.temp_root / "runs",
+        )
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
@@ -43,6 +50,7 @@ class MaaFWProjectStoreContractTest(unittest.TestCase):
             (PACKAGE_ROOT / "pyproject.toml").read_text(encoding="utf-8")
         )
         entrypoints = pyproject["project"]["entry-points"]["auto_mas.plugins"]
+        self.assertEqual(pyproject["project"]["version"], "0.2.1")
         self.assertEqual(
             entrypoints["automas_maafw_project_store"],
             "automas_maafw_project_store.plugin:Plugin",
@@ -52,6 +60,466 @@ class MaaFWProjectStoreContractTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn('provides = ["maafw.project_store.v1"]', plugin_source)
         self.assertIn("DEFAULT_INSTANCE", plugin_source)
+
+    def test_root_marker_identity_is_stable_and_json_friendly(self) -> None:
+        first = self.store.storage_info()
+        marker = json.loads(
+            (self.store.root / STORE_MARKER_NAME).read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(marker["schemaVersion"], STORE_SCHEMA_VERSION)
+        self.assertEqual(marker["kind"], STORE_KIND)
+        self.assertEqual(first["storeId"], marker["storeId"])
+        self.assertEqual(first["root"], str(self.store.root))
+        self.assertFalse(first["isDefault"])
+        self.assertEqual(first["rootIdentity"], self.store.rootIdentity)
+
+        reopened = MaaFWProjectStoreService(
+            self.store.root,
+            run_root=self.store.run_root,
+        )
+        self.assertEqual(reopened.storage_info()["storeId"], first["storeId"])
+
+    def test_configured_root_rejects_unknown_non_empty_directory(self) -> None:
+        unknown = self.temp_root / "unknown"
+        unknown.mkdir()
+        (unknown / "sentinel.txt").write_text("keep", encoding="utf-8")
+
+        with self.assertRaisesRegex(
+            MaaFWProjectStoreError,
+            "non-empty directory without a valid project-store marker",
+        ):
+            MaaFWProjectStoreService(unknown)
+
+        self.assertEqual((unknown / "sentinel.txt").read_text(encoding="utf-8"), "keep")
+        self.assertFalse((unknown / STORE_MARKER_NAME).exists())
+
+    def test_invalid_marker_fails_closed(self) -> None:
+        invalid = self.temp_root / "invalid-marker"
+        invalid.mkdir()
+        (invalid / STORE_MARKER_NAME).write_text(
+            json.dumps(
+                {
+                    "schemaVersion": STORE_SCHEMA_VERSION,
+                    "kind": "not-a-project-store",
+                    "storeId": "00000000-0000-0000-0000-000000000000",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(MaaFWProjectStoreError, "marker kind is invalid"):
+            MaaFWProjectStoreService(invalid)
+
+    def test_legacy_default_layout_is_adopted_without_moving_content(self) -> None:
+        working_directory = self.temp_root / "legacy-host"
+        legacy_root = working_directory / "data" / "maafw_project_store"
+        (legacy_root / "projects").mkdir(parents=True)
+        (legacy_root / ".staging").mkdir()
+        sentinel = legacy_root / "projects" / "sentinel"
+        sentinel.mkdir()
+
+        with patch(
+            "automas_maafw_project_store.service.Path.cwd",
+            return_value=working_directory,
+        ):
+            adopted = MaaFWProjectStoreService()
+
+        self.assertTrue((legacy_root / STORE_MARKER_NAME).is_file())
+        self.assertTrue(sentinel.is_dir())
+        self.assertTrue(adopted.storage_info()["isDefault"])
+
+    def test_plugin_uses_root_from_context_config(self) -> None:
+        from automas_maafw_project_store.plugin import Plugin
+
+        configured = self.temp_root / "configured-store"
+        configured_runs = self.temp_root / "configured-runs"
+        context = type(
+            "Context",
+            (),
+            {
+                "config": {
+                    "Root": str(configured),
+                    "RunRoot": str(configured_runs),
+                }
+            },
+        )()
+
+        plugin = Plugin(context)
+
+        self.assertEqual(plugin.service.root, configured.resolve())
+        self.assertEqual(plugin.service.run_root, configured_runs.resolve())
+
+    def test_configured_roots_must_be_absolute_and_separate(self) -> None:
+        with self.assertRaisesRegex(MaaFWProjectStoreError, "absolute path"):
+            MaaFWProjectStoreService("relative-store")
+        with self.assertRaisesRegex(MaaFWProjectStoreError, "absolute path"):
+            MaaFWProjectStoreService(
+                self.temp_root / "absolute-store",
+                run_root="relative-runs",
+            )
+        with self.assertRaisesRegex(MaaFWProjectStoreError, "separate path trees"):
+            MaaFWProjectStoreService(
+                self.temp_root / "shared",
+                run_root=self.temp_root / "shared" / "runs",
+            )
+
+    def test_checkout_is_isolated_reused_and_does_not_mutate_store(self) -> None:
+        self._write_json(
+            self.source / "interface.json",
+            {
+                "interface_version": 2,
+                "name": "checkout",
+                "version": "1.0.0",
+                "resource": [{"name": "base", "path": ["Bundle"]}],
+                "task": [],
+            },
+        )
+        self._write_text(self.source / "Bundle" / "pipeline.json", "{}")
+        resolved = self.store.import_project(self.source, "demo", "1.0.0")
+        store_data = Path(resolved["dataPath"])
+        first = self.store.checkout_project("demo", "1.0.0", "script-one")
+        checkout_data = Path(first["dataPath"])
+        self.assertNotEqual(checkout_data, store_data)
+        self.assertFalse((checkout_data / MANIFEST_FILE_NAME).exists())
+        self.assertTrue(
+            (checkout_data.parent / CHECKOUT_MARKER_NAME).is_file()
+        )
+        (checkout_data / "user-output.json").write_text("{}", encoding="utf-8")
+        (checkout_data / "Bundle" / "pipeline.json").write_text(
+            '{"changed": true}',
+            encoding="utf-8",
+        )
+        self.assertEqual(
+            (store_data / "Bundle" / "pipeline.json").read_text(encoding="utf-8"),
+            "{}",
+        )
+
+        first_last_used_at = first["lastUsedAt"]
+        with patch.object(
+            project_store_service.time,
+            "time",
+            return_value=time.time() + 60,
+        ):
+            reused = self.store.checkout_project("demo", "1.0.0", "script-one")
+        other = self.store.checkout_project("demo", "1.0.0", "script-two")
+        self.assertTrue(reused["reused"])
+        self.assertGreater(reused["lastUsedAt"], first_last_used_at)
+        self.assertTrue((Path(reused["dataPath"]) / "user-output.json").is_file())
+        self.assertNotEqual(reused["dataPath"], other["dataPath"])
+        self.assertFalse((Path(other["dataPath"]) / "user-output.json").exists())
+        self.assertEqual(reused["storeId"], resolved["storeId"])
+        self.assertEqual(reused["runRootId"], self.store.storage_info()["runRootId"])
+        inventory = self.store.inventory()
+        self.assertTrue(inventory["complete"])
+        self.assertEqual(
+            {item["scriptId"] for item in inventory["checkouts"]},
+            {"script-one", "script-two"},
+        )
+
+    def test_checkout_rejects_tampered_immutable_store_payload(self) -> None:
+        self._write_json(
+            self.source / "interface.json",
+            {
+                "interface_version": 2,
+                "name": "checkout-integrity",
+                "version": "1.0.0",
+                "resource": [{"name": "base", "path": ["Bundle"]}],
+                "task": [],
+            },
+        )
+        self._write_text(self.source / "Bundle" / "pipeline.json", "{}")
+        resolved = self.store.import_project(self.source, "demo", "1.0.0")
+        store_file = Path(resolved["dataPath"]) / "Bundle" / "pipeline.json"
+        store_file.write_text('{"tampered": true}', encoding="utf-8")
+
+        with self.assertRaisesRegex(
+            MaaFWProjectStoreError,
+            "payload integrity check failed",
+        ):
+            self.store.checkout_project("demo", "1.0.0", "script-one")
+
+        checkouts_root = self.store.run_root / "scripts" / "script-one" / "checkouts"
+        self.assertFalse(checkouts_root.exists())
+
+    def test_corrupt_checkout_fails_closed_without_overwrite(self) -> None:
+        self._write_json(
+            self.source / "interface.json",
+            {
+                "interface_version": 2,
+                "name": "checkout",
+                "version": "1.0.0",
+                "task": [],
+            },
+        )
+        self.store.import_project(self.source, "demo", "1.0.0")
+        checkout = self.store.checkout_project("demo", "1.0.0", "script-one")
+        marker_path = Path(checkout["dataPath"]).parent / CHECKOUT_MARKER_NAME
+        marker_path.write_text("{}", encoding="utf-8")
+        sentinel = Path(checkout["dataPath"]) / "keep.txt"
+        sentinel.write_text("keep", encoding="utf-8")
+
+        with self.assertRaisesRegex(MaaFWProjectStoreError, "marker"):
+            self.store.checkout_project("demo", "1.0.0", "script-one")
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep")
+
+    def test_checkout_gc_requires_orphan_context_confirmation_and_no_lease(
+        self,
+    ) -> None:
+        self._write_json(
+            self.source / "interface.json",
+            {
+                "interface_version": 2,
+                "name": "checkout-gc",
+                "version": "1.0.0",
+                "task": [],
+            },
+        )
+        self.store.import_project(self.source, "demo", "1.0.0")
+        checkout = self.store.checkout_project(
+            "demo",
+            "1.0.0",
+            "script-orphan",
+        )
+        checkout_path = Path(checkout["dataPath"]).parent
+        self.store.acquire_checkout_lease(
+            checkout["checkoutId"],
+            "script-orphan",
+            "run-lease",
+            owner="MaaFWManaged:script-orphan",
+            ttl_seconds=300,
+        )
+
+        protected = self.store.collect_garbage(
+            dry_run=True,
+            grace_seconds=0,
+            keep_latest=1,
+            checkout_context={
+                "managedBindings": {},
+                "activeScriptIds": [],
+                "confirmed": False,
+            },
+        )["checkoutGarbageCollection"]
+        self.assertIn("active-lease", protected["kept"][0]["reasons"])
+        self.store.release_checkout_lease(
+            checkout["checkoutId"],
+            "script-orphan",
+            "run-lease",
+        )
+
+        conservative = self.store.collect_garbage(
+            dry_run=False,
+            grace_seconds=0,
+            keep_latest=1,
+            checkout_context={
+                "managedBindings": {},
+                "activeScriptIds": [],
+                "confirmed": False,
+            },
+        )["checkoutGarbageCollection"]
+        self.assertIn(
+            "explicit-confirmation-required",
+            conservative["kept"][0]["reasons"],
+        )
+        self.assertTrue(checkout_path.is_dir())
+
+        applied = self.store.collect_garbage(
+            dry_run=False,
+            grace_seconds=0,
+            keep_latest=1,
+            checkout_context={
+                "managedBindings": {},
+                "activeScriptIds": [],
+                "confirmed": True,
+            },
+        )["checkoutGarbageCollection"]
+        self.assertEqual(
+            [item["checkoutId"] for item in applied["deleted"]],
+            [checkout["checkoutId"]],
+        )
+        self.assertFalse(checkout_path.exists())
+
+    def test_checkout_gc_keeps_current_binding_active_operation_and_legacy_marker(
+        self,
+    ) -> None:
+        self._write_json(
+            self.source / "interface.json",
+            {
+                "interface_version": 2,
+                "name": "checkout-gc",
+                "version": "1.0.0",
+                "task": [],
+            },
+        )
+        self.store.import_project(self.source, "demo", "1.0.0")
+        current = self.store.checkout_project("demo", "1.0.0", "script-current")
+        active = self.store.checkout_project("demo", "1.0.0", "script-active")
+        legacy = self.store.checkout_project("demo", "1.0.0", "script-legacy")
+        legacy_marker = Path(legacy["dataPath"]).parent / CHECKOUT_MARKER_NAME
+        legacy_data = json.loads(legacy_marker.read_text(encoding="utf-8"))
+        legacy_data.pop("leases", None)
+        legacy_marker.write_text(json.dumps(legacy_data), encoding="utf-8")
+
+        result = self.store.collect_garbage(
+            dry_run=False,
+            grace_seconds=0,
+            keep_latest=1,
+            checkout_context={
+                "managedBindings": {
+                    "script-current": {
+                        "projectId": "demo",
+                        "version": "1.0.0",
+                    }
+                },
+                "activeScriptIds": ["script-active"],
+                "confirmed": True,
+            },
+        )["checkoutGarbageCollection"]
+        reasons = {
+            item["scriptId"]: set(item["reasons"])
+            for item in result["kept"]
+        }
+        self.assertIn("managed-script-binding", reasons["script-current"])
+        self.assertIn("active-operation", reasons["script-active"])
+        self.assertIn("checkout-lease-unavailable", reasons["script-legacy"])
+        self.assertTrue(Path(current["dataPath"]).is_dir())
+        self.assertTrue(Path(active["dataPath"]).is_dir())
+        self.assertTrue(Path(legacy["dataPath"]).is_dir())
+
+    def test_directory_import_fails_closed_when_source_changes_during_snapshot(
+        self,
+    ) -> None:
+        self._write_json(
+            self.source / "interface.json",
+            {
+                "interface_version": 2,
+                "name": "race",
+                "version": "1.0.0",
+                "resource": [{"name": "base", "path": ["Bundle"]}],
+                "task": [],
+            },
+        )
+        payload = self.source / "Bundle" / "pipeline.json"
+        self._write_text(payload, '{"generation": 1}')
+        original_copy = project_store_service.shutil.copy2
+        mutated = False
+
+        def copy_then_mutate(source: Path, destination: Path) -> str:
+            nonlocal mutated
+            result = original_copy(source, destination)
+            if not mutated:
+                mutated = True
+                payload.write_text('{"generation": 2}', encoding="utf-8")
+            return result
+
+        with patch.object(
+            project_store_service.shutil,
+            "copy2",
+            side_effect=copy_then_mutate,
+        ), self.assertRaisesRegex(
+            MaaFWProjectStoreError,
+            "source directory changed while it was being imported",
+        ):
+            self.store.import_project(self.source, "race", "1.0.0")
+
+        self.assertEqual(self.store.list_projects(), [])
+        self.assertEqual(list((self.store.root / ".staging").iterdir()), [])
+
+    def test_racing_repeat_import_does_not_reuse_existing_version(self) -> None:
+        self._write_json(
+            self.source / "interface.json",
+            {
+                "interface_version": 2,
+                "name": "race",
+                "version": "1.0.0",
+                "resource": [{"name": "base", "path": ["Bundle"]}],
+                "task": [],
+            },
+        )
+        payload = self.source / "Bundle" / "pipeline.json"
+        self._write_text(payload, '{"generation": 1}')
+        imported = self.store.import_project(self.source, "race", "1.0.0")
+        stored_payload = Path(imported["dataPath"]) / "Bundle" / "pipeline.json"
+        original_copy = project_store_service.shutil.copy2
+        mutated = False
+
+        def copy_then_mutate(source: Path, destination: Path) -> str:
+            nonlocal mutated
+            result = original_copy(source, destination)
+            if not mutated:
+                mutated = True
+                payload.write_text('{"generation": 2}', encoding="utf-8")
+            return result
+
+        with patch.object(
+            project_store_service.shutil,
+            "copy2",
+            side_effect=copy_then_mutate,
+        ), self.assertRaisesRegex(
+            MaaFWProjectStoreError,
+            "source directory changed while it was being imported",
+        ):
+            self.store.import_project(self.source, "race", "1.0.0")
+
+        self.assertEqual(
+            stored_payload.read_text(encoding="utf-8"),
+            '{"generation": 1}',
+        )
+
+    def test_inventory_reports_version_directory_without_manifest(self) -> None:
+        orphan = self.store.root / "projects" / "orphan" / "versions" / "1.0"
+        orphan.mkdir(parents=True)
+        (orphan / "data").mkdir()
+
+        snapshot = self.store.inventory()
+
+        self.assertFalse(snapshot["complete"])
+        self.assertTrue(
+            any(
+                "manifest is missing" in str(item.get("error") or "")
+                for item in snapshot["errors"]
+            )
+        )
+
+    def test_inventory_reports_tampered_immutable_payload(self) -> None:
+        self._write_json(
+            self.source / "interface.json",
+            {
+                "interface_version": 2,
+                "name": "inventory-integrity",
+                "version": "1.0.0",
+                "resource": [{"name": "base", "path": ["Bundle"]}],
+                "task": [],
+            },
+        )
+        self._write_text(self.source / "Bundle" / "pipeline.json", "{}")
+        imported = self.store.import_project(self.source, "demo", "1.0.0")
+        tampered_path = Path(imported["dataPath"]) / "Bundle" / "pipeline.json"
+        tampered_path.write_text('{"tampered": true}', encoding="utf-8")
+
+        snapshot = self.store.inventory()
+
+        self.assertFalse(snapshot["complete"])
+        error = next(
+            item
+            for item in snapshot["errors"]
+            if item.get("projectId") == "demo" and item.get("version") == "1.0.0"
+        )
+        self.assertEqual(error["scope"], "project-version")
+        self.assertEqual(error["path"], str(Path(imported["dataPath"]).parent))
+        self.assertIn("payload integrity check failed", error["error"])
+
+    def test_reparse_root_is_rejected_when_supported(self) -> None:
+        target = self.temp_root / "reparse-target"
+        target.mkdir()
+        link = self.temp_root / "reparse-link"
+        try:
+            link.symlink_to(target, target_is_directory=True)
+        except OSError as exc:
+            self.skipTest(f"directory symlink unavailable: {exc}")
+
+        with self.assertRaisesRegex(MaaFWProjectStoreError, "reparse points"):
+            MaaFWProjectStoreService(link)
 
     def test_resource_lifecycle_transaction_is_task_reentrant(self) -> None:
         async def verify() -> None:
@@ -165,6 +633,8 @@ class MaaFWProjectStoreContractTest(unittest.TestCase):
             set(resolved),
             {
                 "dataPath",
+                "storeId",
+                "activeLeaseIds",
                 "projectId",
                 "version",
                 "runtimeConstraint",
@@ -399,6 +869,56 @@ class MaaFWProjectStoreContractTest(unittest.TestCase):
             )
         )
 
+    def test_missing_bundled_python_uses_managed_route_when_entrypoint_exists(
+        self,
+    ) -> None:
+        self._write_json(
+            self.source / "interface.json",
+            {
+                "interface_version": 2,
+                "name": "missing-bundled-python",
+                "resource": [{"name": "base", "path": ["Bundle"]}],
+                "agent": {
+                    "child_exec": "python/python.exe",
+                    "child_args": ["-u", "agent/bootstrap.py"],
+                    "embedded": True,
+                },
+                "task": [],
+            },
+        )
+        self._write_json(self.source / "Bundle" / "pipeline.json", {})
+        self._write_text(self.source / "agent" / "bootstrap.py", "print('agent')\n")
+        self._write_text(
+            self.source / "requirements.txt",
+            "maafw==5.10.4\nhttpx==0.28.1\n",
+        )
+
+        resolved = self.store.import_project(
+            self.source,
+            "missing-bundled-python",
+            "4.5",
+        )
+        data_path = Path(resolved["dataPath"])
+        runtime = resolved["manifest"]["runtime"]
+        projected_interface = json.loads(
+            (data_path / "interface.json").read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(projected_interface["agent"]["child_exec"], "python")
+        self.assertTrue((data_path / "agent" / "bootstrap.py").is_file())
+        self.assertEqual(runtime["agent"][0]["interpreterRoute"], "managed-python")
+        self.assertEqual(
+            runtime["agent"][0]["strippedInterpreter"]["reason"],
+            "missing-embedded-python",
+        )
+        self.assertTrue(runtime["sharedAgentDependenciesComplete"])
+        self.assertTrue(
+            any(
+                "was missing and was replaced" in warning
+                for warning in resolved["manifest"]["warnings"]
+            )
+        )
+
     def test_required_agent_entrypoint_under_filtered_directory_is_rejected(self) -> None:
         self._write_json(
             self.source / "interface.json",
@@ -584,6 +1104,7 @@ class MaaFWProjectStoreContractTest(unittest.TestCase):
             lease_id="lease-one",
         )
         self.assertEqual(leased["lease"]["leaseId"], "lease-one")
+        self.assertEqual(leased["activeLeaseIds"], ["lease-one"])
         with self.assertRaises(MaaFWProjectStoreError):
             self.store.delete_version("crud", "1.0")
         self.store.release_lease("crud", "1.0", lease_id="lease-one")
@@ -593,6 +1114,38 @@ class MaaFWProjectStoreContractTest(unittest.TestCase):
         self.assertEqual([item["version"] for item in self.store.list_versions("crud")], ["2.0"])
         with self.assertRaises(MaaFWProjectStoreError):
             self.store.delete_version("crud", "2.0")
+
+    def test_version_dto_exposes_only_unexpired_active_lease_ids(self) -> None:
+        self._write_minimal_project()
+        self.store.import_project(self.source, "leases", "1.0", activate=False)
+        with patch(
+            "automas_maafw_project_store.service.time.time",
+            return_value=1_000.0,
+        ):
+            self.store.acquire_lease(
+                "leases",
+                "1.0",
+                owner="worker:one",
+                lease_id="lease-active",
+                ttl_seconds=10,
+            )
+        with patch(
+            "automas_maafw_project_store.service.time.time",
+            return_value=1_005.0,
+        ):
+            active = self.store.list_versions("leases")[0]
+        with patch(
+            "automas_maafw_project_store.service.time.time",
+            return_value=1_011.0,
+        ):
+            expired = self.store.list_versions("leases")[0]
+
+        self.assertEqual(active["activeLeaseIds"], ["lease-active"])
+        self.assertEqual(expired["activeLeaseIds"], [])
+        self.assertEqual(
+            expired["manifest"]["runtime"]["leases"][0]["leaseId"],
+            "lease-active",
+        )
 
     def test_gc_dry_run_grace_and_keep_latest(self) -> None:
         self._write_minimal_project()
@@ -627,6 +1180,78 @@ class MaaFWProjectStoreContractTest(unittest.TestCase):
             {item["version"] for item in self.store.list_versions("gc")},
             {"2.0", "3.0"},
         )
+
+    def test_real_gc_refuses_incomplete_inventory_but_dry_run_reports_it(self) -> None:
+        self._write_minimal_project()
+        imported = self.store.import_project(
+            self.source,
+            "gc-safe",
+            "1.0",
+            activate=False,
+        )
+        corrupt = self.store.root / "projects" / "corrupt-project"
+        corrupt.mkdir()
+
+        preview = self.store.collect_garbage(
+            dry_run=True,
+            grace_seconds=0,
+            keep_latest=0,
+            now=time.time() + 3600,
+        )
+        self.assertFalse(preview["complete"])
+        self.assertTrue(preview["inventoryErrors"])
+        self.assertEqual(preview["deleted"], [])
+        with self.assertRaisesRegex(
+            MaaFWProjectStoreError,
+            "inventory is incomplete",
+        ):
+            self.store.collect_garbage(
+                dry_run=False,
+                grace_seconds=0,
+                keep_latest=0,
+                now=time.time() + 3600,
+            )
+        self.assertTrue(Path(imported["dataPath"]).is_dir())
+
+    def test_gc_refuses_manifest_with_malformed_lease(self) -> None:
+        self._write_minimal_project()
+        imported = self.store.import_project(
+            self.source,
+            "gc-lease-safe",
+            "1.0",
+            activate=False,
+        )
+        manifest_path = Path(imported["manifestPath"])
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["runtime"]["leases"] = [
+            {
+                "leaseId": "possibly-active",
+                "owner": "runner",
+                "expiresAt": "not-a-timestamp",
+            }
+        ]
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        preview = self.store.collect_garbage(
+            dry_run=True,
+            grace_seconds=0,
+            keep_latest=0,
+            now=time.time() + 3600,
+        )
+        self.assertFalse(preview["complete"])
+        self.assertTrue(preview["inventoryErrors"])
+        self.assertEqual(preview["deleted"], [])
+        with self.assertRaisesRegex(
+            MaaFWProjectStoreError,
+            "inventory is incomplete",
+        ):
+            self.store.collect_garbage(
+                dry_run=False,
+                grace_seconds=0,
+                keep_latest=0,
+                now=time.time() + 3600,
+            )
+        self.assertTrue(Path(imported["dataPath"]).is_dir())
 
     def test_same_version_is_idempotent_but_cannot_be_overwritten(self) -> None:
         self._write_minimal_project()

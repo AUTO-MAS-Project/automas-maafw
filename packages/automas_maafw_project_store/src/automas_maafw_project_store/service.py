@@ -20,14 +20,26 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 import json5
 
 
 MANIFEST_FILE_NAME = ".auto_mas_maafw_project.json"
 MANIFEST_SCHEMA_VERSION = 2
+STORE_MARKER_NAME = ".auto_mas_maafw_project_store.json"
+STORE_SCHEMA_VERSION = 1
+STORE_KIND = "auto-mas-maafw-project-store"
 DEFAULT_STORE_DIR = Path("data") / "maafw_project_store"
+RUN_ROOT_MARKER_NAME = ".auto_mas_maafw_project_runs.json"
+RUN_ROOT_SCHEMA_VERSION = 1
+RUN_ROOT_KIND = "auto-mas-maafw-project-runs"
+DEFAULT_RUN_DIR = Path("data") / "maafw_project_runs"
+CHECKOUT_MARKER_NAME = ".auto_mas_maafw_checkout.json"
+CHECKOUT_SCHEMA_VERSION = 1
+CHECKOUT_KIND = "auto-mas-maafw-project-checkout"
+_STORE_LOCKS_GUARD = RLock()
+_STORE_LOCKS: dict[str, RLock] = {}
 
 MAX_ZIP_FILE_COUNT = 200_000
 MAX_ZIP_MEMBER_UNCOMPRESSED_BYTES = 8 * 1024 * 1024 * 1024
@@ -180,6 +192,7 @@ class _RequiredProjectionPath:
     agent_key: str | None = None
     python_entrypoint: bool = False
     allow_stripped_python_interpreter: bool = False
+    source_missing: bool = False
 
 
 @dataclass(frozen=True)
@@ -200,14 +213,43 @@ class MaaFWProjectStoreService:
     pins, bindings or last-used timestamps change.
     """
 
-    def __init__(self, store_root: str | Path | None = None) -> None:
-        requested_root = Path(store_root) if store_root is not None else Path.cwd() / DEFAULT_STORE_DIR
-        absolute_root = Path(os.path.abspath(requested_root))
+    def __init__(
+        self,
+        store_root: str | Path | None = None,
+        *,
+        run_root: str | Path | None = None,
+    ) -> None:
+        default_root = Path.cwd() / DEFAULT_STORE_DIR
+        default_run_root = Path.cwd() / DEFAULT_RUN_DIR
+        absolute_root = _configured_absolute_root(
+            store_root,
+            default_root,
+            "project-store root",
+        )
+        absolute_run_root = _configured_absolute_root(
+            run_root,
+            default_run_root,
+            "project run root",
+        )
         _assert_existing_chain_has_no_reparse(absolute_root)
+        _assert_existing_chain_has_no_reparse(absolute_run_root)
+        if _path_trees_overlap(absolute_root, absolute_run_root):
+            raise MaaFWProjectStoreError(
+                "project-store root and project run root must use separate path trees"
+            )
+        if absolute_root.exists() and not absolute_root.is_dir():
+            raise MaaFWProjectStoreError(
+                f"project-store root must be a directory: {absolute_root}"
+            )
+        if absolute_run_root.exists() and not absolute_run_root.is_dir():
+            raise MaaFWProjectStoreError(
+                f"project run root must be a directory: {absolute_run_root}"
+            )
         absolute_root.mkdir(parents=True, exist_ok=True)
         _assert_not_reparse(absolute_root)
         self.root = absolute_root.resolve(strict=True)
-        self._lock = RLock()
+        self._is_default_root = _same_path(self.root, default_root)
+        self._lock = _store_lock(self.root)
         self._resource_lifecycle_lock = asyncio.Lock()
         self._resource_lifecycle_task: ContextVar[
             asyncio.Task[Any] | None
@@ -215,8 +257,144 @@ class MaaFWProjectStoreService:
             f"maafw_project_resource_lifecycle_{id(self)}",
             default=None,
         )
-        self._projects_root.mkdir(parents=True, exist_ok=True)
-        self._staging_root.mkdir(parents=True, exist_ok=True)
+        with self._lock:
+            self._root_identity = self._initialize_root_identity()
+            _assert_existing_chain_has_no_reparse(self._projects_root)
+            _assert_existing_chain_has_no_reparse(self._staging_root)
+            self._projects_root.mkdir(parents=True, exist_ok=True)
+            self._staging_root.mkdir(parents=True, exist_ok=True)
+            _assert_not_reparse(self._projects_root)
+            _assert_not_reparse(self._staging_root)
+        absolute_run_root.mkdir(parents=True, exist_ok=True)
+        _assert_not_reparse(absolute_run_root)
+        self.run_root = absolute_run_root.resolve(strict=True)
+        self._is_default_run_root = _same_path(self.run_root, default_run_root)
+        self._run_lock = _store_lock(self.run_root)
+        with self._run_lock:
+            self._run_root_identity = self._initialize_run_root_identity()
+            _assert_existing_chain_has_no_reparse(self._run_scripts_root)
+            _assert_existing_chain_has_no_reparse(self._run_staging_root)
+            self._run_scripts_root.mkdir(parents=True, exist_ok=True)
+            self._run_staging_root.mkdir(parents=True, exist_ok=True)
+            _assert_not_reparse(self._run_scripts_root)
+            _assert_not_reparse(self._run_staging_root)
+
+    @property
+    def root_identity(self) -> dict[str, Any]:
+        return _json_clone(self._root_identity)
+
+    @property
+    def rootIdentity(self) -> dict[str, Any]:  # noqa: N802 - public JSON contract
+        return self.root_identity
+
+    def storage_info(self) -> dict[str, Any]:
+        """Return the immutable storage identity selected at service startup."""
+
+        with self._lock, self._run_lock:
+            self._assert_store_identity_unchanged()
+            self._assert_run_identity_unchanged()
+            return {
+                "root": str(self.root),
+                "storeId": self._root_identity["storeId"],
+                "isDefault": self._is_default_root,
+                "rootIdentity": self.root_identity,
+                "runRoot": str(self.run_root),
+                "runRootId": self._run_root_identity["runRootId"],
+                "isDefaultRunRoot": self._is_default_run_root,
+                "runRootIdentity": _json_clone(self._run_root_identity),
+            }
+
+    def _initialize_root_identity(self) -> dict[str, Any]:
+        marker_path = self.root / STORE_MARKER_NAME
+        if marker_path.exists() or marker_path.is_symlink():
+            _assert_not_reparse(marker_path)
+            if not marker_path.is_file():
+                raise MaaFWProjectStoreError(
+                    f"project-store marker must be a file: {marker_path}"
+                )
+            try:
+                marker = json.loads(marker_path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                raise MaaFWProjectStoreError(
+                    f"project-store marker is invalid: {exc}"
+                ) from exc
+            return _validate_store_marker(marker)
+
+        children = list(self.root.iterdir())
+        if children:
+            if not self._is_default_root or not _is_legacy_default_store(children):
+                raise MaaFWProjectStoreError(
+                    "refusing to initialize a non-empty directory without a valid "
+                    f"project-store marker: {self.root}"
+                )
+
+        marker = {
+            "schemaVersion": STORE_SCHEMA_VERSION,
+            "kind": STORE_KIND,
+            "storeId": str(uuid.uuid4()),
+        }
+        _write_json_atomic(marker_path, marker, self.root)
+        return _validate_store_marker(marker)
+
+    def _initialize_run_root_identity(self) -> dict[str, Any]:
+        marker_path = self.run_root / RUN_ROOT_MARKER_NAME
+        if marker_path.exists() or marker_path.is_symlink():
+            _assert_not_reparse(marker_path)
+            if not marker_path.is_file():
+                raise MaaFWProjectStoreError(
+                    f"project run-root marker must be a file: {marker_path}"
+                )
+            try:
+                marker = json.loads(marker_path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                raise MaaFWProjectStoreError(
+                    f"project run-root marker is invalid: {exc}"
+                ) from exc
+            return _validate_run_root_marker(marker)
+        if any(self.run_root.iterdir()):
+            raise MaaFWProjectStoreError(
+                "refusing to initialize a non-empty directory without a valid "
+                f"project run-root marker: {self.run_root}"
+            )
+        marker = {
+            "schemaVersion": RUN_ROOT_SCHEMA_VERSION,
+            "kind": RUN_ROOT_KIND,
+            "runRootId": str(uuid.uuid4()),
+        }
+        _write_json_atomic(marker_path, marker, self.run_root)
+        return _validate_run_root_marker(marker)
+
+    def _assert_store_identity_unchanged(self) -> None:
+        marker_path = self.root / STORE_MARKER_NAME
+        _assert_path_chain_within_root(marker_path, self.root)
+        try:
+            marker = _validate_store_marker(
+                json.loads(marker_path.read_text(encoding="utf-8"))
+            )
+        except Exception as exc:
+            raise MaaFWProjectStoreError(
+                f"project-store identity marker changed or is invalid: {exc}"
+            ) from exc
+        if marker != self._root_identity:
+            raise MaaFWProjectStoreError(
+                "project-store identity changed during the service lifetime"
+            )
+
+    def _assert_run_identity_unchanged(self) -> None:
+        marker_path = self.run_root / RUN_ROOT_MARKER_NAME
+        _assert_path_chain_within_root(marker_path, self.run_root)
+        try:
+            marker = _validate_run_root_marker(
+                json.loads(marker_path.read_text(encoding="utf-8"))
+            )
+        except Exception as exc:
+            raise MaaFWProjectStoreError(
+                f"project run-root identity marker changed or is invalid: {exc}"
+            ) from exc
+        if marker != self._run_root_identity:
+            raise MaaFWProjectStoreError(
+                "project run-root identity changed during the service lifetime"
+            )
 
     @asynccontextmanager
     async def resource_lifecycle_transaction(self) -> AsyncIterator[None]:
@@ -250,6 +428,14 @@ class MaaFWProjectStoreService:
     @property
     def _staging_root(self) -> Path:
         return self.root / ".staging"
+
+    @property
+    def _run_scripts_root(self) -> Path:
+        return self.run_root / "scripts"
+
+    @property
+    def _run_staging_root(self) -> Path:
+        return self.run_root / ".staging"
 
     def import_project(
         self,
@@ -330,6 +516,10 @@ class MaaFWProjectStoreService:
                         f"immutable project version already exists with different content: "
                         f"{normalized_project_id}@{normalized_version}"
                     )
+                self._verify_store_payload(
+                    existing,
+                    final_dir / "data",
+                )
                 if activate:
                     self._write_current(normalized_project_id, normalized_version)
                 return self.resolve_project(
@@ -349,7 +539,18 @@ class MaaFWProjectStoreService:
                 data_dir.mkdir(parents=True, exist_ok=False)
                 cleared_hashes = _clear_native_resource_hashes(plan)
                 _materialize_projection(plan, data_dir)
+                if (
+                    _calculate_projected_source_hash(
+                        source_root,
+                        plan.copied_files,
+                    )
+                    != source_hash
+                ):
+                    raise MaaFWProjectStoreError(
+                        "staged import source changed while project payload was materialized"
+                    )
                 projected_payload_bytes = _tree_size(data_dir)
+                payload_hash = _calculate_store_payload_hash(data_dir)
                 warnings = list(plan.warnings)
                 if cleared_hashes:
                     warnings.append(
@@ -402,6 +603,13 @@ class MaaFWProjectStoreService:
                             "scope": "projected-source",
                             "value": source_hash,
                         },
+                    },
+                    "payload": {
+                        "hash": {
+                            "algorithm": "sha256",
+                            "scope": "store-payload",
+                            "value": payload_hash,
+                        }
                     },
                     "projectInterface": {
                         "path": plan.interface_path.as_posix(),
@@ -531,6 +739,346 @@ class MaaFWProjectStoreService:
                 self._write_manifest(normalized_project_id, resolved_version, manifest)
             return self._build_resolved_record(manifest)
 
+    def checkout_project(
+        self,
+        project_id: str,
+        version: str | None,
+        script_id: str,
+    ) -> dict[str, Any]:
+        """Materialize an isolated, reusable writable copy for one script.
+
+        Store payloads remain immutable. A checkout is copied in full into the
+        run root, marked, and atomically published only after the copy succeeds.
+        Existing matching checkouts are returned without touching their user
+        output; malformed or conflicting directories are never overwritten.
+        """
+
+        normalized_project_id = _validate_component(project_id, "project_id")
+        normalized_script_id = _validate_component(script_id, "script_id")
+        with self._lock, self._run_lock:
+            self._assert_store_identity_unchanged()
+            self._assert_run_identity_unchanged()
+            resolved_version = self._resolve_version(
+                normalized_project_id,
+                version,
+            )
+            manifest = self._load_manifest(
+                normalized_project_id,
+                resolved_version,
+            )
+            source_hash = _manifest_source_hash(manifest)
+            source_dir = self._version_dir(
+                normalized_project_id,
+                resolved_version,
+            ) / "data"
+            payload_hash = _manifest_payload_hash(manifest)
+            identity = {
+                "storeId": self._root_identity["storeId"],
+                "projectId": normalized_project_id,
+                "version": resolved_version,
+                "sourceHash": source_hash,
+                "payloadHash": payload_hash,
+                "scriptId": normalized_script_id,
+            }
+            checkout_id = _checkout_id(identity)
+            script_root = self._run_scripts_root / normalized_script_id
+            final_dir = script_root / "checkouts" / checkout_id
+            _assert_path_chain_within_root(final_dir, self.run_root)
+            if final_dir.exists() or final_dir.is_symlink():
+                return self._load_checkout(final_dir, identity, manifest, reused=True)
+
+            self._verify_store_payload(manifest, source_dir)
+
+            stage_dir = self._run_staging_root / f"{checkout_id}-{uuid.uuid4().hex}"
+            _assert_path_chain_within_root(stage_dir, self.run_root)
+            data_dir = stage_dir / "data"
+            try:
+                stage_dir.mkdir(parents=True, exist_ok=False)
+                _copy_checkout_tree(source_dir, data_dir)
+                copied_hash = _calculate_store_payload_hash(data_dir)
+                if copied_hash != payload_hash:
+                    raise MaaFWProjectStoreError(
+                        "project-store payload changed while preparing checkout; "
+                        "refusing to publish an inconsistent run directory"
+                    )
+                marker = {
+                    "schemaVersion": CHECKOUT_SCHEMA_VERSION,
+                    "kind": CHECKOUT_KIND,
+                    "checkoutId": checkout_id,
+                    "runRootId": self._run_root_identity["runRootId"],
+                    "identity": identity,
+                    "createdAt": _format_timestamp(),
+                    "lastUsedAt": _format_timestamp(),
+                    "dataRelativePath": "data",
+                    "leases": [],
+                }
+                _write_json(stage_dir / CHECKOUT_MARKER_NAME, marker)
+                self._validate_checkout(stage_dir, identity, manifest)
+                final_dir.parent.mkdir(parents=True, exist_ok=True)
+                _assert_path_chain_within_root(final_dir.parent, self.run_root)
+                stage_dir.replace(final_dir)
+            except FileExistsError as exc:
+                if stage_dir.exists():
+                    _safe_remove_tree(stage_dir, self.run_root)
+                if final_dir.exists() or final_dir.is_symlink():
+                    return self._load_checkout(
+                        final_dir,
+                        identity,
+                        manifest,
+                        reused=True,
+                    )
+                raise MaaFWProjectStoreError(
+                    f"project checkout path conflict: {final_dir}"
+                ) from exc
+            except Exception:
+                if stage_dir.exists():
+                    _safe_remove_tree(stage_dir, self.run_root)
+                raise
+            return self._load_checkout(final_dir, identity, manifest, reused=False)
+
+    def _load_checkout(
+        self,
+        checkout_root: Path,
+        expected_identity: dict[str, str],
+        manifest: dict[str, Any],
+        *,
+        reused: bool,
+    ) -> dict[str, Any]:
+        marker = self._validate_checkout(checkout_root, expected_identity, manifest)
+        if reused:
+            if marker.get("leases") is None:
+                marker["leases"] = []
+            marker["lastUsedAt"] = _format_timestamp()
+            _write_json_atomic(
+                checkout_root / CHECKOUT_MARKER_NAME,
+                marker,
+                self.run_root,
+            )
+        data_path = (checkout_root / "data").resolve(strict=True)
+        lease_values = marker.get("leases")
+        lease_capable = isinstance(lease_values, list)
+        return {
+            "checkoutId": marker["checkoutId"],
+            "dataPath": str(data_path),
+            "projectId": expected_identity["projectId"],
+            "version": expected_identity["version"],
+            "scriptId": expected_identity["scriptId"],
+            "sourceHash": expected_identity["sourceHash"],
+            "payloadHash": expected_identity["payloadHash"],
+            "storeId": expected_identity["storeId"],
+            "runRootId": self._run_root_identity["runRootId"],
+            "reused": bool(reused),
+            "createdAt": marker.get("createdAt"),
+            "lastUsedAt": marker.get("lastUsedAt"),
+            "leaseProtectionAvailable": lease_capable,
+            "activeLeaseIds": [
+                str(item["leaseId"])
+                for item in _active_leases(
+                    lease_values,
+                    time.time(),
+                )
+            ],
+        }
+
+    def acquire_checkout_lease(
+        self,
+        checkout_id: str,
+        script_id: str,
+        lease_id: str,
+        *,
+        owner: str,
+        ttl_seconds: float = 5 * 60,
+    ) -> dict[str, Any]:
+        if ttl_seconds <= 0:
+            raise MaaFWProjectStoreError("checkout lease ttl_seconds must be positive")
+        normalized_owner = str(owner or "").strip()
+        normalized_lease_id = str(lease_id or "").strip()
+        if not normalized_owner or not normalized_lease_id:
+            raise MaaFWProjectStoreError("checkout lease owner and lease_id are required")
+        with self._run_lock:
+            marker_path, marker = self._load_checkout_marker_by_id(
+                checkout_id,
+                script_id,
+            )
+            if not isinstance(marker.get("leases"), list):
+                raise MaaFWProjectStoreError(
+                    "checkout marker does not support leases; refusing unsafe activation"
+                )
+            now_value = time.time()
+            leases = [
+                item
+                for item in _active_leases(marker["leases"], now_value)
+                if item.get("leaseId") != normalized_lease_id
+            ]
+            leases.append(
+                {
+                    "leaseId": normalized_lease_id,
+                    "owner": normalized_owner,
+                    "acquiredAt": _format_timestamp(now_value),
+                    "expiresAt": _format_timestamp(
+                        now_value + float(ttl_seconds)
+                    ),
+                }
+            )
+            marker["leases"] = leases
+            marker["lastUsedAt"] = _format_timestamp(now_value)
+            _write_json_atomic(marker_path, marker, self.run_root)
+            return self._checkout_marker_record(marker_path.parent, marker)
+
+    def release_checkout_lease(
+        self,
+        checkout_id: str,
+        script_id: str,
+        lease_id: str,
+    ) -> dict[str, Any]:
+        normalized_lease_id = str(lease_id or "").strip()
+        if not normalized_lease_id:
+            raise MaaFWProjectStoreError("checkout lease_id is required")
+        with self._run_lock:
+            marker_path, marker = self._load_checkout_marker_by_id(
+                checkout_id,
+                script_id,
+            )
+            leases = marker.get("leases")
+            if not isinstance(leases, list):
+                raise MaaFWProjectStoreError(
+                    "checkout marker does not support leases"
+                )
+            marker["leases"] = [
+                item
+                for item in _active_leases(leases, time.time())
+                if item.get("leaseId") != normalized_lease_id
+            ]
+            _write_json_atomic(marker_path, marker, self.run_root)
+            return self._checkout_marker_record(marker_path.parent, marker)
+
+    def _load_checkout_marker_by_id(
+        self,
+        checkout_id: str,
+        script_id: str,
+    ) -> tuple[Path, dict[str, Any]]:
+        normalized_checkout_id = str(checkout_id or "").strip()
+        if not re.fullmatch(r"maafw-checkout-[0-9a-f]{32}", normalized_checkout_id):
+            raise MaaFWProjectStoreError("checkout_id is invalid")
+        normalized_script_id = _validate_component(script_id, "script_id")
+        checkout_root = (
+            self._run_scripts_root
+            / normalized_script_id
+            / "checkouts"
+            / normalized_checkout_id
+        )
+        _assert_path_chain_within_root(checkout_root, self.run_root)
+        marker_path = checkout_root / CHECKOUT_MARKER_NAME
+        _assert_not_reparse(marker_path)
+        try:
+            marker = _validate_checkout_marker(
+                json.loads(marker_path.read_text(encoding="utf-8"))
+            )
+        except Exception as exc:
+            raise MaaFWProjectStoreError(
+                f"cannot read checkout marker: {exc}"
+            ) from exc
+        if (
+            marker["checkoutId"] != normalized_checkout_id
+            or marker["identity"]["scriptId"] != normalized_script_id
+            or marker["runRootId"] != self._run_root_identity["runRootId"]
+        ):
+            raise MaaFWProjectStoreError("checkout marker identity mismatch")
+        return marker_path, marker
+
+    def _checkout_marker_record(
+        self,
+        checkout_root: Path,
+        marker: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        identity = dict(marker["identity"])
+        leases = marker.get("leases")
+        return {
+            "checkoutId": marker["checkoutId"],
+            "dataPath": str((checkout_root / "data").resolve(strict=True)),
+            **identity,
+            "runRootId": marker["runRootId"],
+            "createdAt": marker.get("createdAt"),
+            "lastUsedAt": marker.get("lastUsedAt"),
+            "leaseProtectionAvailable": isinstance(leases, list),
+            "activeLeaseIds": [
+                str(item["leaseId"])
+                for item in _active_leases(leases, time.time())
+            ],
+        }
+
+    def _validate_checkout(
+        self,
+        checkout_root: Path,
+        expected_identity: dict[str, str],
+        manifest: dict[str, Any],
+    ) -> dict[str, Any]:
+        _assert_path_chain_within_root(checkout_root, self.run_root)
+        _assert_not_reparse(checkout_root)
+        if not checkout_root.is_dir():
+            raise MaaFWProjectStoreError(
+                f"project checkout must be a directory: {checkout_root}"
+            )
+        marker_path = checkout_root / CHECKOUT_MARKER_NAME
+        _assert_not_reparse(marker_path)
+        if not marker_path.is_file():
+            raise MaaFWProjectStoreError(
+                f"project checkout marker is missing: {checkout_root}"
+            )
+        try:
+            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise MaaFWProjectStoreError(
+                f"project checkout marker is invalid: {exc}"
+            ) from exc
+        validated = _validate_checkout_marker(marker)
+        expected_checkout_id = _checkout_id(expected_identity)
+        if (
+            validated["checkoutId"] != expected_checkout_id
+            or validated["runRootId"] != self._run_root_identity["runRootId"]
+            or validated["identity"] != expected_identity
+        ):
+            raise MaaFWProjectStoreError(
+                f"project checkout identity mismatch: {checkout_root}"
+            )
+        data_path = checkout_root / "data"
+        _assert_path_chain_within_root(data_path, self.run_root)
+        _assert_not_reparse(data_path)
+        if not data_path.is_dir():
+            raise MaaFWProjectStoreError(
+                f"project checkout data is missing: {checkout_root}"
+            )
+        if (data_path / MANIFEST_FILE_NAME).exists():
+            raise MaaFWProjectStoreError(
+                "project checkout contains the private Project Store manifest"
+            )
+        interface_relative = _normalize_relative_path(
+            manifest.get("projectInterface", {}).get("path"),
+            "projectInterface.path",
+        )
+        interface_path = data_path / interface_relative
+        _assert_path_chain_within_root(interface_path, self.run_root)
+        _assert_not_reparse(interface_path)
+        if not interface_path.is_file():
+            raise MaaFWProjectStoreError(
+                f"project checkout interface is missing: {interface_path}"
+            )
+        return validated
+
+    @staticmethod
+    def _verify_store_payload(
+        manifest: Mapping[str, Any],
+        data_path: Path,
+    ) -> str:
+        expected_hash = _manifest_payload_hash(manifest)
+        actual_hash = _calculate_store_payload_hash(data_path)
+        if actual_hash != expected_hash:
+            raise MaaFWProjectStoreError(
+                "immutable project-store payload integrity check failed; "
+                "refusing to create or reuse a checkout"
+            )
+        return expected_hash
+
     def list_versions(self, project_id: str) -> list[dict[str, Any]]:
         normalized_project_id = _validate_component(project_id, "project_id")
         with self._lock:
@@ -573,6 +1121,7 @@ class MaaFWProjectStoreService:
                             {
                                 "version": item["version"],
                                 "current": item["current"],
+                                "activeLeaseIds": list(item["activeLeaseIds"]),
                                 "summary": _json_clone(item["summary"]),
                             }
                             for item in versions
@@ -588,6 +1137,225 @@ class MaaFWProjectStoreService:
                     }
                 )
             return result
+
+    def inventory(self) -> dict[str, Any]:
+        """Return a fail-closed inventory instead of hiding corrupt entries."""
+
+        with self._lock, self._run_lock:
+            self._assert_store_identity_unchanged()
+            self._assert_run_identity_unchanged()
+            errors = self._inventory_project_structure()
+            try:
+                items = self.list_projects()
+            except Exception as exc:
+                items = []
+                errors.append(
+                    {
+                        "scope": "project-store",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+            checkouts, checkout_errors = self._inventory_checkouts()
+            errors.extend(checkout_errors)
+            return {
+                "complete": not errors,
+                "items": items,
+                "checkouts": checkouts,
+                "errors": errors,
+                "rootIdentity": self.root_identity,
+                "runRootIdentity": _json_clone(self._run_root_identity),
+            }
+
+    def _inventory_project_structure(self) -> list[dict[str, Any]]:
+        """Report Store-shaped entries that tolerant list APIs would skip."""
+
+        errors: list[dict[str, Any]] = []
+        for project_root in self._projects_root.iterdir():
+            try:
+                _assert_not_reparse(project_root)
+                if not project_root.is_dir():
+                    raise MaaFWProjectStoreError(
+                        f"project-store entry must be a directory: {project_root}"
+                    )
+                project_id = _validate_component(project_root.name, "project_id")
+                unknown = [
+                    item
+                    for item in project_root.iterdir()
+                    if item.name not in {"current.json", "versions"}
+                ]
+                if unknown:
+                    raise MaaFWProjectStoreError(
+                        "project directory contains unknown entries: "
+                        f"{project_root}"
+                    )
+                current_path = project_root / "current.json"
+                if current_path.exists() or current_path.is_symlink():
+                    _assert_not_reparse(current_path)
+                    self._read_current(project_id)
+                versions_root = project_root / "versions"
+                if not versions_root.exists():
+                    raise MaaFWProjectStoreError(
+                        f"project versions directory is missing: {project_root}"
+                    )
+                _assert_not_reparse(versions_root)
+                if not versions_root.is_dir():
+                    raise MaaFWProjectStoreError(
+                        f"project versions path must be a directory: {versions_root}"
+                    )
+                for version_root in versions_root.iterdir():
+                    version_name = version_root.name
+                    try:
+                        _assert_not_reparse(version_root)
+                        if not version_root.is_dir():
+                            raise MaaFWProjectStoreError(
+                                "project version entry must be a directory: "
+                                f"{version_root}"
+                            )
+                        version = _validate_component(version_name, "version")
+                        manifest_path = self._manifest_path(project_id, version)
+                        _assert_path_chain_within_root(manifest_path, self.root)
+                        _assert_not_reparse(manifest_path)
+                        if not manifest_path.is_file():
+                            raise MaaFWProjectStoreError(
+                                "project version manifest is missing: "
+                                f"{project_id}@{version}"
+                            )
+                        manifest = self._load_manifest(project_id, version)
+                        self._verify_store_payload(
+                            manifest,
+                            version_root / "data",
+                        )
+                    except Exception as exc:
+                        errors.append(
+                            {
+                                "scope": "project-version",
+                                "projectId": project_id,
+                                "version": version_name,
+                                "path": str(version_root),
+                                "error": f"{type(exc).__name__}: {exc}",
+                            }
+                        )
+            except Exception as exc:
+                errors.append(
+                    {
+                        "scope": "project-store",
+                        "path": str(project_root),
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+        return errors
+
+    def _inventory_checkouts(
+        self,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        items: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = []
+        for script_root in self._run_scripts_root.iterdir():
+            try:
+                _assert_not_reparse(script_root)
+                script_id = _validate_component(script_root.name, "script_id")
+                if not script_root.is_dir():
+                    raise MaaFWProjectStoreError(
+                        f"project run script path must be a directory: {script_root}"
+                    )
+                children = list(script_root.iterdir())
+                unknown = [child for child in children if child.name != "checkouts"]
+                if unknown:
+                    raise MaaFWProjectStoreError(
+                        f"project run script directory contains unknown entries: {script_root}"
+                    )
+                checkouts_root = script_root / "checkouts"
+                if not checkouts_root.exists():
+                    continue
+                _assert_not_reparse(checkouts_root)
+                if not checkouts_root.is_dir():
+                    raise MaaFWProjectStoreError(
+                        f"project checkouts path must be a directory: {checkouts_root}"
+                    )
+                for checkout_root in checkouts_root.iterdir():
+                    try:
+                        _assert_not_reparse(checkout_root)
+                        marker_path = checkout_root / CHECKOUT_MARKER_NAME
+                        _assert_not_reparse(marker_path)
+                        marker = _validate_checkout_marker(
+                            json.loads(marker_path.read_text(encoding="utf-8"))
+                        )
+                        identity = marker["identity"]
+                        if (
+                            not checkout_root.is_dir()
+                            or marker["checkoutId"] != checkout_root.name
+                            or marker["runRootId"]
+                            != self._run_root_identity["runRootId"]
+                            or identity["scriptId"] != script_id
+                            or _checkout_id(identity) != checkout_root.name
+                        ):
+                            raise MaaFWProjectStoreError(
+                                f"project checkout identity mismatch: {checkout_root}"
+                            )
+                        data_path = checkout_root / "data"
+                        _assert_not_reparse(data_path)
+                        if not data_path.is_dir():
+                            raise MaaFWProjectStoreError(
+                                f"project checkout data is missing: {checkout_root}"
+                            )
+                        if (data_path / MANIFEST_FILE_NAME).exists():
+                            raise MaaFWProjectStoreError(
+                                "project checkout contains the private Project Store manifest"
+                            )
+                        store_available = True
+                        try:
+                            manifest = self._load_manifest(
+                                identity["projectId"],
+                                identity["version"],
+                            )
+                        except MaaFWProjectStoreError:
+                            store_available = False
+                        else:
+                            self._validate_checkout(
+                                checkout_root,
+                                identity,
+                                manifest,
+                            )
+                        items.append(
+                            {
+                                "checkoutId": marker["checkoutId"],
+                                "dataPath": str(data_path.resolve(strict=True)),
+                                **identity,
+                                "runRootId": marker["runRootId"],
+                                "storeAvailable": store_available,
+                                "createdAt": marker.get("createdAt"),
+                                "lastUsedAt": marker.get("lastUsedAt"),
+                                "leaseProtectionAvailable": isinstance(
+                                    marker.get("leases"),
+                                    list,
+                                ),
+                                "activeLeaseIds": [
+                                    str(item["leaseId"])
+                                    for item in _active_leases(
+                                        marker.get("leases"),
+                                        time.time(),
+                                    )
+                                ],
+                            }
+                        )
+                    except Exception as exc:
+                        errors.append(
+                            {
+                                "scope": "project-checkout",
+                                "scriptId": script_id,
+                                "path": str(checkout_root),
+                                "error": f"{type(exc).__name__}: {exc}",
+                            }
+                        )
+            except Exception as exc:
+                errors.append(
+                    {
+                        "scope": "project-run-script",
+                        "path": str(script_root),
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+        return items, errors
 
     def switch_version(self, project_id: str, version: str) -> dict[str, Any]:
         normalized_project_id = _validate_component(project_id, "project_id")
@@ -799,6 +1567,7 @@ class MaaFWProjectStoreService:
         grace_seconds: float = 24 * 60 * 60,
         keep_latest: int = 1,
         now: float | None = None,
+        checkout_context: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         if grace_seconds < 0:
             raise MaaFWProjectStoreError("grace_seconds cannot be negative")
@@ -811,7 +1580,37 @@ class MaaFWProjectStoreService:
         )
         current_time = float(now if now is not None else time.time())
 
-        with self._lock:
+        with self._lock, self._run_lock:
+            inventory = self.inventory()
+            if not inventory["complete"]:
+                if not dry_run:
+                    raise MaaFWProjectStoreError(
+                        "refusing project-store garbage collection because "
+                        "resource inventory is incomplete"
+                    )
+                return {
+                    "dryRun": True,
+                    "complete": False,
+                    "inventoryErrors": _json_clone(inventory["errors"]),
+                    "graceSeconds": grace_seconds,
+                    "keepLatest": keep_latest,
+                    "candidates": [],
+                    "deleted": [],
+                    "kept": [],
+                    "reclaimedBytes": 0,
+                    "checkoutGarbageCollection": {
+                        "candidates": [],
+                        "deleted": [],
+                        "kept": [],
+                    },
+                }
+            checkout_gc = self._collect_checkout_garbage(
+                inventory.get("checkouts") or [],
+                dry_run=bool(dry_run),
+                grace_seconds=float(grace_seconds),
+                current_time=current_time,
+                context=checkout_context,
+            )
             project_ids = (
                 [normalized_project_id]
                 if normalized_project_id is not None
@@ -890,13 +1689,150 @@ class MaaFWProjectStoreService:
 
             return {
                 "dryRun": bool(dry_run),
+                "complete": True,
+                "inventoryErrors": [],
                 "graceSeconds": grace_seconds,
                 "keepLatest": keep_latest,
                 "candidates": candidates,
                 "deleted": deleted,
                 "kept": kept,
                 "reclaimedBytes": reclaimed_bytes,
+                "checkoutGarbageCollection": checkout_gc,
             }
+
+    def _collect_checkout_garbage(
+        self,
+        checkouts: Iterable[Mapping[str, Any]],
+        *,
+        dry_run: bool,
+        grace_seconds: float,
+        current_time: float,
+        context: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        context_data = dict(context) if isinstance(context, Mapping) else {}
+        bindings_value = context_data.get("managedBindings")
+        bindings = dict(bindings_value) if isinstance(bindings_value, Mapping) else {}
+        active_script_ids_value = context_data.get("activeScriptIds")
+        if not isinstance(active_script_ids_value, (list, tuple, set, frozenset)):
+            active_script_ids_value = []
+        active_script_ids = {
+            str(item).strip()
+            for item in active_script_ids_value
+            if isinstance(item, str) and item.strip()
+        }
+        confirmed = bool(context_data.get("confirmed"))
+        candidates: list[dict[str, Any]] = []
+        kept: list[dict[str, Any]] = []
+        deleted: list[dict[str, Any]] = []
+        reclaimed_bytes = 0
+        for raw_checkout in checkouts:
+            checkout = dict(raw_checkout)
+            script_id = str(checkout.get("scriptId") or "")
+            project_id = str(checkout.get("projectId") or "")
+            version = str(checkout.get("version") or "")
+            checkout_id = str(checkout.get("checkoutId") or "")
+            binding_value = bindings.get(script_id)
+            binding = (
+                dict(binding_value)
+                if isinstance(binding_value, Mapping)
+                else None
+            )
+            binding_matches = bool(
+                binding
+                and str(binding.get("projectId") or "") == project_id
+                and str(binding.get("version") or "") == version
+            )
+            orphan_reason = None
+            if binding is None:
+                orphan_reason = "managed-script-missing"
+            elif not binding_matches:
+                orphan_reason = "script-binding-moved"
+            elif not checkout.get("storeAvailable"):
+                orphan_reason = "store-version-missing"
+
+            reasons: list[str] = []
+            if not context_data:
+                reasons.append("checkout-context-unavailable")
+            if binding_matches:
+                reasons.append("managed-script-binding")
+            if script_id in active_script_ids:
+                reasons.append("active-operation")
+            if checkout.get("activeLeaseIds"):
+                reasons.append("active-lease")
+            if not checkout.get("leaseProtectionAvailable"):
+                reasons.append("checkout-lease-unavailable")
+            age_anchor = checkout.get("lastUsedAt") or checkout.get("createdAt")
+            age_seconds = max(0.0, current_time - _parse_timestamp(age_anchor))
+            if age_seconds < grace_seconds:
+                reasons.append("grace-period")
+            if orphan_reason is None and not binding_matches:
+                reasons.append("orphan-state-unknown")
+            if not dry_run and not confirmed:
+                reasons.append("explicit-confirmation-required")
+
+            summary = {
+                "checkoutId": checkout_id,
+                "scriptId": script_id,
+                "projectId": project_id,
+                "version": version,
+                "dataPath": checkout.get("dataPath"),
+                "ageSeconds": age_seconds,
+                "orphanReason": orphan_reason,
+            }
+            if reasons:
+                summary["reasons"] = sorted(set(reasons))
+                kept.append(summary)
+                continue
+            checkout_root = (
+                self._run_scripts_root
+                / _validate_component(script_id, "script_id")
+                / "checkouts"
+                / checkout_id
+            )
+            summary["bytes"] = _tree_size(checkout_root)
+            candidates.append(summary)
+            if dry_run:
+                continue
+            marker_path, marker = self._load_checkout_marker_by_id(
+                checkout_id,
+                script_id,
+            )
+            marker_identity = marker["identity"]
+            if (
+                marker_identity["projectId"] != project_id
+                or marker_identity["version"] != version
+            ):
+                raise MaaFWProjectStoreError(
+                    f"checkout identity changed during garbage collection: {checkout_id}"
+                )
+            if not isinstance(marker.get("leases"), list):
+                raise MaaFWProjectStoreError(
+                    f"checkout lease protection became unavailable during garbage collection: {checkout_id}"
+                )
+            if _active_leases(marker.get("leases"), time.time()):
+                raise MaaFWProjectStoreError(
+                    f"checkout became active during garbage collection: {checkout_id}"
+                )
+            refreshed_age_anchor = marker.get("lastUsedAt") or marker.get("createdAt")
+            if max(0.0, time.time() - _parse_timestamp(refreshed_age_anchor)) < grace_seconds:
+                raise MaaFWProjectStoreError(
+                    f"checkout was reused during garbage collection: {checkout_id}"
+                )
+            _safe_remove_tree(marker_path.parent, self.run_root)
+            reclaimed_bytes += int(summary["bytes"])
+            deleted.append(dict(summary))
+            checkouts_root = marker_path.parent.parent
+            script_root = checkouts_root.parent
+            if checkouts_root.is_dir() and not any(checkouts_root.iterdir()):
+                checkouts_root.rmdir()
+            if script_root.is_dir() and not any(script_root.iterdir()):
+                script_root.rmdir()
+        return {
+            "candidates": candidates,
+            "deleted": deleted,
+            "kept": kept,
+            "reclaimedBytes": reclaimed_bytes,
+        }
 
     def _build_resolved_record(self, manifest: dict[str, Any]) -> dict[str, Any]:
         project_id = str(manifest["projectId"])
@@ -905,11 +1841,19 @@ class MaaFWProjectStoreService:
         interface_relative = Path(str(manifest["projectInterface"]["path"]))
         interface_path = (data_path / interface_relative).resolve(strict=True)
         _assert_within(interface_path, data_path)
+        runtime = manifest.get("runtime")
+        runtime = runtime if isinstance(runtime, dict) else {}
+        active_lease_ids = [
+            str(item["leaseId"])
+            for item in _active_leases(runtime.get("leases"), time.time())
+        ]
         return {
             "dataPath": str(data_path.resolve(strict=True)),
+            "storeId": self._root_identity["storeId"],
             "projectId": project_id,
             "version": version,
             "runtimeConstraint": manifest.get("runtime", {}).get("constraint"),
+            "activeLeaseIds": active_lease_ids,
             "manifestPath": str((data_path / MANIFEST_FILE_NAME).resolve(strict=True)),
             "projectInterfacePath": str(interface_path),
             "summary": _build_inventory_summary(manifest),
@@ -928,6 +1872,7 @@ class MaaFWProjectStoreService:
         return self._version_dir(project_id, version) / "data" / MANIFEST_FILE_NAME
 
     def _load_manifest(self, project_id: str, version: str) -> dict[str, Any]:
+        self._assert_store_identity_unchanged()
         manifest_path = self._manifest_path(project_id, version)
         if not manifest_path.is_file():
             raise MaaFWProjectStoreError(
@@ -957,6 +1902,7 @@ class MaaFWProjectStoreService:
         version: str,
         manifest: dict[str, Any],
     ) -> None:
+        self._assert_store_identity_unchanged()
         _write_json_atomic(
             self._manifest_path(project_id, version),
             manifest,
@@ -1103,6 +2049,7 @@ def _build_projection_plan(
         agent_key: str | None = None,
         python_entrypoint: bool = False,
         allow_stripped_python_interpreter: bool = False,
+        allow_missing_python_interpreter: bool = False,
     ) -> None:
         normalized = _normalize_relative_path(
             relative_path.as_posix(),
@@ -1112,6 +2059,34 @@ def _build_projection_plan(
         absolute = (source_root / normalized).resolve(strict=False)
         _assert_within(absolute, source_root)
         if not absolute.exists():
+            if required and allow_missing_python_interpreter:
+                exact_path = _normalize_relative_path(
+                    (required_path or normalized).as_posix(),
+                    f"required {label}",
+                    allow_root=True,
+                )
+                exact_absolute = (source_root / exact_path).resolve(strict=False)
+                _assert_within(exact_absolute, source_root)
+                if exact_absolute.exists():
+                    raise MaaFWProjectStoreError(
+                        f"required {label} retention root does not exist: "
+                        f"{relative_path.as_posix()}"
+                    )
+                required_paths.append(
+                    _RequiredProjectionPath(
+                        path=exact_path,
+                        label=label,
+                        is_directory=False,
+                        agent_index=agent_index,
+                        agent_key=agent_key,
+                        python_entrypoint=python_entrypoint,
+                        allow_stripped_python_interpreter=(
+                            allow_stripped_python_interpreter
+                        ),
+                        source_missing=True,
+                    )
+                )
+                return
             if required:
                 raise MaaFWProjectStoreError(f"required {label} path does not exist: {relative_path}")
             warnings.append(f"optional {label} path was not found and was not copied: {relative_path}")
@@ -1382,15 +2357,24 @@ def _validate_required_projection_paths(
         )
         if retained:
             continue
-        reason = _exclusion_reason(
-            requirement.path,
-            is_directory=requirement.is_directory,
+        reason = (
+            "missing-embedded-python"
+            if requirement.source_missing
+            else _exclusion_reason(
+                requirement.path,
+                is_directory=requirement.is_directory,
+            )
         )
         if (
             requirement.allow_stripped_python_interpreter
             and not requirement.is_directory
             and _is_python_interpreter_path(requirement.path)
-            and reason in {"embedded-python", "embedded-runtime"}
+            and reason
+            in {
+                "embedded-python",
+                "embedded-runtime",
+                "missing-embedded-python",
+            }
             and requirement.agent_index is not None
             and requirement.agent_key is not None
             and python_entrypoints.get(requirement.agent_key)
@@ -1409,8 +2393,13 @@ def _validate_required_projection_paths(
             }
             agent["interpreterRoute"] = "managed-python"
             agent["projectedChildExec"] = "python"
+            action = (
+                "was missing and was replaced"
+                if requirement.source_missing
+                else "was stripped"
+            )
             warnings.append(
-                f"{requirement.label} embedded Python interpreter was stripped "
+                f"{requirement.label} embedded Python interpreter {action} "
                 f"({requirement.path.as_posix()}); retained Python entrypoint(s): "
                 f"{', '.join(entrypoints)}."
             )
@@ -1797,8 +2786,17 @@ def _rewrite_agent_paths(
                 interface_base,
                 source_root,
                 f"agent[{index}].{key}",
-                required=True,
+                required=False,
             )
+            managed_python_interpreter = (
+                classification == "python"
+                and _is_python_interpreter_path(source_path)
+            )
+            if not source_path.exists() and not managed_python_interpreter:
+                raise MaaFWProjectStoreError(
+                    f"agent[{index}].{key} path does not exist in the "
+                    f"unpacked release: {raw_exec}"
+                )
             add_target(
                 _agent_retention_root(source_path, source_root),
                 complete=False,
@@ -1812,16 +2810,18 @@ def _rewrite_agent_paths(
                     and source_path.suffix.casefold() in {".py", ".pyw"}
                 ),
                 allow_stripped_python_interpreter=(
-                    classification == "python"
-                    and _is_python_interpreter_path(source_path)
+                    managed_python_interpreter
                 ),
+                allow_missing_python_interpreter=managed_python_interpreter,
             )
             projected_agent[key] = (
                 "python"
-                if classification == "python"
-                and _is_python_interpreter_path(source_path)
-                and _exclusion_reason(source_path.relative_to(source_root))
-                in {"embedded-python", "embedded-runtime"}
+                if managed_python_interpreter
+                and (
+                    not source_path.exists()
+                    or _exclusion_reason(source_path.relative_to(source_root))
+                    in {"embedded-python", "embedded-runtime"}
+                )
                 else _format_project_path(output_path)
             )
         for key in ("child_args", "childArgs"):
@@ -2372,12 +3372,25 @@ def _materialize_import_source(
 
     if source.is_dir():
         root = _canonical_source_directory(source, store_root)
-        return _ImportSource(
-            root=root,
-            input_path=source,
-            kind="directory",
-            input_size_bytes=_tree_size(root),
-        )
+        stage_dir = staging_root / f"import-directory-{uuid.uuid4().hex}"
+        snapshot_root = stage_dir / "source"
+        _assert_path_chain_within_root(stage_dir, store_root)
+        try:
+            input_size_bytes = _copy_stable_directory_snapshot(
+                root,
+                snapshot_root,
+            )
+            return _ImportSource(
+                root=snapshot_root.resolve(strict=True),
+                input_path=source,
+                kind="directory",
+                input_size_bytes=input_size_bytes,
+                cleanup_root=stage_dir,
+            )
+        except Exception:
+            if stage_dir.exists():
+                _safe_remove_tree(stage_dir, store_root)
+            raise
 
     if not source.is_file():
         raise MaaFWProjectStoreError(
@@ -2412,6 +3425,81 @@ def _materialize_import_source(
         if stage_dir.exists():
             _safe_remove_tree(stage_dir, store_root)
         raise
+
+
+def _copy_stable_directory_snapshot(source_root: Path, snapshot_root: Path) -> int:
+    """Copy one stable external directory state into private Store staging."""
+
+    before_hash, before_size, directories, files = _calculate_source_tree_identity(
+        source_root
+    )
+    snapshot_root.mkdir(parents=True, exist_ok=False)
+    for relative_directory in sorted(
+        directories,
+        key=lambda path: (len(path.parts), path.as_posix()),
+    ):
+        if relative_directory == Path("."):
+            continue
+        (snapshot_root / relative_directory).mkdir(parents=True, exist_ok=False)
+
+    for relative_file in sorted(files, key=lambda path: path.as_posix()):
+        source_file = source_root / relative_file
+        _assert_existing_chain_has_no_reparse(source_file)
+        _assert_not_reparse(source_file)
+        if not source_file.is_file():
+            raise MaaFWProjectStoreError(
+                f"source entry changed while it was being imported: {source_file}"
+            )
+        destination = snapshot_root / relative_file
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_file, destination)
+        _assert_existing_chain_has_no_reparse(source_file)
+        _assert_not_reparse(source_file)
+
+    after_hash, after_size, _, _ = _calculate_source_tree_identity(source_root)
+    snapshot_hash, snapshot_size, _, _ = _calculate_source_tree_identity(snapshot_root)
+    if (
+        before_hash != after_hash
+        or before_hash != snapshot_hash
+        or before_size != after_size
+        or before_size != snapshot_size
+    ):
+        raise MaaFWProjectStoreError(
+            "source directory changed while it was being imported"
+        )
+    return before_size
+
+
+def _calculate_source_tree_identity(
+    root: Path,
+) -> tuple[str, int, set[Path], set[Path]]:
+    directories, files = _scan_safe_tree(root)
+    digest = hashlib.sha256()
+    total_size = 0
+    for relative_directory in sorted(directories, key=lambda path: path.as_posix()):
+        encoded = relative_directory.as_posix().encode("utf-8")
+        digest.update(b"D")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    for relative_file in sorted(files, key=lambda path: path.as_posix()):
+        source_file = root / relative_file
+        _assert_existing_chain_has_no_reparse(source_file)
+        _assert_not_reparse(source_file)
+        if not source_file.is_file():
+            raise MaaFWProjectStoreError(
+                f"source entry changed while it was being imported: {source_file}"
+            )
+        encoded = relative_file.as_posix().encode("utf-8")
+        digest.update(b"F")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+        with source_file.open("rb") as file:
+            for chunk in iter(lambda: file.read(1024 * 1024), b""):
+                total_size += len(chunk)
+                digest.update(chunk)
+        _assert_existing_chain_has_no_reparse(source_file)
+        _assert_not_reparse(source_file)
+    return digest.hexdigest(), total_size, directories, files
 
 
 def _select_zip_release_root(extract_root: Path) -> Path:
@@ -2716,6 +3804,245 @@ def _assert_existing_chain_has_no_reparse(path: Path) -> None:
         current = current.parent
     for item in reversed(existing):
         _assert_not_reparse(item)
+
+
+def _validate_store_marker(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise MaaFWProjectStoreError("project-store marker must be a JSON object")
+    if value.get("schemaVersion") != STORE_SCHEMA_VERSION:
+        raise MaaFWProjectStoreError("project-store marker version is unsupported")
+    if value.get("kind") != STORE_KIND:
+        raise MaaFWProjectStoreError("project-store marker kind is invalid")
+    store_id = value.get("storeId")
+    try:
+        normalized_store_id = str(uuid.UUID(str(store_id or "")))
+    except ValueError as exc:
+        raise MaaFWProjectStoreError("project-store marker storeId is invalid") from exc
+    return {
+        "schemaVersion": STORE_SCHEMA_VERSION,
+        "kind": STORE_KIND,
+        "storeId": normalized_store_id,
+    }
+
+
+def _validate_run_root_marker(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise MaaFWProjectStoreError("project run-root marker must be a JSON object")
+    if value.get("schemaVersion") != RUN_ROOT_SCHEMA_VERSION:
+        raise MaaFWProjectStoreError("project run-root marker version is unsupported")
+    if value.get("kind") != RUN_ROOT_KIND:
+        raise MaaFWProjectStoreError("project run-root marker kind is invalid")
+    try:
+        run_root_id = str(uuid.UUID(str(value.get("runRootId") or "")))
+    except ValueError as exc:
+        raise MaaFWProjectStoreError(
+            "project run-root marker runRootId is invalid"
+        ) from exc
+    return {
+        "schemaVersion": RUN_ROOT_SCHEMA_VERSION,
+        "kind": RUN_ROOT_KIND,
+        "runRootId": run_root_id,
+    }
+
+
+def _validate_checkout_marker(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise MaaFWProjectStoreError("project checkout marker must be a JSON object")
+    if value.get("schemaVersion") != CHECKOUT_SCHEMA_VERSION:
+        raise MaaFWProjectStoreError("project checkout marker version is unsupported")
+    if value.get("kind") != CHECKOUT_KIND:
+        raise MaaFWProjectStoreError("project checkout marker kind is invalid")
+    checkout_id = str(value.get("checkoutId") or "")
+    if not re.fullmatch(r"maafw-checkout-[0-9a-f]{32}", checkout_id):
+        raise MaaFWProjectStoreError("project checkout marker checkoutId is invalid")
+    try:
+        run_root_id = str(uuid.UUID(str(value.get("runRootId") or "")))
+    except ValueError as exc:
+        raise MaaFWProjectStoreError(
+            "project checkout marker runRootId is invalid"
+        ) from exc
+    identity = value.get("identity")
+    if not isinstance(identity, dict):
+        raise MaaFWProjectStoreError("project checkout marker identity is invalid")
+    normalized_identity = {
+        "storeId": str(identity.get("storeId") or ""),
+        "projectId": str(identity.get("projectId") or ""),
+        "version": str(identity.get("version") or ""),
+        "sourceHash": str(identity.get("sourceHash") or ""),
+        "payloadHash": str(identity.get("payloadHash") or ""),
+        "scriptId": str(identity.get("scriptId") or ""),
+    }
+    if set(identity) != set(normalized_identity):
+        raise MaaFWProjectStoreError("project checkout marker identity is invalid")
+    try:
+        normalized_identity["storeId"] = str(
+            uuid.UUID(normalized_identity["storeId"])
+        )
+    except ValueError as exc:
+        raise MaaFWProjectStoreError(
+            "project checkout marker storeId is invalid"
+        ) from exc
+    _validate_component(normalized_identity["projectId"], "project_id")
+    _validate_component(normalized_identity["version"], "version")
+    _validate_component(normalized_identity["scriptId"], "script_id")
+    if not re.fullmatch(r"[0-9a-f]{64}", normalized_identity["sourceHash"]):
+        raise MaaFWProjectStoreError(
+            "project checkout marker sourceHash is invalid"
+        )
+    if not re.fullmatch(r"[0-9a-f]{64}", normalized_identity["payloadHash"]):
+        raise MaaFWProjectStoreError(
+            "project checkout marker payloadHash is invalid"
+        )
+    if value.get("dataRelativePath") != "data":
+        raise MaaFWProjectStoreError(
+            "project checkout marker dataRelativePath is invalid"
+        )
+    leases = value.get("leases")
+    if leases is not None and not isinstance(leases, list):
+        raise MaaFWProjectStoreError("project checkout marker leases are invalid")
+    return {
+        "schemaVersion": CHECKOUT_SCHEMA_VERSION,
+        "kind": CHECKOUT_KIND,
+        "checkoutId": checkout_id,
+        "runRootId": run_root_id,
+        "identity": normalized_identity,
+        "createdAt": value.get("createdAt"),
+        "lastUsedAt": value.get("lastUsedAt"),
+        "dataRelativePath": "data",
+        "leases": _json_clone(leases) if isinstance(leases, list) else None,
+    }
+
+
+def _configured_absolute_root(
+    value: str | Path | None,
+    default_root: Path,
+    field_name: str,
+) -> Path:
+    normalized = str(value or "").strip()
+    if not normalized:
+        return Path(os.path.abspath(default_root))
+    requested = Path(normalized)
+    if not requested.is_absolute():
+        raise MaaFWProjectStoreError(
+            f"configured {field_name} must be an absolute path"
+        )
+    return Path(os.path.abspath(requested))
+
+
+def _path_trees_overlap(left: Path, right: Path) -> bool:
+    left_resolved = left.resolve(strict=False)
+    right_resolved = right.resolve(strict=False)
+    return _is_within(left_resolved, right_resolved) or _is_within(
+        right_resolved,
+        left_resolved,
+    )
+
+
+def _manifest_source_hash(manifest: Mapping[str, Any]) -> str:
+    source = manifest.get("source")
+    source = source if isinstance(source, Mapping) else {}
+    hash_value = source.get("hash")
+    hash_value = hash_value if isinstance(hash_value, Mapping) else {}
+    if (
+        str(hash_value.get("algorithm") or "").casefold() != "sha256"
+        or hash_value.get("scope") != "projected-source"
+    ):
+        raise MaaFWProjectStoreError("project manifest source hash identity is invalid")
+    value = str(hash_value.get("value") or "").casefold()
+    if not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise MaaFWProjectStoreError("project manifest source hash value is invalid")
+    return value
+
+
+def _manifest_payload_hash(manifest: Mapping[str, Any]) -> str:
+    payload = manifest.get("payload")
+    payload = payload if isinstance(payload, Mapping) else {}
+    hash_value = payload.get("hash")
+    hash_value = hash_value if isinstance(hash_value, Mapping) else {}
+    value = str(hash_value.get("value") or "").casefold()
+    if (
+        str(hash_value.get("algorithm") or "").casefold() != "sha256"
+        or hash_value.get("scope") != "store-payload"
+        or not re.fullmatch(r"[0-9a-f]{64}", value)
+    ):
+        raise MaaFWProjectStoreError(
+            "project manifest has no verifiable Store payload hash; "
+            "import the resource as a new immutable version"
+        )
+    return value
+
+
+def _calculate_store_payload_hash(data_path: Path) -> str:
+    _, files = _scan_safe_tree(data_path)
+    files.discard(Path(MANIFEST_FILE_NAME))
+    return _calculate_projected_source_hash(data_path, files)
+
+
+def _checkout_id(identity: Mapping[str, str]) -> str:
+    encoded = json.dumps(
+        dict(identity),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return f"maafw-checkout-{hashlib.sha256(encoded).hexdigest()[:32]}"
+
+
+def _copy_checkout_tree(source_root: Path, target_root: Path) -> None:
+    _assert_not_reparse(source_root)
+    if not source_root.is_dir():
+        raise MaaFWProjectStoreError(
+            f"project-store payload is missing: {source_root}"
+        )
+    target_root.mkdir(parents=True, exist_ok=False)
+    for current_raw, directory_names, file_names in os.walk(
+        source_root,
+        followlinks=False,
+    ):
+        current = Path(current_raw)
+        _assert_not_reparse(current)
+        relative = current.relative_to(source_root)
+        destination = target_root / relative
+        destination.mkdir(parents=True, exist_ok=True)
+        for directory_name in directory_names:
+            child = current / directory_name
+            _assert_not_reparse(child)
+            if not child.is_dir():
+                raise MaaFWProjectStoreError(
+                    f"project-store payload contains a special directory: {child}"
+                )
+            (destination / directory_name).mkdir(parents=True, exist_ok=True)
+        for file_name in file_names:
+            child = current / file_name
+            _assert_not_reparse(child)
+            if not child.is_file():
+                raise MaaFWProjectStoreError(
+                    f"project-store payload contains a special file: {child}"
+                )
+            if relative == Path(".") and file_name == MANIFEST_FILE_NAME:
+                continue
+            shutil.copy2(child, destination / file_name)
+
+
+def _store_lock(root: Path) -> RLock:
+    key = os.path.normcase(str(root.resolve(strict=True)))
+    with _STORE_LOCKS_GUARD:
+        return _STORE_LOCKS.setdefault(key, RLock())
+
+
+def _is_legacy_default_store(children: Iterable[Path]) -> bool:
+    known_names = {"projects", ".staging"}
+    for child in children:
+        _assert_not_reparse(child)
+        if child.name not in known_names or not child.is_dir():
+            return False
+    return True
+
+
+def _same_path(left: Path, right: Path) -> bool:
+    return os.path.normcase(str(left.resolve(strict=False))) == os.path.normcase(
+        str(Path(os.path.abspath(right)).resolve(strict=False))
+    )
 
 
 def _assert_not_reparse(path: Path) -> None:
@@ -3094,12 +4421,14 @@ def _format_timestamp(timestamp: float | None = None) -> str:
 
 
 def _active_leases(value: Any, now: float) -> list[dict[str, Any]]:
-    if not isinstance(value, list):
+    if value is None:
         return []
+    if not isinstance(value, list):
+        raise MaaFWProjectStoreError("project lease collection is invalid")
     active: list[dict[str, Any]] = []
     for item in value:
         if not isinstance(item, dict):
-            continue
+            raise MaaFWProjectStoreError("project lease entry is invalid")
         lease_id = item.get("leaseId")
         owner = item.get("owner")
         expires_at = item.get("expiresAt")
@@ -3108,8 +4437,12 @@ def _active_leases(value: Any, now: float) -> list[dict[str, Any]]:
             or not lease_id
             or not isinstance(owner, str)
             or not owner
-            or _parse_timestamp(expires_at) <= now
         ):
+            raise MaaFWProjectStoreError("project lease identity is invalid")
+        expires_at_value = _parse_timestamp(expires_at)
+        if expires_at_value <= 0:
+            raise MaaFWProjectStoreError("project lease expiry is invalid")
+        if expires_at_value <= now:
             continue
         active.append(_json_clone(item))
     return active
