@@ -50,7 +50,7 @@ class MaaFWProjectStoreContractTest(unittest.TestCase):
             (PACKAGE_ROOT / "pyproject.toml").read_text(encoding="utf-8")
         )
         entrypoints = pyproject["project"]["entry-points"]["auto_mas.plugins"]
-        self.assertEqual(pyproject["project"]["version"], "0.2.1")
+        self.assertEqual(pyproject["project"]["version"], "0.2.2")
         self.assertEqual(
             entrypoints["automas_maafw_project_store"],
             "automas_maafw_project_store.plugin:Plugin",
@@ -242,6 +242,35 @@ class MaaFWProjectStoreContractTest(unittest.TestCase):
         checkouts_root = self.store.run_root / "scripts" / "script-one" / "checkouts"
         self.assertFalse(checkouts_root.exists())
 
+    def test_existing_checkout_rejects_tampered_immutable_store_payload(
+        self,
+    ) -> None:
+        self._write_json(
+            self.source / "interface.json",
+            {
+                "interface_version": 2,
+                "name": "checkout-integrity-reuse",
+                "version": "1.0.0",
+                "resource": [{"name": "base", "path": ["Bundle"]}],
+                "task": [],
+            },
+        )
+        self._write_text(self.source / "Bundle" / "pipeline.json", "{}")
+        resolved = self.store.import_project(self.source, "demo", "1.0.0")
+        checkout = self.store.checkout_project("demo", "1.0.0", "script-one")
+        checkout_sentinel = Path(checkout["dataPath"]) / "keep.txt"
+        checkout_sentinel.write_text("keep", encoding="utf-8")
+
+        store_file = Path(resolved["dataPath"]) / "Bundle" / "pipeline.json"
+        store_file.write_text('{"tampered": true}', encoding="utf-8")
+
+        with self.assertRaisesRegex(
+            MaaFWProjectStoreError,
+            "payload integrity check failed",
+        ):
+            self.store.checkout_project("demo", "1.0.0", "script-one")
+        self.assertEqual(checkout_sentinel.read_text(encoding="utf-8"), "keep")
+
     def test_corrupt_checkout_fails_closed_without_overwrite(self) -> None:
         self._write_json(
             self.source / "interface.json",
@@ -425,6 +454,59 @@ class MaaFWProjectStoreContractTest(unittest.TestCase):
         self.assertEqual(self.store.list_projects(), [])
         self.assertEqual(list((self.store.root / ".staging").iterdir()), [])
 
+    def test_directory_import_uses_compact_snapshot_for_portable_python_tree(
+        self,
+    ) -> None:
+        self._write_json(
+            self.source / "interface.json",
+            {
+                "interface_version": 2,
+                "name": "portable-python",
+                "version": "1.0.0",
+                "resource": [{"name": "base", "path": ["Bundle"]}],
+                "task": [],
+            },
+        )
+        self._write_json(self.source / "Bundle" / "pipeline.json", {})
+
+        relative_directory = Path(
+            "temp/temp_res/resource_v3.28.6_extracted/python/Lib/site-packages/"
+            "pip-26.1.2.dist-info/licenses/src/pip/_vendor/cachecontrol"
+        )
+        store = MaaFWProjectStoreService(
+            self.temp_root / "project-store-long",
+            run_root=self.temp_root / "project-runs-long",
+        )
+        compact_snapshot = store.root / ".staging" / ("a" * 32)
+        while len(str(compact_snapshot / relative_directory)) < 230:
+            relative_directory /= "vendorpkg"
+        legacy_snapshot = (
+            store.root
+            / ".staging"
+            / f"import-directory-{'a' * 32}"
+            / "source"
+        )
+        if sys.platform == "win32":
+            self.assertLess(len(str(compact_snapshot / relative_directory)), 248)
+            self.assertGreaterEqual(
+                len(str(legacy_snapshot / relative_directory)),
+                248,
+            )
+
+        self._write_text(
+            self.source / relative_directory / "LICENSE.txt",
+            "portable python license payload",
+        )
+        resolved = store.import_project(
+            self.source,
+            "portable-python",
+            "1.0.0",
+        )
+
+        self.assertEqual(resolved["projectId"], "portable-python")
+        self.assertFalse((Path(resolved["dataPath"]) / "temp").exists())
+        self.assertEqual(list((store.root / ".staging").iterdir()), [])
+
     def test_racing_repeat_import_does_not_reuse_existing_version(self) -> None:
         self._write_json(
             self.source / "interface.json",
@@ -561,6 +643,12 @@ class MaaFWProjectStoreContractTest(unittest.TestCase):
                 "interface_version": 2,
                 "name": "demo",
                 "version": "1.0.0",
+                "runtime": {
+                    "python": {
+                        "implementation": "cpython",
+                        "requires": "==3.13.*",
+                    }
+                },
                 "controller": [
                     {
                         "name": "adb",
@@ -695,6 +783,10 @@ class MaaFWProjectStoreContractTest(unittest.TestCase):
             ["cp313-win_amd64"],
         )
         self.assertEqual(
+            manifest["runtime"]["agent"][0]["interpreterRoute"],
+            "managed-python",
+        )
+        self.assertEqual(
             manifest["projectInterface"]["clearedResources"],
             [
                 {"file": "config/tasks.json", "resource": "fragment-resource"},
@@ -723,6 +815,12 @@ class MaaFWProjectStoreContractTest(unittest.TestCase):
             {
                 "interface_version": 2,
                 "name": "nested",
+                "runtime": {
+                    "python": {
+                        "implementation": "cpython",
+                        "requires": "==3.13.*",
+                    }
+                },
                 "languages": {"zh_cn": "resource/i18n.json"},
                 "resource": [
                     {"name": "base", "path": ["./resource/base"]},
@@ -835,6 +933,10 @@ class MaaFWProjectStoreContractTest(unittest.TestCase):
         )
         self._write_json(self.source / "Bundle" / "pipeline.json", {})
         self._write_text(self.source / "python" / "python.exe", "embedded runtime")
+        self._write_text(
+            self.source / "python" / "python313._pth",
+            "python313.zip\n",
+        )
         self._write_text(self.source / "agent" / "bootstrap.py", "print('agent')\n")
         self._write_text(
             self.source / "requirements.txt",
@@ -861,6 +963,15 @@ class MaaFWProjectStoreContractTest(unittest.TestCase):
         )
         self.assertEqual(runtime["agent"][0]["interpreterRoute"], "managed-python")
         self.assertEqual(runtime["agent"][0]["projectedChildExec"], "python")
+        self.assertEqual(
+            runtime["python"],
+            {
+                "implementation": "cpython",
+                "constraint": "==3.13.*",
+                "sources": ["embedded-python-marker"],
+            },
+        )
+        self.assertEqual(resolved["summary"]["pythonConstraint"], "==3.13.*")
         self.assertTrue(runtime["sharedAgentDependenciesComplete"])
         self.assertTrue(
             any(
@@ -868,6 +979,368 @@ class MaaFWProjectStoreContractTest(unittest.TestCase):
                 for warning in resolved["manifest"]["warnings"]
             )
         )
+
+    def test_missing_bundled_python_uses_release_runtime_dll_marker(self) -> None:
+        self._write_json(
+            self.source / "interface.json",
+            {
+                "interface_version": 2,
+                "name": "bundled-python-dll",
+                "resource": [{"name": "base", "path": ["Bundle"]}],
+                "agent": {
+                    "child_exec": "python/python.exe",
+                    "child_args": ["-u", "agent/bootstrap.py"],
+                },
+                "task": [],
+            },
+        )
+        self._write_json(self.source / "Bundle" / "pipeline.json", {})
+        self._write_text(self.source / "python312.dll", "embedded runtime")
+        self._write_text(self.source / "agent" / "bootstrap.py", "pass\n")
+        self._write_text(
+            self.source / "requirements.txt",
+            "maafw==5.10.4\n",
+        )
+
+        resolved = self.store.import_project(
+            self.source,
+            "bundled-python-dll",
+            "1.0",
+        )
+        data_path = Path(resolved["dataPath"])
+        runtime = resolved["manifest"]["runtime"]
+
+        self.assertFalse((data_path / "python312.dll").exists())
+        self.assertEqual(
+            runtime["python"],
+            {
+                "implementation": "cpython",
+                "constraint": "==3.12.*",
+                "sources": ["bundled-python-runtime-library"],
+            },
+        )
+        self.assertEqual(runtime["requiredPythonAbi"], ["cp312"])
+        self.assertEqual(runtime["agent"][0]["abiTags"], ["cp312"])
+        self.assertEqual(
+            runtime["agent"][0]["strippedInterpreter"]["sourcePath"],
+            "python/python.exe",
+        )
+        self.assertEqual(runtime["agent"][0]["interpreterRoute"], "managed-python")
+
+    def test_ambiguous_release_runtime_dll_markers_fail_closed(self) -> None:
+        self._write_json(
+            self.source / "interface.json",
+            {
+                "interface_version": 2,
+                "name": "ambiguous-python-dll",
+                "resource": [{"name": "base", "path": ["Bundle"]}],
+                "agent": {
+                    "child_exec": "python/python.exe",
+                    "child_args": ["-u", "agent/bootstrap.py"],
+                },
+                "task": [],
+            },
+        )
+        self._write_json(self.source / "Bundle" / "pipeline.json", {})
+        self._write_text(self.source / "python312.dll", "runtime 3.12")
+        self._write_text(self.source / "python313.dll", "runtime 3.13")
+        self._write_text(self.source / "agent" / "bootstrap.py", "pass\n")
+        self._write_text(self.source / "requirements.txt", "maafw==5.10.4\n")
+
+        with self.assertRaisesRegex(
+            MaaFWProjectStoreError,
+            "multiple interpreter minors",
+        ):
+            self.store.import_project(
+                self.source,
+                "ambiguous-python-dll",
+                "1.0",
+            )
+
+    def test_release_python_dll_does_not_reclassify_native_agent(self) -> None:
+        self._write_json(
+            self.source / "interface.json",
+            {
+                "interface_version": 2,
+                "name": "native-with-shell-python",
+                "agent": {"child_exec": "agent/native.exe"},
+                "task": [],
+            },
+        )
+        self._write_text(self.source / "agent" / "native.exe", "native")
+        self._write_text(self.source / "python312.dll", "shell runtime")
+
+        resolved = self.store.import_project(
+            self.source,
+            "native-with-shell-python",
+            "1.0",
+        )
+        runtime = resolved["manifest"]["runtime"]
+
+        self.assertIsNone(runtime["python"])
+        self.assertEqual(runtime["requiredPythonAbi"], [])
+        self.assertEqual(runtime["agent"][0]["classification"], "native")
+        self.assertNotIn("interpreterRoute", runtime["agent"][0])
+
+    def test_unpinned_maafw_uses_unique_bundled_framework_version(self) -> None:
+        self._write_json(
+            self.source / "interface.json",
+            {
+                "interface_version": 2,
+                "name": "bundled-framework-version",
+                "resource": [{"name": "base", "path": ["Bundle"]}],
+                "task": [],
+            },
+        )
+        self._write_json(self.source / "Bundle" / "pipeline.json", {})
+        self._write_text(self.source / "requirements.txt", "MaaFw\n")
+        framework = self.source / "runtimes" / "win-x64" / "MaaFramework.dll"
+        framework.parent.mkdir(parents=True)
+        framework.write_bytes(b"latest_id\x00v5.12.1\x00DoNothing")
+
+        resolved = self.store.import_project(
+            self.source,
+            "bundled-framework-version",
+            "1.0",
+        )
+
+        self.assertEqual(resolved["runtimeConstraint"], "==5.12.1")
+        self.assertEqual(
+            resolved["manifest"]["runtime"]["constraint"],
+            "==5.12.1",
+        )
+
+    def test_declared_maafw_constraint_must_match_bundled_framework(self) -> None:
+        self._write_minimal_project()
+        framework = self.source / "maafw" / "MaaFramework.dll"
+        framework.parent.mkdir(parents=True)
+        framework.write_bytes(b"latest_id\x00v5.12.1\x00DoNothing")
+
+        with self.assertRaisesRegex(
+            MaaFWProjectStoreError,
+            "does not match bundled MaaFramework",
+        ):
+            self.store.import_project(
+                self.source,
+                "framework-version-mismatch",
+                "1.0",
+                runtime_constraint="==5.10.4",
+            )
+
+    def test_conflicting_bundled_framework_versions_fail_closed(self) -> None:
+        self._write_minimal_project()
+        for relative, version in (
+            ("maafw/MaaFramework.dll", "5.12.1"),
+            ("runtimes/win-x64/MaaFramework.dll", "5.10.4"),
+        ):
+            framework = self.source / relative
+            framework.parent.mkdir(parents=True, exist_ok=True)
+            framework.write_bytes(
+                f"latest_id\x00v{version}\x00DoNothing".encode("ascii")
+            )
+
+        with self.assertRaisesRegex(
+            MaaFWProjectStoreError,
+            "declare different versions",
+        ):
+            self.store.import_project(
+                self.source,
+                "framework-version-conflict",
+                "1.0",
+            )
+
+    def test_framework_with_historical_versions_is_not_inference_evidence(
+        self,
+    ) -> None:
+        self._write_minimal_project()
+        framework = self.source / "maafw" / "MaaFramework.dll"
+        framework.parent.mkdir(parents=True)
+        framework.write_bytes(
+            b"current\x00v5.12.2\x00historical\x00v5.10.5\x00"
+        )
+
+        resolved = self.store.import_project(
+            self.source,
+            "framework-history",
+            "1.0",
+            runtime_constraint="==5.12.2",
+        )
+
+        self.assertEqual(resolved["runtimeConstraint"], "==5.12.2")
+
+    def test_framework_inference_ignores_update_and_pip_residue(self) -> None:
+        self._write_minimal_project()
+        binaries = {
+            "runtimes/win-x64/native/MaaFramework.dll": b"v5.12.2\x00",
+            "temp/update/MaaFramework.dll": b"v5.10.5\x00",
+            "python/Lib/site-packages/~-a/bin/MaaFramework.dll": b"v4.5.4\x00",
+            "python/Lib/site-packages/~.a/bin/MaaFramework.dll": (
+                b"v5.3.0-beta.5\x00"
+            ),
+        }
+        for relative, content in binaries.items():
+            framework = self.source / relative
+            framework.parent.mkdir(parents=True, exist_ok=True)
+            framework.write_bytes(content)
+
+        resolved = self.store.import_project(
+            self.source,
+            "framework-residue",
+            "1.0",
+        )
+
+        self.assertEqual(resolved["runtimeConstraint"], "==5.12.2")
+
+    def test_extensionless_windows_native_exec_is_retained_and_rewritten(self) -> None:
+        self._write_json(
+            self.source / "interface.json",
+            {
+                "interface_version": 2,
+                "name": "native-agent",
+                "agent": [{"child_exec": "agent/go-service"}],
+                "import": ["tasks/pretasks/GameSetting.json"],
+                "task": [],
+            },
+        )
+        self._write_json(
+            self.source / "tasks" / "pretasks" / "GameSetting.json",
+            {
+                "pretask": {
+                    "exec": "agent/go-service",
+                    "args": ["--pretask", "GameSetting"],
+                }
+            },
+        )
+        self._write_text(self.source / "agent" / "go-service.exe", "native")
+
+        resolved = self.store.import_project(self.source, "native-agent", "1.0")
+        data_path = Path(resolved["dataPath"])
+        projected_interface = json.loads(
+            (data_path / "interface.json").read_text(encoding="utf-8")
+        )
+        projected_pretask = json.loads(
+            (data_path / "tasks" / "pretasks" / "GameSetting.json").read_text(
+                encoding="utf-8"
+            )
+        )
+
+        self.assertTrue((data_path / "agent" / "go-service.exe").is_file())
+        self.assertEqual(
+            projected_interface["agent"][0]["child_exec"],
+            "./agent/go-service.exe",
+        )
+        self.assertEqual(
+            projected_pretask["pretask"]["exec"],
+            "./agent/go-service.exe",
+        )
+
+    def test_declared_python_constraint_must_match_bundled_interpreter(self) -> None:
+        self._write_json(
+            self.source / "interface.json",
+            {
+                "interface_version": 2,
+                "name": "python-constraint-mismatch",
+                "runtime": {
+                    "python": {
+                        "implementation": "cpython",
+                        "requires": ">=3.12,<3.13",
+                    }
+                },
+                "resource": [{"name": "base", "path": ["Bundle"]}],
+                "agent": {
+                    "child_exec": "python/python.exe",
+                    "child_args": ["-u", "agent/bootstrap.py"],
+                },
+                "task": [],
+            },
+        )
+        self._write_json(self.source / "Bundle" / "pipeline.json", {})
+        self._write_text(self.source / "python" / "python.exe", "embedded")
+        self._write_text(
+            self.source / "python" / "python313._pth",
+            "python313.zip\n",
+        )
+        self._write_text(self.source / "agent" / "bootstrap.py", "pass\n")
+        self._write_text(self.source / "requirements.txt", "maafw==5.12.2\n")
+
+        with self.assertRaisesRegex(
+            MaaFWProjectStoreError,
+            "does not match the bundled interpreter marker",
+        ):
+            self.store.import_project(
+                self.source,
+                "python-constraint-mismatch",
+                "1.0",
+            )
+        self.assertEqual(self.store.list_projects(), [])
+
+    def test_exact_patch_constraint_accepts_matching_bundled_minor(self) -> None:
+        self._write_json(
+            self.source / "interface.json",
+            {
+                "interface_version": 2,
+                "name": "python-exact-patch",
+                "runtime": {
+                    "python": {
+                        "implementation": "cpython",
+                        "requires": "==3.13.14",
+                    }
+                },
+                "resource": [{"name": "base", "path": ["Bundle"]}],
+                "agent": {
+                    "child_exec": "python/python.exe",
+                    "child_args": ["-u", "agent/bootstrap.py"],
+                },
+                "task": [],
+            },
+        )
+        self._write_json(self.source / "Bundle" / "pipeline.json", {})
+        self._write_text(self.source / "python" / "python.exe", "embedded")
+        self._write_text(
+            self.source / "python" / "python313._pth",
+            "python313.zip\n",
+        )
+        self._write_text(self.source / "agent" / "bootstrap.py", "pass\n")
+        self._write_text(self.source / "requirements.txt", "maafw==5.12.2\n")
+
+        resolved = self.store.import_project(
+            self.source,
+            "python-exact-patch",
+            "1.0",
+        )
+
+        runtime = resolved["manifest"]["runtime"]
+        self.assertEqual(runtime["python"]["constraint"], "==3.13.14")
+        self.assertEqual(
+            runtime["agent"][0]["interpreterRoute"],
+            "managed-python",
+        )
+
+    def test_python_agent_without_runtime_identity_is_rejected(self) -> None:
+        self._write_json(
+            self.source / "interface.json",
+            {
+                "interface_version": 2,
+                "name": "python-unknown-abi",
+                "agent": {
+                    "child_exec": "python",
+                    "child_args": ["agent.py"],
+                },
+                "task": [],
+            },
+        )
+        self._write_text(self.source / "agent.py", "pass\n")
+        self._write_text(self.source / "requirements.txt", "maafw==5.12.2\n")
+
+        with self.assertRaisesRegex(
+            MaaFWProjectStoreError,
+            "runtime ABI is unknown",
+        ):
+            self.store.import_project(
+                self.source,
+                "python-unknown-abi",
+                "1.0",
+            )
 
     def test_missing_bundled_python_uses_managed_route_when_entrypoint_exists(
         self,
@@ -877,6 +1350,12 @@ class MaaFWProjectStoreContractTest(unittest.TestCase):
             {
                 "interface_version": 2,
                 "name": "missing-bundled-python",
+                "runtime": {
+                    "python": {
+                        "implementation": "cpython",
+                        "requires": "==3.12.*",
+                    }
+                },
                 "resource": [{"name": "base", "path": ["Bundle"]}],
                 "agent": {
                     "child_exec": "python/python.exe",
@@ -998,6 +1477,12 @@ class MaaFWProjectStoreContractTest(unittest.TestCase):
                     {
                         "interface_version": 2,
                         "name": name,
+                        "runtime": {
+                            "python": {
+                                "implementation": "cpython",
+                                "requires": "==3.12.*",
+                            }
+                        },
                         "resource": [{"name": "base", "path": ["Bundle"]}],
                         "agent": {
                             "child_exec": "python/python.exe",
@@ -1017,18 +1502,30 @@ class MaaFWProjectStoreContractTest(unittest.TestCase):
                     for relative, content in extra.items():
                         self._write_text(source / relative, content)
 
-                resolved = self.store.import_project(
-                    source,
-                    f"deps-{name}",
-                    "1.0",
-                    activate=False,
-                )
-                self.assertIs(
-                    resolved["manifest"]["runtime"][
-                        "sharedAgentDependenciesComplete"
-                    ],
-                    case["expected"],
-                )
+                if case["expected"]:
+                    resolved = self.store.import_project(
+                        source,
+                        f"deps-{name}",
+                        "1.0",
+                        activate=False,
+                    )
+                    self.assertIs(
+                        resolved["manifest"]["runtime"][
+                            "sharedAgentDependenciesComplete"
+                        ],
+                        True,
+                    )
+                else:
+                    with self.assertRaisesRegex(
+                        MaaFWProjectStoreError,
+                        "dependencies are incomplete",
+                    ):
+                        self.store.import_project(
+                            source,
+                            f"deps-{name}",
+                            "1.0",
+                            activate=False,
+                        )
 
     def test_root_resource_still_excludes_known_shells_and_embedded_runtime(self) -> None:
         self._write_json(
@@ -1266,6 +1763,92 @@ class MaaFWProjectStoreContractTest(unittest.TestCase):
         with self.assertRaises(MaaFWProjectStoreError):
             self.store.import_project(self.source, "immutable", "1.0")
 
+    def test_source_without_python_runtime_uses_framed_projected_hash(self) -> None:
+        self._write_minimal_project()
+        projected_hash = project_store_service._calculate_projected_source_hash(
+            self.source,
+            [Path("interface.json"), Path("Bundle/pipeline.json")],
+        )
+
+        imported = self.store.import_project(self.source, "legacy-hash", "1.0")
+
+        self.assertIsNone(imported["manifest"]["runtime"]["python"])
+        source_hash = imported["manifest"]["source"]["hash"]
+        payload_hash = imported["manifest"]["payload"]["hash"]
+        self.assertEqual(
+            source_hash["value"],
+            projected_hash,
+        )
+        self.assertEqual(source_hash["schemaVersion"], 2)
+        self.assertEqual(payload_hash["schemaVersion"], 2)
+        self.assertEqual(
+            source_hash["domain"],
+            project_store_service._PROJECTED_SOURCE_HASH_DOMAIN_NAME,
+        )
+        self.assertEqual(
+            payload_hash["domain"],
+            project_store_service._STORE_PAYLOAD_HASH_DOMAIN_NAME,
+        )
+        self.assertEqual(source_hash["framing"], payload_hash["framing"])
+
+    def test_python_runtime_hash_is_idempotent_and_tracks_constraint(self) -> None:
+        def write_bundled_python_project(root: Path, compact_version: str) -> None:
+            self._write_json(
+                root / "interface.json",
+                {
+                    "interface_version": 2,
+                    "name": "bundled-python-hash",
+                    "resource": [{"name": "base", "path": ["Bundle"]}],
+                    "agent": {
+                        "child_exec": "python/python.exe",
+                        "child_args": ["-u", "agent/bootstrap.py"],
+                    },
+                    "task": [],
+                },
+            )
+            self._write_json(root / "Bundle" / "pipeline.json", {})
+            self._write_text(root / "python" / "python.exe", "embedded runtime")
+            self._write_text(
+                root / "python" / f"python{compact_version}._pth",
+                f"python{compact_version}.zip\n",
+            )
+            self._write_text(root / "agent" / "bootstrap.py", "pass\n")
+            self._write_text(root / "requirements.txt", "maafw==5.10.4\n")
+
+        source_312 = self.temp_root / "release-python-312"
+        source_313 = self.temp_root / "release-python-313"
+        write_bundled_python_project(source_312, "312")
+        write_bundled_python_project(source_313, "313")
+
+        first = self.store.import_project(source_312, "python-312", "1.0")
+        repeated = self.store.import_project(source_312, "python-312", "1.0")
+        different_constraint = self.store.import_project(
+            source_313,
+            "python-313",
+            "1.0",
+        )
+
+        self.assertEqual(
+            first["manifest"]["source"]["hash"],
+            repeated["manifest"]["source"]["hash"],
+        )
+        self.assertEqual(
+            first["manifest"]["payload"]["hash"],
+            different_constraint["manifest"]["payload"]["hash"],
+        )
+        self.assertEqual(
+            first["manifest"]["runtime"]["python"]["constraint"],
+            "==3.12.*",
+        )
+        self.assertEqual(
+            different_constraint["manifest"]["runtime"]["python"]["constraint"],
+            "==3.13.*",
+        )
+        self.assertNotEqual(
+            first["manifest"]["source"]["hash"],
+            different_constraint["manifest"]["source"]["hash"],
+        )
+
     def test_zip_import_infers_declared_version_and_exposes_inventory(self) -> None:
         archive = self.temp_root / "M9A-release-name-does-not-match.zip"
         with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as output:
@@ -1394,6 +1977,212 @@ class MaaFWProjectStoreContractTest(unittest.TestCase):
             ):
                 self.store.import_project(bomb, "bomb")
         self.assertEqual(list((self.store.root / ".staging").iterdir()), [])
+
+    def test_tree_hash_v2_frames_content_lengths_and_separates_domains(self) -> None:
+        one_file = self.temp_root / "hash-one-file"
+        two_files = self.temp_root / "hash-two-files"
+        one_file.mkdir()
+        two_files.mkdir()
+        prefix = b"prefix"
+        suffix = b"suffix"
+        self._write_text(two_files / "a", prefix.decode("ascii"))
+        self._write_text(two_files / "b", suffix.decode("ascii"))
+        (one_file / "a").write_bytes(
+            prefix + len(b"b").to_bytes(8, "big") + b"b" + suffix
+        )
+
+        legacy_one = project_store_service._calculate_projected_source_hash_legacy(
+            one_file,
+            [Path("a")],
+        )
+        legacy_two = project_store_service._calculate_projected_source_hash_legacy(
+            two_files,
+            [Path("a"), Path("b")],
+        )
+        framed_one = project_store_service._calculate_projected_source_hash(
+            one_file,
+            [Path("a")],
+        )
+        framed_two = project_store_service._calculate_projected_source_hash(
+            two_files,
+            [Path("a"), Path("b")],
+        )
+
+        self.assertEqual(legacy_one, legacy_two)
+        self.assertNotEqual(framed_one, framed_two)
+        self.assertNotEqual(
+            framed_two,
+            project_store_service._calculate_tree_hash(
+                two_files,
+                [Path("a"), Path("b")],
+                domain=project_store_service._STORE_PAYLOAD_HASH_DOMAIN,
+            ),
+        )
+
+    def test_schema_two_manifest_migrates_without_changing_hash_identity(self) -> None:
+        self._write_minimal_project()
+        imported = self.store.import_project(
+            self.source,
+            "legacy-manifest",
+            "1.0",
+        )
+        data_path = Path(imported["dataPath"])
+        manifest_path = Path(imported["manifestPath"])
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        legacy_source_hash = (
+            project_store_service._calculate_projected_source_hash_legacy(
+                self.source,
+                [Path("interface.json"), Path("Bundle/pipeline.json")],
+            )
+        )
+        legacy_payload_hash = project_store_service._calculate_store_payload_hash(
+            data_path,
+            hash_schema_version=(
+                project_store_service._LEGACY_TREE_HASH_SCHEMA_VERSION
+            ),
+        )
+        manifest["schemaVersion"] = (
+            project_store_service.LEGACY_MANIFEST_SCHEMA_VERSION
+        )
+        manifest.pop("hashCompatibility", None)
+        for section_name, digest in (
+            ("source", legacy_source_hash),
+            ("payload", legacy_payload_hash),
+        ):
+            hash_value = manifest[section_name]["hash"]
+            hash_value["value"] = digest
+            hash_value.pop("schemaVersion", None)
+            hash_value.pop("domain", None)
+            hash_value.pop("framing", None)
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        first_checkout = self.store.checkout_project(
+            "legacy-manifest",
+            "1.0",
+            "script-one",
+        )
+        migrated = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            migrated["schemaVersion"],
+            project_store_service.MANIFEST_SCHEMA_VERSION,
+        )
+        self.assertEqual(
+            migrated["source"]["hash"]["value"],
+            legacy_source_hash,
+        )
+        self.assertEqual(
+            migrated["payload"]["hash"]["value"],
+            legacy_payload_hash,
+        )
+        self.assertEqual(migrated["source"]["hash"]["schemaVersion"], 1)
+        self.assertEqual(migrated["payload"]["hash"]["schemaVersion"], 1)
+        self.assertEqual(
+            migrated["source"]["hash"]["framing"],
+            project_store_service._LEGACY_TREE_HASH_FRAMING,
+        )
+        self.assertEqual(
+            migrated["hashCompatibility"][
+                "migratedFromManifestSchemaVersion"
+            ],
+            project_store_service.LEGACY_MANIFEST_SCHEMA_VERSION,
+        )
+
+        second_checkout = self.store.checkout_project(
+            "legacy-manifest",
+            "1.0",
+            "script-one",
+        )
+        self.assertEqual(
+            second_checkout["checkoutId"],
+            first_checkout["checkoutId"],
+        )
+        self.assertTrue(second_checkout["reused"])
+        self.assertTrue(self.store.inventory()["complete"])
+
+    def test_manifest_validator_fails_closed_across_resolve_and_list_paths(self) -> None:
+        self._write_minimal_project()
+        imported = self.store.import_project(
+            self.source,
+            "manifest-validation",
+            "1.0",
+        )
+        manifest_path = Path(imported["manifestPath"])
+        original = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+        def missing_source_hash(value: dict[str, object]) -> None:
+            del value["source"]["hash"]  # type: ignore[index]
+
+        def invalid_payload_scope(value: dict[str, object]) -> None:
+            value["payload"]["hash"]["scope"] = "other"  # type: ignore[index]
+
+        def missing_project_interface(value: dict[str, object]) -> None:
+            value["projectInterface"]["path"] = "missing.json"  # type: ignore[index]
+
+        def wrong_project_interface(value: dict[str, object]) -> None:
+            value["projectInterface"]["path"] = (  # type: ignore[index]
+                "Bundle/pipeline.json"
+            )
+
+        def malformed_binding(value: dict[str, object]) -> None:
+            value["runtime"]["binding"] = []  # type: ignore[index]
+
+        def identityless_binding(value: dict[str, object]) -> None:
+            value["runtime"]["binding"] = {}  # type: ignore[index]
+
+        def mismatched_runtime_constraint(value: dict[str, object]) -> None:
+            value["runtimeConstraint"] = "==different"
+
+        mutations = {
+            "source": missing_source_hash,
+            "payload": invalid_payload_scope,
+            "project-interface": missing_project_interface,
+            "project-interface-identity": wrong_project_interface,
+            "binding-type": malformed_binding,
+            "binding-identity": identityless_binding,
+            "runtime-constraint": mismatched_runtime_constraint,
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                corrupted = json.loads(json.dumps(original))
+                mutate(corrupted)
+                manifest_path.write_text(json.dumps(corrupted), encoding="utf-8")
+                for operation in (
+                    lambda: self.store.resolve_project(
+                        "manifest-validation",
+                        "1.0",
+                        touch=False,
+                    ),
+                    lambda: self.store.list_versions("manifest-validation"),
+                    self.store.list_projects,
+                ):
+                    with self.assertRaises(MaaFWProjectStoreError):
+                        operation()
+                inventory = self.store.inventory()
+                self.assertFalse(inventory["complete"])
+                self.assertTrue(inventory["errors"])
+                manifest_path.write_text(json.dumps(original), encoding="utf-8")
+
+    def test_invalid_runtime_binding_is_rejected_before_manifest_write(self) -> None:
+        self._write_minimal_project()
+        imported = self.store.import_project(
+            self.source,
+            "binding-validation",
+            "1.0",
+        )
+        manifest_path = Path(imported["manifestPath"])
+        before = manifest_path.read_bytes()
+
+        with self.assertRaisesRegex(
+            MaaFWProjectStoreError,
+            "runtime.binding.runtimeId",
+        ):
+            self.store.bind_runtime(
+                "binding-validation",
+                "1.0",
+                binding={},
+            )
+
+        self.assertEqual(manifest_path.read_bytes(), before)
 
     def _write_minimal_project(self) -> None:
         self._write_json(

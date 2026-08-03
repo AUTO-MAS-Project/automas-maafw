@@ -46,6 +46,38 @@ The returned `dataPath` always points at a directory containing
 `.auto_mas_maafw_project.json` manifest exposes the runtime constraint without
 requiring host-specific models.
 
+When ProjectInterface and `requirements.txt` do not pin MaaFW, a bundled
+`MaaFramework.dll` containing exactly one static `vX.Y.Z` marker can supply the
+exact constraint without loading the DLL. Binaries retaining multiple version
+strings, temporary/update trees and pip `~*` uninstall residue are not treated
+as evidence. A caller-supplied constraint that excludes the uniquely inferred
+version, or conflicting unique bundled versions, fails closed.
+
+Manifest schema 3 is validated centrally before every resolve, list, checkout,
+binding, reference, lease, switch and garbage-collection path. Store identity,
+source and payload hash descriptors, the projected ProjectInterface path,
+runtime aliases, Python metadata, agent/ABI mirrors, binding shape and deletion
+guards fail closed when malformed; a corrupt manifest is never reduced to a
+partial inventory DTO.
+
+New source and payload tree hashes use distinct domains and frame the file
+count, every UTF-8 path length/path and every content length/content before the
+bytes themselves. Existing schema-2 Stores remain usable: on first load the
+legacy payload is verified with its original algorithm, then the private
+manifest is atomically upgraded to schema 3 with explicit legacy-framing
+metadata. Legacy hash values are deliberately preserved so existing checkout
+identities and per-script writable state are not stranded; only newly imported
+versions use the collision-resistant framing.
+
+Project Store 0.2.2 also persists a hard `runtime.python` object containing the
+CPython implementation, version constraint and evidence sources. It uses an
+explicit ProjectInterface declaration when present; otherwise a unique
+`python3XY._pth` beside a stripped bundled interpreter, or one unambiguous
+`python3XY.dll` beside it/at the Windows release root, supplies the minor family
+without executing project code. Conflicting declarations fail closed,
+and the Python metadata participates in the projected source identity so a
+CP312 and CP313 release cannot become the same immutable import accidentally.
+
 Resolved records and list operations expose a compact `summary` containing
 ProjectInterface capabilities, agent routing, stripped shell families, source
 and projected sizes, ABI requirements and warning counts. If a bundled Python

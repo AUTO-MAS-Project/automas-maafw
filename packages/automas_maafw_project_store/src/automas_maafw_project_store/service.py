@@ -23,10 +23,13 @@ from threading import RLock
 from typing import Any, Iterable, Mapping
 
 import json5
+from packaging.specifiers import InvalidSpecifier, SpecifierSet
+from packaging.version import InvalidVersion, Version
 
 
 MANIFEST_FILE_NAME = ".auto_mas_maafw_project.json"
-MANIFEST_SCHEMA_VERSION = 2
+MANIFEST_SCHEMA_VERSION = 3
+LEGACY_MANIFEST_SCHEMA_VERSION = 2
 STORE_MARKER_NAME = ".auto_mas_maafw_project_store.json"
 STORE_SCHEMA_VERSION = 1
 STORE_KIND = "auto-mas-maafw-project-store"
@@ -47,6 +50,17 @@ MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES = 16 * 1024 * 1024 * 1024
 MAX_ZIP_COMPRESSION_RATIO = 500.0
 _ZIP_COPY_CHUNK_SIZE = 1024 * 1024
 MAX_SUMMARY_ITEM_NAMES = 128
+_TREE_HASH_SCHEMA_VERSION = 2
+_LEGACY_TREE_HASH_SCHEMA_VERSION = 1
+_TREE_HASH_FRAMING = "domain-file-count-path-length-content-length-v2"
+_LEGACY_TREE_HASH_FRAMING = "path-length-content-v1"
+_PROJECTED_SOURCE_HASH_DOMAIN = b"AUTO-MAS:MaaFW:projected-source:v2\x00"
+_STORE_PAYLOAD_HASH_DOMAIN = b"AUTO-MAS:MaaFW:store-payload:v2\x00"
+_SOURCE_SNAPSHOT_HASH_DOMAIN = b"AUTO-MAS:MaaFW:source-snapshot:v2\x00"
+_PROJECTED_SOURCE_HASH_DOMAIN_NAME = "AUTO-MAS:MaaFW:projected-source:v2"
+_STORE_PAYLOAD_HASH_DOMAIN_NAME = "AUTO-MAS:MaaFW:store-payload:v2"
+_PROJECTED_SOURCE_METADATA_DOMAIN = b"AUTO-MAS:MaaFW:projected-source-metadata\x00"
+_PROJECTED_SOURCE_METADATA_SCHEMA_VERSION = 1
 
 _COMPONENT_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$")
 _WINDOWS_RESERVED_NAMES = {
@@ -171,6 +185,7 @@ class _ProjectionPlan:
     excluded_reasons: dict[str, str]
     agent_runtime: list[dict[str, Any]]
     required_python_abi: list[str]
+    python_runtime: dict[str, Any] | None
     shared_agent_dependencies_complete: bool
     opaque_agent: bool
     conservative: bool
@@ -499,19 +514,43 @@ class MaaFWProjectStoreService:
         plan = _build_projection_plan(source_root, source_interface_path, interface_data)
         interface_version = _optional_string(plan.interface_data.get("version"))
         normalized_version = _resolve_import_version(version, interface_version)
-        source_hash = _calculate_projected_source_hash(source_root, plan.copied_files)
+        source_hash_metadata = _projected_source_hash_metadata(plan.python_runtime)
+        source_hash = _calculate_projected_source_hash(
+            source_root,
+            plan.copied_files,
+            metadata=source_hash_metadata,
+        )
         source_tree_bytes = _tree_size(source_root)
 
         with self._lock:
             final_dir = self._version_dir(normalized_project_id, normalized_version)
             if final_dir.exists():
                 existing = self._load_manifest(normalized_project_id, normalized_version)
-                existing_hash = (
-                    existing.get("source", {})
-                    .get("hash", {})
-                    .get("value")
+                existing_hash = _manifest_source_hash(existing)
+                existing_hash_schema = _manifest_hash_schema_version(
+                    existing,
+                    "source",
                 )
-                if existing_hash != source_hash:
+                candidate_hash = source_hash
+                if existing_hash_schema == _LEGACY_TREE_HASH_SCHEMA_VERSION:
+                    existing_runtime = existing.get("runtime")
+                    existing_runtime = (
+                        existing_runtime
+                        if isinstance(existing_runtime, Mapping)
+                        else {}
+                    )
+                    existing_python = existing_runtime.get("python")
+                    existing_python = (
+                        existing_python
+                        if isinstance(existing_python, Mapping)
+                        else None
+                    )
+                    candidate_hash = _calculate_projected_source_hash_legacy(
+                        source_root,
+                        plan.copied_files,
+                        metadata=_projected_source_hash_metadata(existing_python),
+                    )
+                if existing_hash != candidate_hash:
                     raise MaaFWProjectStoreError(
                         f"immutable project version already exists with different content: "
                         f"{normalized_project_id}@{normalized_version}"
@@ -543,6 +582,7 @@ class MaaFWProjectStoreService:
                     _calculate_projected_source_hash(
                         source_root,
                         plan.copied_files,
+                        metadata=source_hash_metadata,
                     )
                     != source_hash
                 ):
@@ -601,6 +641,9 @@ class MaaFWProjectStoreService:
                         "hash": {
                             "algorithm": "sha256",
                             "scope": "projected-source",
+                            "schemaVersion": _TREE_HASH_SCHEMA_VERSION,
+                            "domain": _PROJECTED_SOURCE_HASH_DOMAIN_NAME,
+                            "framing": _TREE_HASH_FRAMING,
                             "value": source_hash,
                         },
                     },
@@ -608,6 +651,9 @@ class MaaFWProjectStoreService:
                         "hash": {
                             "algorithm": "sha256",
                             "scope": "store-payload",
+                            "schemaVersion": _TREE_HASH_SCHEMA_VERSION,
+                            "domain": _STORE_PAYLOAD_HASH_DOMAIN_NAME,
+                            "framing": _TREE_HASH_FRAMING,
                             "value": payload_hash,
                         }
                     },
@@ -626,6 +672,7 @@ class MaaFWProjectStoreService:
                         "constraint": constraint,
                         "platform": _optional_string(platform) or sys.platform,
                         "arch": _optional_string(arch) or host_platform.machine() or "unknown",
+                        "python": _json_clone(plan.python_runtime),
                         "agent": agents,
                         "requiredPythonAbi": plan.required_python_abi,
                         "sharedAgentDependenciesComplete": (
@@ -666,6 +713,12 @@ class MaaFWProjectStoreService:
                     },
                     "warnings": warnings,
                 }
+                _validate_project_manifest(
+                    manifest,
+                    expected_project_id=normalized_project_id,
+                    expected_version=normalized_version,
+                    data_path=data_dir,
+                )
                 _write_json(data_dir / MANIFEST_FILE_NAME, manifest)
                 stage_dir.rename(final_dir)
             except FileExistsError as exc:
@@ -784,10 +837,9 @@ class MaaFWProjectStoreService:
             script_root = self._run_scripts_root / normalized_script_id
             final_dir = script_root / "checkouts" / checkout_id
             _assert_path_chain_within_root(final_dir, self.run_root)
+            self._verify_store_payload(manifest, source_dir)
             if final_dir.exists() or final_dir.is_symlink():
                 return self._load_checkout(final_dir, identity, manifest, reused=True)
-
-            self._verify_store_payload(manifest, source_dir)
 
             stage_dir = self._run_staging_root / f"{checkout_id}-{uuid.uuid4().hex}"
             _assert_path_chain_within_root(stage_dir, self.run_root)
@@ -795,7 +847,13 @@ class MaaFWProjectStoreService:
             try:
                 stage_dir.mkdir(parents=True, exist_ok=False)
                 _copy_checkout_tree(source_dir, data_dir)
-                copied_hash = _calculate_store_payload_hash(data_dir)
+                copied_hash = _calculate_store_payload_hash(
+                    data_dir,
+                    hash_schema_version=_manifest_hash_schema_version(
+                        manifest,
+                        "payload",
+                    ),
+                )
                 if copied_hash != payload_hash:
                     raise MaaFWProjectStoreError(
                         "project-store payload changed while preparing checkout; "
@@ -1071,7 +1129,13 @@ class MaaFWProjectStoreService:
         data_path: Path,
     ) -> str:
         expected_hash = _manifest_payload_hash(manifest)
-        actual_hash = _calculate_store_payload_hash(data_path)
+        actual_hash = _calculate_store_payload_hash(
+            data_path,
+            hash_schema_version=_manifest_hash_schema_version(
+                manifest,
+                "payload",
+            ),
+        )
         if actual_hash != expected_hash:
             raise MaaFWProjectStoreError(
                 "immutable project-store payload integrity check failed; "
@@ -1879,22 +1943,81 @@ class MaaFWProjectStoreService:
                 f"project version does not exist: {project_id}@{version}"
             )
         _assert_path_chain_within_root(manifest_path, self.root)
+        _assert_not_reparse(manifest_path)
         try:
             payload = json.loads(manifest_path.read_text(encoding="utf-8"))
         except Exception as exc:
             raise MaaFWProjectStoreError(
                 f"cannot read project manifest: {project_id}@{version}: {exc}"
             ) from exc
-        if not isinstance(payload, dict):
-            raise MaaFWProjectStoreError("project manifest must be a JSON object")
-        if payload.get("projectId") != project_id or payload.get("version") != version:
-            raise MaaFWProjectStoreError(
-                f"project manifest identity mismatch: {project_id}@{version}"
+        data_path = manifest_path.parent
+        validated = _validate_project_manifest(
+            payload,
+            expected_project_id=project_id,
+            expected_version=version,
+            data_path=data_path,
+            allow_legacy_schema=True,
+        )
+        if validated["schemaVersion"] == LEGACY_MANIFEST_SCHEMA_VERSION:
+            validated = self._migrate_legacy_manifest(
+                project_id,
+                version,
+                validated,
+                data_path,
             )
-        runtime = payload.get("runtime")
-        if not isinstance(runtime, dict):
-            raise MaaFWProjectStoreError("project manifest runtime must be a JSON object")
-        return payload
+        return _validate_project_manifest(
+            validated,
+            expected_project_id=project_id,
+            expected_version=version,
+            data_path=data_path,
+        )
+
+    def _migrate_legacy_manifest(
+        self,
+        project_id: str,
+        version: str,
+        manifest: dict[str, Any],
+        data_path: Path,
+    ) -> dict[str, Any]:
+        """Annotate schema-2 hashes without changing their stable identities.
+
+        Schema 2 used an ambiguous legacy tree framing. Existing checkout IDs
+        contain those hash values, so rewriting them would strand writable
+        per-script state. Verify the legacy payload first, then make the old
+        framing explicit and upgrade only the private manifest metadata.
+        """
+
+        self._verify_store_payload(manifest, data_path)
+        if "hashCompatibility" in manifest:
+            raise MaaFWProjectStoreError(
+                "legacy project manifest contains an unexpected hashCompatibility field"
+            )
+        migrated = _json_clone(manifest)
+        migrated["schemaVersion"] = MANIFEST_SCHEMA_VERSION
+        migrated["runtime"].setdefault("python", None)
+        for section_name in ("source", "payload"):
+            section = migrated[section_name]
+            hash_value = section["hash"]
+            hash_value["schemaVersion"] = _LEGACY_TREE_HASH_SCHEMA_VERSION
+            hash_value["framing"] = _LEGACY_TREE_HASH_FRAMING
+        migrated["hashCompatibility"] = {
+            "migratedFromManifestSchemaVersion": LEGACY_MANIFEST_SCHEMA_VERSION,
+            "sourceHashSchemaVersion": _LEGACY_TREE_HASH_SCHEMA_VERSION,
+            "payloadHashSchemaVersion": _LEGACY_TREE_HASH_SCHEMA_VERSION,
+            "migratedAt": _format_timestamp(),
+        }
+        _validate_project_manifest(
+            migrated,
+            expected_project_id=project_id,
+            expected_version=version,
+            data_path=data_path,
+        )
+        _write_json_atomic(
+            self._manifest_path(project_id, version),
+            migrated,
+            self.root,
+        )
+        return migrated
 
     def _write_manifest(
         self,
@@ -1903,6 +2026,12 @@ class MaaFWProjectStoreService:
         manifest: dict[str, Any],
     ) -> None:
         self._assert_store_identity_unchanged()
+        _validate_project_manifest(
+            manifest,
+            expected_project_id=project_id,
+            expected_version=version,
+            data_path=self._version_dir(project_id, version) / "data",
+        )
         _write_json_atomic(
             self._manifest_path(project_id, version),
             manifest,
@@ -2262,7 +2391,11 @@ def _build_projection_plan(
                 f"{output_relative.as_posix()}"
             )
 
-    required_python_abi = _detect_python_abi_tags(source_root, copied_files)
+    required_python_abi = _detect_python_abi_tags(
+        source_root,
+        copied_files,
+        agent_runtime,
+    )
     for agent in agent_runtime:
         agent["abiTags"] = (
             list(required_python_abi)
@@ -2275,6 +2408,40 @@ def _build_projection_plan(
         copied_files,
         agent_runtime,
     )
+    python_runtime = _resolve_python_runtime_metadata(
+        source_root,
+        rewritten_json[source_interface_relative],
+        agent_runtime,
+    )
+    _mark_declared_managed_python_agents(
+        source_root=source_root,
+        interface_base=interface_base,
+        interface_data=interface_data,
+        copied_files=copied_files,
+        agent_runtime=agent_runtime,
+        python_runtime=python_runtime,
+    )
+    python_agents = [
+        agent
+        for agent in agent_runtime
+        if agent.get("classification") == "python"
+    ]
+    if python_agents and python_runtime is None:
+        indexes = ", ".join(str(agent.get("index")) for agent in python_agents)
+        raise MaaFWProjectStoreError(
+            "Python Agent runtime ABI is unknown for indexes "
+            f"{indexes}; declare ProjectInterface runtime.python or provide one "
+            "unambiguous bundled python3XY._pth/python3XY.dll marker"
+        )
+    if python_agents and not shared_agent_dependencies_complete:
+        indexes = ", ".join(
+            str(agent.get("index")) for agent in python_agents
+        )
+        raise MaaFWProjectStoreError(
+            "managed Python Agent dependencies are incomplete for indexes "
+            f"{indexes}; declare one complete root requirements.txt without "
+            "includes, local paths or remote URLs before importing as Managed"
+        )
 
     return _ProjectionPlan(
         source_root=source_root,
@@ -2288,6 +2455,7 @@ def _build_projection_plan(
         excluded_reasons=excluded_reasons,
         agent_runtime=agent_runtime,
         required_python_abi=required_python_abi,
+        python_runtime=python_runtime,
         shared_agent_dependencies_complete=shared_agent_dependencies_complete,
         opaque_agent=opaque_agent,
         conservative=conservative,
@@ -2468,6 +2636,115 @@ def _shared_agent_dependencies_complete(
         ):
             return False
     return True
+
+
+def _mark_declared_managed_python_agents(
+    *,
+    source_root: Path,
+    interface_base: Path,
+    interface_data: Mapping[str, Any],
+    copied_files: set[Path],
+    agent_runtime: list[dict[str, Any]],
+    python_runtime: Mapping[str, Any] | None,
+) -> None:
+    """Bind safe bare-Python Agents to an explicit managed interpreter.
+
+    Some modern ProjectInterface releases already declare ``child_exec`` as
+    ``python`` instead of bundling an interpreter.  Once ``runtime.python`` is
+    authoritative, leaving those plans as generic ``external`` commands would
+    silently pick whichever Python happens to be on PATH.  Record the exact
+    Store indexes only when a real project-local script entrypoint survived
+    projection; unsafe module/command invocations fail closed at import time.
+    """
+
+    if python_runtime is None:
+        return
+    raw_agents = interface_data.get("agent")
+    if isinstance(raw_agents, Mapping):
+        agents: list[Any] = [raw_agents]
+    elif isinstance(raw_agents, list):
+        agents = raw_agents
+    else:
+        agents = []
+
+    for runtime_agent in agent_runtime:
+        if (
+            runtime_agent.get("classification") != "python"
+            or runtime_agent.get("interpreterRoute") is not None
+        ):
+            continue
+        index = runtime_agent.get("index")
+        if type(index) is not int or index < 0 or index >= len(agents):
+            raise MaaFWProjectStoreError(
+                "Python Agent runtime index does not match ProjectInterface"
+            )
+        source_agent = agents[index]
+        if not isinstance(source_agent, Mapping):
+            raise MaaFWProjectStoreError(
+                f"agent[{index}] must be a JSON object"
+            )
+        child_exec = (
+            _optional_string(source_agent.get("child_exec"))
+            or _optional_string(source_agent.get("childExec"))
+            or ""
+        )
+        if not _is_python_interpreter_path(Path(child_exec.replace("\\", "/"))):
+            continue
+        raw_args = source_agent.get("child_args")
+        if raw_args is None:
+            raw_args = source_agent.get("childArgs")
+        entrypoint = _safe_python_entrypoint_argument(raw_args)
+        if entrypoint is None:
+            raise MaaFWProjectStoreError(
+                f"agent[{index}] uses managed Python without a safe project-local "
+                ".py/.pyw entrypoint; -m, -c and opaque commands are not supported"
+            )
+        source_path, output_path = _resolve_and_project_local_path(
+            entrypoint,
+            interface_base,
+            source_root,
+            f"agent[{index}] Python entrypoint",
+            required=True,
+        )
+        if source_path.suffix.casefold() not in {".py", ".pyw"}:
+            raise MaaFWProjectStoreError(
+                f"agent[{index}] managed Python entrypoint must be .py or .pyw"
+            )
+        if source_path.relative_to(source_root) not in copied_files:
+            raise MaaFWProjectStoreError(
+                f"agent[{index}] managed Python entrypoint was not retained by "
+                "the resource projection"
+            )
+        runtime_agent["interpreterRoute"] = "managed-python"
+        runtime_agent["projectedChildExec"] = "python"
+        runtime_agent["managedEntrypoint"] = output_path.as_posix()
+
+
+def _safe_python_entrypoint_argument(raw_args: Any) -> str | None:
+    if not isinstance(raw_args, list):
+        return None
+    consume_next = False
+    after_options = False
+    for raw_arg in raw_args:
+        if not isinstance(raw_arg, str) or not raw_arg:
+            return None
+        if consume_next:
+            consume_next = False
+            continue
+        if after_options:
+            return raw_arg
+        if raw_arg == "--":
+            after_options = True
+            continue
+        if raw_arg in {"-c", "-m"}:
+            return None
+        if raw_arg in {"--check-hash-based-pycs", "-W", "-X"}:
+            consume_next = True
+            continue
+        if raw_arg.startswith("-"):
+            continue
+        return raw_arg
+    return None
 
 
 def _is_python_interpreter_path(path: Path) -> bool:
@@ -2781,7 +3058,7 @@ def _rewrite_agent_paths(
             raw_exec = source_agent.get(key)
             if not isinstance(raw_exec, str) or not _looks_like_local_path(raw_exec):
                 continue
-            source_path, output_path = _resolve_and_project_local_path(
+            source_path, output_path = _resolve_and_project_executable_path(
                 raw_exec,
                 interface_base,
                 source_root,
@@ -2883,7 +3160,7 @@ def _rewrite_pretask_paths(
             or not _looks_like_local_path(raw_exec)
         ):
             continue
-        source_path, output_path = _resolve_and_project_local_path(
+        source_path, output_path = _resolve_and_project_executable_path(
             raw_exec,
             interface_base,
             source_root,
@@ -2958,6 +3235,7 @@ def _inspect_agents(
                 "declaredType": declared_type or None,
                 "childExec": child_exec or None,
                 "classification": classification,
+                "embeddedRequested": agent.get("embedded") is True,
                 "opaque": opaque,
                 "projectPaths": discovered_paths,
                 "_projectionKey": f"{agent_scope}#{index}",
@@ -2977,7 +3255,7 @@ def _classify_agent(
     suffixes = {Path(item.replace("\\", "/")).suffix.casefold() for item in child_args}
     if kind in {"custom", "command", "shell", "opaque"}:
         return kind or "opaque", True
-    if executable in {"python", "python.exe", "python3", "python3.exe", "py", "py.exe"} or ".py" in suffixes:
+    if _is_python_interpreter_path(Path(executable)) or ".py" in suffixes or ".pyw" in suffixes:
         return "python", False
     if executable in {"node", "node.exe", "deno", "deno.exe", "bun", "bun.exe"} or ".js" in suffixes or ".mjs" in suffixes:
         return "javascript", False
@@ -2998,7 +3276,7 @@ def _resolve_agent_candidate(
     if not _looks_like_local_path(raw_value):
         return None
     try:
-        candidate, _ = _resolve_and_project_local_path(
+        candidate, _ = _resolve_and_project_executable_path(
             raw_value,
             interface_base,
             source_root,
@@ -3109,9 +3387,80 @@ def _scan_safe_tree(root: Path) -> tuple[set[Path], set[Path]]:
     return directories, files
 
 
-def _calculate_projected_source_hash(root: Path, files: Iterable[Path]) -> str:
+def _calculate_projected_source_hash(
+    root: Path,
+    files: Iterable[Path],
+    *,
+    metadata: Mapping[str, Any] | None = None,
+) -> str:
+    return _calculate_tree_hash(
+        root,
+        files,
+        domain=_PROJECTED_SOURCE_HASH_DOMAIN,
+        metadata=metadata,
+    )
+
+
+def _calculate_tree_hash(
+    root: Path,
+    files: Iterable[Path],
+    *,
+    domain: bytes,
+    metadata: Mapping[str, Any] | None = None,
+) -> str:
+    """Hash a file set with unambiguous domain-separated framing."""
+
+    ordered_files = sorted(set(files), key=lambda path: path.as_posix())
     digest = hashlib.sha256()
-    for relative_path in sorted(files, key=lambda path: path.as_posix()):
+    digest.update(domain)
+    digest.update(len(ordered_files).to_bytes(8, "big"))
+    for relative_path in ordered_files:
+        source = (root / relative_path).resolve(strict=True)
+        _assert_within(source, root)
+        _assert_not_reparse(source)
+        encoded_path = relative_path.as_posix().encode("utf-8")
+        file_size = source.stat().st_size
+        if file_size < 0:
+            raise MaaFWProjectStoreError(f"project file size is invalid: {source}")
+        digest.update(b"F")
+        digest.update(len(encoded_path).to_bytes(8, "big"))
+        digest.update(encoded_path)
+        digest.update(file_size.to_bytes(8, "big"))
+        consumed = 0
+        with source.open("rb") as file:
+            for chunk in iter(lambda: file.read(1024 * 1024), b""):
+                consumed += len(chunk)
+                digest.update(chunk)
+        _assert_not_reparse(source)
+        if consumed != file_size or source.stat().st_size != file_size:
+            raise MaaFWProjectStoreError(
+                f"project file changed while its tree identity was calculated: {source}"
+            )
+    if metadata is not None:
+        encoded_metadata = json.dumps(
+            metadata,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        digest.update(b"M")
+        digest.update(len(encoded_metadata).to_bytes(8, "big"))
+        digest.update(encoded_metadata)
+    else:
+        digest.update(b"N")
+    return digest.hexdigest()
+
+
+def _calculate_projected_source_hash_legacy(
+    root: Path,
+    files: Iterable[Path],
+    *,
+    metadata: Mapping[str, Any] | None = None,
+) -> str:
+    """Reproduce schema-2 hashes solely for verified Store compatibility."""
+
+    digest = hashlib.sha256()
+    for relative_path in sorted(set(files), key=lambda path: path.as_posix()):
         source = (root / relative_path).resolve(strict=True)
         _assert_within(source, root)
         _assert_not_reparse(source)
@@ -3121,10 +3470,35 @@ def _calculate_projected_source_hash(root: Path, files: Iterable[Path]) -> str:
         with source.open("rb") as file:
             for chunk in iter(lambda: file.read(1024 * 1024), b""):
                 digest.update(chunk)
+    if metadata is not None:
+        encoded_metadata = json.dumps(
+            metadata,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        digest.update(_PROJECTED_SOURCE_METADATA_DOMAIN)
+        digest.update(len(encoded_metadata).to_bytes(8, "big"))
+        digest.update(encoded_metadata)
     return digest.hexdigest()
 
 
-def _detect_python_abi_tags(root: Path, files: Iterable[Path]) -> list[str]:
+def _projected_source_hash_metadata(
+    python_runtime: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    if python_runtime is None:
+        return None
+    return {
+        "schemaVersion": _PROJECTED_SOURCE_METADATA_SCHEMA_VERSION,
+        "pythonRuntime": python_runtime,
+    }
+
+
+def _detect_python_abi_tags(
+    root: Path,
+    files: Iterable[Path],
+    agent_runtime: Iterable[Mapping[str, Any]] = (),
+) -> list[str]:
     tags: set[str] = set()
     compact_pattern = re.compile(
         r"(?<![A-Za-z0-9])(?P<tag>cp\d{2,3}(?:-[A-Za-z0-9_]+)?)",
@@ -3143,7 +3517,193 @@ def _detect_python_abi_tags(root: Path, files: Iterable[Path]) -> list[str]:
             match = pattern.search(relative_path.name)
             if match is not None:
                 tags.add(match.group("tag").casefold())
+    bundled_versions, _ = _detect_bundled_python_version_evidence(
+        root,
+        agent_runtime,
+    )
+    tags.update(f"cp{major}{minor}" for major, minor in bundled_versions)
     return sorted(tags)
+
+
+def _detect_bundled_python_version_evidence(
+    source_root: Path,
+    agent_runtime: Iterable[Mapping[str, Any]],
+) -> tuple[set[tuple[int, int]], set[str]]:
+    """Find unambiguous CPython minor markers without executing project code.
+
+    Some Windows MFW releases omit the ``python/python.exe`` named by
+    ProjectInterface while retaining the embeddable runtime DLL at the release
+    root.  The exact ``python3XY.dll`` name is the same minor-family evidence as
+    ``python3XY._pth`` and remains available before the shell is projected out.
+    Only the release root and declared stripped-interpreter directories are
+    inspected; similarly named files elsewhere in project resources are not
+    treated as runtime metadata.
+    """
+
+    marker_roots: set[Path] = set()
+    for agent in agent_runtime:
+        stripped = agent.get("strippedInterpreter")
+        if not isinstance(stripped, Mapping):
+            continue
+        raw_source_path = str(stripped.get("sourcePath") or "").strip()
+        if not raw_source_path:
+            continue
+        marker_roots.add(source_root.resolve())
+        marker_root = (source_root / Path(raw_source_path).parent).resolve()
+        _assert_within(marker_root, source_root)
+        if marker_root.is_dir():
+            marker_roots.add(marker_root)
+
+    versions: set[tuple[int, int]] = set()
+    sources: set[str] = set()
+    marker_patterns = (
+        (
+            re.compile(
+                r"python(?P<major>\d)(?P<minor>\d{1,2})\._pth",
+                flags=re.IGNORECASE,
+            ),
+            "embedded-python-marker",
+        ),
+        (
+            re.compile(
+                r"python(?P<major>\d)(?P<minor>\d{1,2})\.dll",
+                flags=re.IGNORECASE,
+            ),
+            "bundled-python-runtime-library",
+        ),
+    )
+    for marker_root in sorted(marker_roots, key=lambda path: str(path).casefold()):
+        for marker in marker_root.iterdir():
+            for pattern, source in marker_patterns:
+                match = pattern.fullmatch(marker.name)
+                if match is None:
+                    continue
+                _assert_not_reparse(marker)
+                if not marker.is_file():
+                    continue
+                versions.add(
+                    (int(match.group("major")), int(match.group("minor")))
+                )
+                sources.add(source)
+                break
+
+    if len(versions) > 1:
+        rendered = ", ".join(
+            f"{major}.{minor}" for major, minor in sorted(versions)
+        )
+        raise MaaFWProjectStoreError(
+            "bundled Python metadata declares multiple interpreter minors: "
+            f"{rendered}"
+        )
+    return versions, sources
+
+
+def _resolve_python_runtime_metadata(
+    source_root: Path,
+    interface_data: Mapping[str, Any],
+    agent_runtime: Iterable[Mapping[str, Any]],
+) -> dict[str, Any] | None:
+    """Resolve a hard Python constraint without executing project code.
+
+    A ProjectInterface declaration is authoritative when present. For older
+    releases that bundle an interpreter and are projected onto managed Python,
+    a unique ``python3XY._pth`` marker beside the stripped executable, or a
+    ``python3XY.dll`` at that location/the release root, is stable evidence of
+    the interpreter minor family shipped by that release.
+    """
+
+    explicit_constraint: str | None = None
+    sources: list[str] = []
+    runtime = interface_data.get("runtime")
+    runtime_data = dict(runtime) if isinstance(runtime, Mapping) else {}
+    python = runtime_data.get("python")
+    if python is not None:
+        if not isinstance(python, Mapping):
+            raise MaaFWProjectStoreError(
+                "ProjectInterface runtime.python must be a JSON object"
+            )
+        implementation = str(python.get("implementation") or "cpython").strip()
+        if implementation.casefold() != "cpython":
+            raise MaaFWProjectStoreError(
+                "ProjectInterface runtime.python currently supports only cpython"
+            )
+        raw_constraint = str(
+            python.get("requires") or python.get("constraint") or ""
+        ).strip()
+        if not raw_constraint:
+            raise MaaFWProjectStoreError(
+                "ProjectInterface runtime.python requires a non-empty constraint"
+            )
+        explicit_constraint = _normalize_python_constraint(raw_constraint)
+        sources.append("project-interface")
+
+    embedded_versions, embedded_sources = _detect_bundled_python_version_evidence(
+        source_root,
+        agent_runtime,
+    )
+    if embedded_versions:
+        major, minor = next(iter(embedded_versions))
+        if explicit_constraint is not None:
+            if not _python_constraint_accepts_minor_family(
+                explicit_constraint,
+                major,
+                minor,
+            ):
+                raise MaaFWProjectStoreError(
+                    "ProjectInterface Python constraint does not match the bundled "
+                    f"interpreter marker: {explicit_constraint} vs {major}.{minor}"
+                )
+        else:
+            explicit_constraint = f"=={major}.{minor}.*"
+        sources.extend(sorted(embedded_sources))
+
+    if explicit_constraint is None:
+        return None
+    return {
+        "implementation": "cpython",
+        "constraint": explicit_constraint,
+        "sources": sources,
+    }
+
+
+def _normalize_python_constraint(value: str) -> str:
+    try:
+        constraint = SpecifierSet(value)
+    except InvalidSpecifier as exc:
+        raise MaaFWProjectStoreError(
+            f"invalid ProjectInterface Python constraint: {value}"
+        ) from exc
+    normalized = str(constraint)
+    if not normalized:
+        raise MaaFWProjectStoreError(
+            "ProjectInterface Python constraint cannot be empty"
+        )
+    return normalized
+
+
+def _python_constraint_accepts_minor_family(
+    constraint: str,
+    major: int,
+    minor: int,
+) -> bool:
+    """Whether a minor-only bundled marker can satisfy a Python constraint.
+
+    ``python313._pth`` proves the CPython 3.13 ABI family, not patch 3.13.0.
+    The interpreter is removed from the managed projection, so an explicit
+    patch constraint such as ``==3.13.14`` must be accepted and routed to the
+    Pool instead of being compared against the synthetic version ``3.13``.
+    CPython patch releases are small non-negative integers; probing a generous
+    bounded family also handles normal ranges, exclusions and prefix pins.
+    """
+
+    specifier = SpecifierSet(constraint)
+    return any(
+        specifier.contains(
+            Version(f"{major}.{minor}.{patch}"),
+            prereleases=True,
+        )
+        for patch in range(1000)
+    )
 
 
 def _resolve_runtime_constraint(
@@ -3152,26 +3712,46 @@ def _resolve_runtime_constraint(
     source_root: Path,
     interface_base: Path,
 ) -> str | None:
-    if explicit is not None and explicit.strip():
-        return explicit.strip()
-    for key in (
-        "maafw_constraint",
-        "maafwConstraint",
-        "maafw_version",
-        "maafwVersion",
-        "maa_framework_version",
-        "maaFrameworkVersion",
-    ):
-        value = _optional_string(interface_data.get(key))
-        if value:
-            return value
-    runtime = interface_data.get("runtime")
-    if isinstance(runtime, dict):
-        for key in ("maafw", "constraint", "version"):
-            value = _optional_string(runtime.get(key))
+    constraint = explicit.strip() if explicit is not None and explicit.strip() else None
+    if constraint is None:
+        for key in (
+            "maafw_constraint",
+            "maafwConstraint",
+            "maafw_version",
+            "maafwVersion",
+            "maa_framework_version",
+            "maaFrameworkVersion",
+        ):
+            value = _optional_string(interface_data.get(key))
             if value:
-                return value
-    return _read_maafw_requirement_constraint(source_root, interface_base)
+                constraint = value
+                break
+    if constraint is None:
+        runtime = interface_data.get("runtime")
+        if isinstance(runtime, dict):
+            for key in ("maafw", "constraint", "version"):
+                value = _optional_string(runtime.get(key))
+                if value:
+                    constraint = value
+                    break
+    if constraint is None:
+        constraint = _read_maafw_requirement_constraint(
+            source_root,
+            interface_base,
+        )
+
+    bundled_version = _read_bundled_maafw_binary_version(source_root)
+    if bundled_version is None:
+        return constraint
+    if constraint is not None and not _maafw_constraint_accepts_version(
+        constraint,
+        bundled_version,
+    ):
+        raise MaaFWProjectStoreError(
+            "declared MaaFW constraint does not match bundled MaaFramework: "
+            f"{constraint} vs {bundled_version}"
+        )
+    return constraint or f"=={bundled_version}"
 
 
 def _read_maafw_requirement_constraint(
@@ -3216,6 +3796,112 @@ def _read_maafw_requirement_constraint(
     return candidates[0][1]
 
 
+def _read_bundled_maafw_binary_version(source_root: Path) -> str | None:
+    """Read one static MaaFramework version without loading project binaries."""
+
+    candidates = sorted(
+        (
+            path
+            for path in source_root.rglob("*")
+            if path.name.casefold() == "maaframework.dll"
+            and not _is_stale_maafw_binary_candidate(
+                path.relative_to(source_root)
+            )
+        ),
+        key=lambda path: path.as_posix().casefold(),
+    )
+    versions: set[str] = set()
+    version_pattern = re.compile(
+        rb"(?<![0-9A-Za-z])v(?P<version>\d+\.\d+\.\d+"
+        rb"(?:[-+][0-9A-Za-z][0-9A-Za-z.-]*)?)(?![0-9A-Za-z.-])"
+    )
+    for candidate in candidates:
+        resolved = candidate.resolve(strict=True)
+        _assert_within(resolved, source_root)
+        _assert_not_reparse(candidate)
+        if not candidate.is_file():
+            continue
+        candidate_versions: set[str] = set()
+        try:
+            with candidate.open("rb") as handle:
+                overlap = b""
+                while True:
+                    chunk = handle.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    searchable = overlap + chunk
+                    for match in version_pattern.finditer(searchable):
+                        raw_version = match.group("version").decode("ascii")
+                        try:
+                            candidate_versions.add(str(Version(raw_version)))
+                        except InvalidVersion as exc:
+                            raise MaaFWProjectStoreError(
+                                "bundled MaaFramework contains an invalid "
+                                f"version marker: {candidate} ({raw_version})"
+                            ) from exc
+                    overlap = searchable[-64:]
+        except OSError as exc:
+            raise MaaFWProjectStoreError(
+                f"cannot inspect bundled MaaFramework version: {candidate}"
+            ) from exc
+        # A framework binary may retain historical version strings.  Such a
+        # file is not an authoritative current-version marker; only a binary
+        # containing exactly one semantic version contributes evidence.
+        if len(candidate_versions) == 1:
+            versions.update(candidate_versions)
+
+    if len(versions) > 1:
+        rendered = ", ".join(sorted(versions))
+        raise MaaFWProjectStoreError(
+            "bundled MaaFramework binaries declare different versions: "
+            f"{rendered}"
+        )
+    return next(iter(versions), None)
+
+
+def _is_stale_maafw_binary_candidate(relative_path: Path) -> bool:
+    ignored_directories = {
+        "backup",
+        "backups",
+        "cache",
+        "caches",
+        "debug",
+        "old",
+        "staging",
+        "temp",
+        "temp_res",
+        "tmp",
+        "update",
+        "updates",
+        "updater",
+    }
+    for part in relative_path.parts[:-1]:
+        normalized = part.casefold()
+        if normalized.startswith("~") or normalized in ignored_directories:
+            return True
+    return False
+
+
+def _maafw_constraint_accepts_version(
+    constraint: str,
+    bundled_version: str,
+) -> bool:
+    normalized = constraint.strip()
+    if not normalized:
+        return False
+    if normalized[0].isdigit() or normalized[0].casefold() == "v":
+        normalized = f"=={normalized}"
+    try:
+        return SpecifierSet(normalized).contains(
+            Version(bundled_version),
+            prereleases=True,
+        )
+    except InvalidSpecifier as exc:
+        raise MaaFWProjectStoreError(
+            f"invalid MaaFW runtime constraint: {constraint}"
+        ) from exc
+
+
 def _resolve_and_project_local_path(
     raw_path: str,
     interface_base: Path,
@@ -3250,6 +3936,48 @@ def _resolve_and_project_local_path(
         source_root,
         interface_base,
     )
+    return source_path, output_path
+
+
+def _resolve_and_project_executable_path(
+    raw_path: str,
+    interface_base: Path,
+    source_root: Path,
+    field_name: str,
+    *,
+    required: bool,
+) -> tuple[Path, Path]:
+    """Resolve a local executable, including Windows' implicit ``.exe``."""
+
+    source_path, output_path = _resolve_and_project_local_path(
+        raw_path,
+        interface_base,
+        source_root,
+        field_name,
+        required=False,
+    )
+    if source_path.exists():
+        return source_path, output_path
+
+    value = str(raw_path).strip().strip('"').strip("'").replace("\\", "/")
+    value = value.replace("${PROJECT_DIR}", "{PROJECT_DIR}")
+    if value.startswith("{PROJECT_DIR}"):
+        value = value[len("{PROJECT_DIR}") :].lstrip("/")
+    if value and not Path(value).suffix:
+        executable_path, executable_output = _resolve_and_project_local_path(
+            f"{value}.exe",
+            interface_base,
+            source_root,
+            field_name,
+            required=False,
+        )
+        if executable_path.is_file():
+            return executable_path, executable_output
+
+    if required:
+        raise MaaFWProjectStoreError(
+            f"{field_name} path does not exist in the unpacked release: {raw_path}"
+        )
     return source_path, output_path
 
 
@@ -3372,8 +4100,14 @@ def _materialize_import_source(
 
     if source.is_dir():
         root = _canonical_source_directory(source, store_root)
-        stage_dir = staging_root / f"import-directory-{uuid.uuid4().hex}"
-        snapshot_root = stage_dir / "source"
+        # Directory snapshots can include a complete portable Python tree. On
+        # Windows, spending another ``import-directory-.../source`` segment in
+        # front of every copied entry is enough to hit the legacy directory
+        # path limit even when both the source and final Store payload are
+        # otherwise valid. The random staging directory is already the private
+        # cleanup boundary, so use it directly as the immutable snapshot root.
+        stage_dir = staging_root / uuid.uuid4().hex
+        snapshot_root = stage_dir
         _assert_path_chain_within_root(stage_dir, store_root)
         try:
             input_size_bytes = _copy_stable_directory_snapshot(
@@ -3475,6 +4209,9 @@ def _calculate_source_tree_identity(
 ) -> tuple[str, int, set[Path], set[Path]]:
     directories, files = _scan_safe_tree(root)
     digest = hashlib.sha256()
+    digest.update(_SOURCE_SNAPSHOT_HASH_DOMAIN)
+    digest.update(len(directories).to_bytes(8, "big"))
+    digest.update(len(files).to_bytes(8, "big"))
     total_size = 0
     for relative_directory in sorted(directories, key=lambda path: path.as_posix()):
         encoded = relative_directory.as_posix().encode("utf-8")
@@ -3490,15 +4227,23 @@ def _calculate_source_tree_identity(
                 f"source entry changed while it was being imported: {source_file}"
             )
         encoded = relative_file.as_posix().encode("utf-8")
+        file_size = source_file.stat().st_size
         digest.update(b"F")
         digest.update(len(encoded).to_bytes(8, "big"))
         digest.update(encoded)
+        digest.update(file_size.to_bytes(8, "big"))
+        consumed = 0
         with source_file.open("rb") as file:
             for chunk in iter(lambda: file.read(1024 * 1024), b""):
+                consumed += len(chunk)
                 total_size += len(chunk)
                 digest.update(chunk)
         _assert_existing_chain_has_no_reparse(source_file)
         _assert_not_reparse(source_file)
+        if consumed != file_size or source_file.stat().st_size != file_size:
+            raise MaaFWProjectStoreError(
+                f"source entry changed while it was being imported: {source_file}"
+            )
     return digest.hexdigest(), total_size, directories, files
 
 
@@ -3938,44 +4683,743 @@ def _path_trees_overlap(left: Path, right: Path) -> bool:
     )
 
 
-def _manifest_source_hash(manifest: Mapping[str, Any]) -> str:
-    source = manifest.get("source")
-    source = source if isinstance(source, Mapping) else {}
-    hash_value = source.get("hash")
-    hash_value = hash_value if isinstance(hash_value, Mapping) else {}
-    if (
-        str(hash_value.get("algorithm") or "").casefold() != "sha256"
-        or hash_value.get("scope") != "projected-source"
-    ):
-        raise MaaFWProjectStoreError("project manifest source hash identity is invalid")
-    value = str(hash_value.get("value") or "").casefold()
-    if not re.fullmatch(r"[0-9a-f]{64}", value):
-        raise MaaFWProjectStoreError("project manifest source hash value is invalid")
-    return value
+def _validate_project_manifest(
+    value: Any,
+    *,
+    expected_project_id: str,
+    expected_version: str,
+    data_path: Path,
+    allow_legacy_schema: bool = False,
+) -> dict[str, Any]:
+    """Validate every authoritative manifest field used by Store consumers."""
 
-
-def _manifest_payload_hash(manifest: Mapping[str, Any]) -> str:
-    payload = manifest.get("payload")
-    payload = payload if isinstance(payload, Mapping) else {}
-    hash_value = payload.get("hash")
-    hash_value = hash_value if isinstance(hash_value, Mapping) else {}
-    value = str(hash_value.get("value") or "").casefold()
+    if not isinstance(value, dict):
+        raise MaaFWProjectStoreError("project manifest must be a JSON object")
+    schema_version = value.get("schemaVersion")
+    allowed_schemas = {MANIFEST_SCHEMA_VERSION}
+    if allow_legacy_schema:
+        allowed_schemas.add(LEGACY_MANIFEST_SCHEMA_VERSION)
+    if type(schema_version) is not int or schema_version not in allowed_schemas:
+        raise MaaFWProjectStoreError("project manifest schema version is unsupported")
     if (
-        str(hash_value.get("algorithm") or "").casefold() != "sha256"
-        or hash_value.get("scope") != "store-payload"
-        or not re.fullmatch(r"[0-9a-f]{64}", value)
+        value.get("projectId") != expected_project_id
+        or value.get("version") != expected_version
     ):
         raise MaaFWProjectStoreError(
-            "project manifest has no verifiable Store payload hash; "
-            "import the resource as a new immutable version"
+            f"project manifest identity mismatch: "
+            f"{expected_project_id}@{expected_version}"
+        )
+    _validate_component(expected_project_id, "project_id")
+    _validate_component(expected_version, "version")
+    _require_manifest_timestamp(value.get("createdAt"), "createdAt")
+
+    source = _require_manifest_mapping(value, "source")
+    source_kind = source.get("kind")
+    if source_kind not in {"directory", "zip"}:
+        raise MaaFWProjectStoreError("project manifest source.kind is invalid")
+    _require_manifest_text(source.get("path"), "source.path")
+    source_project_path = source.get("projectPath")
+    if not isinstance(source_project_path, str):
+        raise MaaFWProjectStoreError(
+            "project manifest source.projectPath must be a string"
+        )
+    source_project_relative = _normalize_relative_path(
+        source_project_path,
+        "project manifest source.projectPath",
+        allow_root=True,
+    )
+    source_interface_path = source.get("interfacePath")
+    if not isinstance(source_interface_path, str):
+        raise MaaFWProjectStoreError(
+            "project manifest source.interfacePath must be a string"
+        )
+    source_interface_relative = _normalize_relative_path(
+        source_interface_path,
+        "project manifest source.interfacePath",
+    )
+    interface_version = source.get("interfaceVersion")
+    if interface_version is not None:
+        _require_manifest_text(interface_version, "source.interfaceVersion")
+    if source.get("version") != interface_version:
+        raise MaaFWProjectStoreError(
+            "project manifest source.version does not match source.interfaceVersion"
+        )
+    for field_name in ("inputSizeBytes", "treeSizeBytes"):
+        _require_non_negative_manifest_integer(
+            source.get(field_name),
+            f"source.{field_name}",
+        )
+    archive_hash = source.get("archiveSha256")
+    if source_kind == "zip":
+        if not isinstance(archive_hash, str) or not re.fullmatch(
+            r"[0-9a-fA-F]{64}",
+            archive_hash,
+        ):
+            raise MaaFWProjectStoreError(
+                "project manifest source.archiveSha256 is invalid"
+            )
+    elif archive_hash is not None:
+        raise MaaFWProjectStoreError(
+            "directory project manifest must not declare source.archiveSha256"
+        )
+
+    source_hash_descriptor = _manifest_hash_descriptor(
+        value,
+        "source",
+        expected_scope="projected-source",
+    )
+    _require_manifest_mapping(value, "payload")
+    payload_hash_descriptor = _manifest_hash_descriptor(
+        value,
+        "payload",
+        expected_scope="store-payload",
+    )
+    if schema_version == MANIFEST_SCHEMA_VERSION:
+        legacy_hashes = {
+            int(source_hash_descriptor["schemaVersion"])
+            == _LEGACY_TREE_HASH_SCHEMA_VERSION,
+            int(payload_hash_descriptor["schemaVersion"])
+            == _LEGACY_TREE_HASH_SCHEMA_VERSION,
+        }
+        if len(legacy_hashes) != 1:
+            raise MaaFWProjectStoreError(
+                "project manifest source and payload hash schemas must migrate together"
+            )
+        uses_legacy_hashes = legacy_hashes == {True}
+        if not uses_legacy_hashes and "hashCompatibility" in value:
+            raise MaaFWProjectStoreError(
+                "current project manifest must not declare legacy hash compatibility"
+            )
+
+    project_interface = _require_manifest_mapping(value, "projectInterface")
+    interface_path_value = project_interface.get("path")
+    if not isinstance(interface_path_value, str):
+        raise MaaFWProjectStoreError(
+            "project manifest projectInterface.path must be a string"
+        )
+    interface_relative = _normalize_relative_path(
+        interface_path_value,
+        "project manifest projectInterface.path",
+    )
+    try:
+        expected_interface_relative = source_interface_relative.relative_to(
+            source_project_relative
+        )
+    except ValueError as exc:
+        raise MaaFWProjectStoreError(
+            "project manifest source.interfacePath is outside source.projectPath"
+        ) from exc
+    if (
+        interface_relative != expected_interface_relative
+        or interface_relative.name.casefold() not in {"interface.json", "interface.jsonc"}
+    ):
+        raise MaaFWProjectStoreError(
+            "project manifest ProjectInterface identity is inconsistent"
+        )
+    if type(project_interface.get("resourceHashCleared")) is not bool:
+        raise MaaFWProjectStoreError(
+            "project manifest projectInterface.resourceHashCleared must be boolean"
+        )
+    cleared_resources = project_interface.get("clearedResources")
+    if not isinstance(cleared_resources, list) or any(
+        not isinstance(item, Mapping) for item in cleared_resources
+    ):
+        raise MaaFWProjectStoreError(
+            "project manifest projectInterface.clearedResources must be an object array"
+        )
+    for cleared_resource in cleared_resources:
+        cleared_file = _require_manifest_text(
+            cleared_resource.get("file"),
+            "projectInterface.clearedResources.file",
+        )
+        _normalize_relative_path(
+            cleared_file,
+            "project manifest projectInterface.clearedResources.file",
+        )
+        _require_manifest_text(
+            cleared_resource.get("resource"),
+            "projectInterface.clearedResources.resource",
+        )
+
+    _assert_not_reparse(data_path)
+    if not data_path.is_dir():
+        raise MaaFWProjectStoreError(
+            f"project manifest data directory is missing: {data_path}"
+        )
+    interface_path = data_path / interface_relative
+    _assert_path_chain_within_root(interface_path, data_path)
+    _assert_not_reparse(interface_path)
+    if not interface_path.is_file():
+        raise MaaFWProjectStoreError(
+            f"project manifest ProjectInterface is missing: {interface_path}"
+        )
+    _, discovered_interface_path = _discover_project_interface(data_path)
+    if not _same_path(discovered_interface_path, interface_path):
+        raise MaaFWProjectStoreError(
+            "project manifest ProjectInterface does not match the payload root"
+        )
+    _read_json_object(interface_path)
+
+    runtime = _require_manifest_mapping(value, "runtime")
+    runtime_constraint = runtime.get("constraint")
+    if runtime_constraint is not None:
+        _require_manifest_text(runtime_constraint, "runtime.constraint")
+    if value.get("runtimeConstraint") != runtime_constraint:
+        raise MaaFWProjectStoreError(
+            "project manifest runtimeConstraint does not match runtime.constraint"
+        )
+    _require_manifest_text(runtime.get("platform"), "runtime.platform")
+    _require_manifest_text(runtime.get("arch"), "runtime.arch")
+
+    if "python" not in runtime and schema_version != LEGACY_MANIFEST_SCHEMA_VERSION:
+        raise MaaFWProjectStoreError("project manifest runtime.python is missing")
+    python_runtime = runtime.get("python")
+    if python_runtime is not None:
+        if not isinstance(python_runtime, Mapping):
+            raise MaaFWProjectStoreError(
+                "project manifest runtime.python must be a JSON object or null"
+            )
+        if str(python_runtime.get("implementation") or "").casefold() != "cpython":
+            raise MaaFWProjectStoreError(
+                "project manifest runtime.python implementation is invalid"
+            )
+        python_constraint = _require_manifest_text(
+            python_runtime.get("constraint"),
+            "runtime.python.constraint",
+        )
+        try:
+            SpecifierSet(python_constraint)
+        except InvalidSpecifier as exc:
+            raise MaaFWProjectStoreError(
+                "project manifest runtime.python constraint is invalid"
+            ) from exc
+        _require_manifest_text_list(
+            python_runtime.get("sources"),
+            "runtime.python.sources",
+            allow_empty=False,
+            require_unique=True,
+        )
+
+    agents = value.get("agents")
+    runtime_agents = runtime.get("agent")
+    _require_manifest_object_list(agents, "agents")
+    _require_manifest_object_list(runtime_agents, "runtime.agent")
+    if agents != runtime_agents:
+        raise MaaFWProjectStoreError(
+            "project manifest agents do not match runtime.agent"
+        )
+    _validate_manifest_agents(agents)
+
+    required_abi = _require_manifest_text_list(
+        value.get("requiredPythonAbi"),
+        "requiredPythonAbi",
+        allow_empty=True,
+        require_unique=True,
+    )
+    runtime_required_abi = _require_manifest_text_list(
+        runtime.get("requiredPythonAbi"),
+        "runtime.requiredPythonAbi",
+        allow_empty=True,
+        require_unique=True,
+    )
+    if required_abi != runtime_required_abi:
+        raise MaaFWProjectStoreError(
+            "project manifest requiredPythonAbi does not match runtime.requiredPythonAbi"
+        )
+    if type(runtime.get("sharedAgentDependenciesComplete")) is not bool:
+        raise MaaFWProjectStoreError(
+            "project manifest runtime.sharedAgentDependenciesComplete must be boolean"
+        )
+
+    binding = runtime.get("binding")
+    if binding is not None:
+        if not isinstance(binding, Mapping):
+            raise MaaFWProjectStoreError(
+                "project manifest runtime.binding must be a JSON object or null"
+            )
+        _require_manifest_text(binding.get("runtimeId"), "runtime.binding.runtimeId")
+    _require_manifest_text_list(
+        runtime.get("references"),
+        "runtime.references",
+        allow_empty=True,
+        require_unique=True,
+    )
+    _active_leases(runtime.get("leases"), float("-inf"))
+    if type(runtime.get("pinned")) is not bool:
+        raise MaaFWProjectStoreError("project manifest runtime.pinned must be boolean")
+    last_used_at = runtime.get("lastUsedAt")
+    if last_used_at is not None:
+        _require_manifest_timestamp(last_used_at, "runtime.lastUsedAt")
+
+    projection = _require_manifest_mapping(value, "projection")
+    copied = _require_manifest_relative_path_list(
+        projection.get("copied"),
+        "projection.copied",
+    )
+    if interface_relative.as_posix() not in copied:
+        raise MaaFWProjectStoreError(
+            "project manifest projection.copied does not contain ProjectInterface"
+        )
+    copied_from_source = _require_manifest_relative_path_list(
+        projection.get("copiedFromSource"),
+        "projection.copiedFromSource",
+    )
+    if len(copied_from_source) != len(copied):
+        raise MaaFWProjectStoreError(
+            "project manifest projected and source file lists are inconsistent"
+        )
+    _require_manifest_relative_path_list(
+        projection.get("copiedDirectories"),
+        "projection.copiedDirectories",
+    )
+    excluded = _require_manifest_relative_path_list(
+        projection.get("excluded"),
+        "projection.excluded",
+    )
+    excluded_reasons = projection.get("excludedReasons")
+    if not isinstance(excluded_reasons, Mapping):
+        raise MaaFWProjectStoreError(
+            "project manifest projection.excludedReasons must be a JSON object"
+        )
+    if set(excluded_reasons) != set(excluded):
+        raise MaaFWProjectStoreError(
+            "project manifest projection.excludedReasons is inconsistent"
+        )
+    for excluded_path, reason in excluded_reasons.items():
+        _require_manifest_text(excluded_path, "projection.excludedReasons key")
+        _require_manifest_text(reason, f"projection.excludedReasons.{excluded_path}")
+    for field_name in (
+        "sourceSizeBytes",
+        "payloadSizeBytes",
+        "savedBytes",
+    ):
+        _require_non_negative_manifest_integer(
+            projection.get(field_name),
+            f"projection.{field_name}",
+        )
+    saved_percent = projection.get("savedPercent")
+    if type(saved_percent) not in {int, float} or not 0 <= float(saved_percent) <= 100:
+        raise MaaFWProjectStoreError(
+            "project manifest projection.savedPercent is invalid"
+        )
+    source_size = int(projection["sourceSizeBytes"])
+    payload_size = int(projection["payloadSizeBytes"])
+    expected_saved_bytes = max(0, source_size - payload_size)
+    expected_saved_percent = (
+        round(expected_saved_bytes * 100 / source_size, 2)
+        if source_size
+        else 0.0
+    )
+    if (
+        source_size != source.get("treeSizeBytes")
+        or projection.get("savedBytes") != expected_saved_bytes
+        or float(saved_percent) != expected_saved_percent
+    ):
+        raise MaaFWProjectStoreError(
+            "project manifest projection size summary is inconsistent"
+        )
+
+    _validate_manifest_summaries(
+        value,
+        source=source,
+        projection=projection,
+        agent_count=len(agents),
+    )
+    warnings = value.get("warnings")
+    if not isinstance(warnings, list) or any(
+        not isinstance(item, str) for item in warnings
+    ):
+        raise MaaFWProjectStoreError(
+            "project manifest warnings must be a string array"
         )
     return value
 
 
-def _calculate_store_payload_hash(data_path: Path) -> str:
+def _manifest_hash_descriptor(
+    manifest: Mapping[str, Any],
+    section_name: str,
+    *,
+    expected_scope: str,
+) -> dict[str, Any]:
+    section = manifest.get(section_name)
+    if not isinstance(section, Mapping):
+        raise MaaFWProjectStoreError(
+            f"project manifest {section_name} must be a JSON object"
+        )
+    hash_value = section.get("hash")
+    if not isinstance(hash_value, Mapping):
+        raise MaaFWProjectStoreError(
+            f"project manifest {section_name}.hash must be a JSON object"
+        )
+    if (
+        str(hash_value.get("algorithm") or "").casefold() != "sha256"
+        or hash_value.get("scope") != expected_scope
+    ):
+        raise MaaFWProjectStoreError(
+            f"project manifest {section_name} hash identity is invalid"
+        )
+    digest_value = str(hash_value.get("value") or "").casefold()
+    if not re.fullmatch(r"[0-9a-f]{64}", digest_value):
+        raise MaaFWProjectStoreError(
+            f"project manifest {section_name} hash value is invalid"
+        )
+
+    manifest_schema = manifest.get("schemaVersion")
+    hash_schema = hash_value.get("schemaVersion")
+    if manifest_schema == LEGACY_MANIFEST_SCHEMA_VERSION and hash_schema is None:
+        if "domain" in hash_value or "framing" in hash_value:
+            raise MaaFWProjectStoreError(
+                f"legacy project manifest {section_name} hash framing is invalid"
+            )
+        return {
+            **dict(hash_value),
+            "value": digest_value,
+            "schemaVersion": _LEGACY_TREE_HASH_SCHEMA_VERSION,
+            "framing": _LEGACY_TREE_HASH_FRAMING,
+        }
+
+    if type(hash_schema) is not int:
+        raise MaaFWProjectStoreError(
+            f"project manifest {section_name} hash schema is invalid"
+        )
+    if hash_schema == _TREE_HASH_SCHEMA_VERSION:
+        expected_domain = (
+            _PROJECTED_SOURCE_HASH_DOMAIN_NAME
+            if expected_scope == "projected-source"
+            else _STORE_PAYLOAD_HASH_DOMAIN_NAME
+        )
+        if (
+            hash_value.get("domain") != expected_domain
+            or hash_value.get("framing") != _TREE_HASH_FRAMING
+        ):
+            raise MaaFWProjectStoreError(
+                f"project manifest {section_name} hash framing is invalid"
+            )
+    elif hash_schema == _LEGACY_TREE_HASH_SCHEMA_VERSION:
+        if (
+            hash_value.get("framing") != _LEGACY_TREE_HASH_FRAMING
+            or "domain" in hash_value
+        ):
+            raise MaaFWProjectStoreError(
+                f"project manifest {section_name} legacy hash framing is invalid"
+            )
+        compatibility = manifest.get("hashCompatibility")
+        if not isinstance(compatibility, Mapping):
+            raise MaaFWProjectStoreError(
+                "project manifest legacy hashes lack migration metadata"
+            )
+        if (
+            compatibility.get("migratedFromManifestSchemaVersion")
+            != LEGACY_MANIFEST_SCHEMA_VERSION
+            or compatibility.get(f"{section_name}HashSchemaVersion")
+            != _LEGACY_TREE_HASH_SCHEMA_VERSION
+        ):
+            raise MaaFWProjectStoreError(
+                "project manifest legacy hash migration metadata is invalid"
+            )
+        _require_manifest_timestamp(
+            compatibility.get("migratedAt"),
+            "hashCompatibility.migratedAt",
+        )
+    else:
+        raise MaaFWProjectStoreError(
+            f"project manifest {section_name} hash schema is unsupported"
+        )
+    return {**dict(hash_value), "value": digest_value}
+
+
+def _require_manifest_mapping(
+    manifest: Mapping[str, Any],
+    field_name: str,
+) -> Mapping[str, Any]:
+    value = manifest.get(field_name)
+    if not isinstance(value, Mapping):
+        raise MaaFWProjectStoreError(
+            f"project manifest {field_name} must be a JSON object"
+        )
+    return value
+
+
+def _require_manifest_text(value: Any, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise MaaFWProjectStoreError(
+            f"project manifest {field_name} must be a non-empty string"
+        )
+    return value.strip()
+
+
+def _require_manifest_timestamp(value: Any, field_name: str) -> str:
+    normalized = _require_manifest_text(value, field_name)
+    if _parse_timestamp(normalized) <= 0:
+        raise MaaFWProjectStoreError(
+            f"project manifest {field_name} is not a valid timestamp"
+        )
+    return normalized
+
+
+def _require_non_negative_manifest_integer(value: Any, field_name: str) -> int:
+    if type(value) is not int or value < 0:
+        raise MaaFWProjectStoreError(
+            f"project manifest {field_name} must be a non-negative integer"
+        )
+    return value
+
+
+def _require_manifest_text_list(
+    value: Any,
+    field_name: str,
+    *,
+    allow_empty: bool,
+    require_unique: bool,
+) -> list[str]:
+    if not isinstance(value, list) or any(
+        not isinstance(item, str) or not item.strip() for item in value
+    ):
+        raise MaaFWProjectStoreError(
+            f"project manifest {field_name} must be a string array"
+        )
+    if not allow_empty and not value:
+        raise MaaFWProjectStoreError(
+            f"project manifest {field_name} cannot be empty"
+        )
+    if require_unique and len(value) != len(set(value)):
+        raise MaaFWProjectStoreError(
+            f"project manifest {field_name} contains duplicate values"
+        )
+    return value
+
+
+def _require_manifest_object_list(value: Any, field_name: str) -> list[Any]:
+    if not isinstance(value, list) or any(
+        not isinstance(item, Mapping) for item in value
+    ):
+        raise MaaFWProjectStoreError(
+            f"project manifest {field_name} must be an object array"
+        )
+    return value
+
+
+def _validate_manifest_agents(value: list[Any]) -> None:
+    indexes: list[int] = []
+    for item in value:
+        index = item.get("index")
+        if type(index) is not int or index < 0:
+            raise MaaFWProjectStoreError(
+                "project manifest agent index is invalid"
+            )
+        indexes.append(index)
+        _require_manifest_text(item.get("classification"), "agent.classification")
+        if type(item.get("opaque")) is not bool:
+            raise MaaFWProjectStoreError(
+                "project manifest agent.opaque must be boolean"
+            )
+        _require_manifest_text_list(
+            item.get("projectPaths"),
+            "agent.projectPaths",
+            allow_empty=True,
+            require_unique=False,
+        )
+    if indexes != list(range(len(indexes))):
+        raise MaaFWProjectStoreError(
+            "project manifest agent indexes must be contiguous"
+        )
+
+
+def _validate_manifest_summaries(
+    manifest: Mapping[str, Any],
+    *,
+    source: Mapping[str, Any],
+    projection: Mapping[str, Any],
+    agent_count: int,
+) -> None:
+    capabilities = _require_manifest_mapping(manifest, "capabilities")
+    counts = capabilities.get("counts")
+    if not isinstance(counts, Mapping):
+        raise MaaFWProjectStoreError(
+            "project manifest capabilities.counts must be a JSON object"
+        )
+    for field_name, count in counts.items():
+        _require_manifest_text(field_name, "capabilities.counts key")
+        _require_non_negative_manifest_integer(
+            count,
+            f"capabilities.counts.{field_name}",
+        )
+    if counts.get("agents") != agent_count:
+        raise MaaFWProjectStoreError(
+            "project manifest capabilities agent count is inconsistent"
+        )
+    _require_manifest_text_list(
+        capabilities.get("features"),
+        "capabilities.features",
+        allow_empty=True,
+        require_unique=True,
+    )
+    for field_name in (
+        "controllerNames",
+        "controllerTypes",
+        "resourceNames",
+        "taskNames",
+        "optionTypes",
+        "languageNames",
+    ):
+        _require_manifest_text_list(
+            capabilities.get(field_name),
+            f"capabilities.{field_name}",
+            allow_empty=True,
+            require_unique=True,
+        )
+    truncated = capabilities.get("truncated")
+    if not isinstance(truncated, Mapping) or any(
+        type(item) is not bool for item in truncated.values()
+    ):
+        raise MaaFWProjectStoreError(
+            "project manifest capabilities.truncated is invalid"
+        )
+
+    shells = _require_manifest_mapping(manifest, "shells")
+    _require_manifest_text_list(
+        shells.get("families"),
+        "shells.families",
+        allow_empty=True,
+        require_unique=True,
+    )
+    stripped_count = _require_non_negative_manifest_integer(
+        shells.get("strippedCount"),
+        "shells.strippedCount",
+    )
+    reason_counts = shells.get("reasonCounts")
+    if not isinstance(reason_counts, Mapping):
+        raise MaaFWProjectStoreError(
+            "project manifest shells.reasonCounts must be a JSON object"
+        )
+    for reason, count in reason_counts.items():
+        _require_manifest_text(reason, "shells.reasonCounts key")
+        _require_non_negative_manifest_integer(
+            count,
+            f"shells.reasonCounts.{reason}",
+        )
+    shell_paths = shells.get("paths")
+    if not isinstance(shell_paths, list) or any(
+        not isinstance(item, Mapping) for item in shell_paths
+    ):
+        raise MaaFWProjectStoreError(
+            "project manifest shells.paths must be an object array"
+        )
+    for item in shell_paths:
+        shell_path = _require_manifest_text(item.get("path"), "shells.paths.path")
+        _normalize_relative_path(shell_path, "project manifest shells.paths.path")
+        _require_manifest_text(item.get("reason"), "shells.paths.reason")
+    if stripped_count < len(shell_paths):
+        raise MaaFWProjectStoreError(
+            "project manifest shells.strippedCount is inconsistent"
+        )
+    if type(shells.get("pathsTruncated")) is not bool:
+        raise MaaFWProjectStoreError(
+            "project manifest shells.pathsTruncated must be boolean"
+        )
+
+    size = _require_manifest_mapping(manifest, "size")
+    expected_sizes = {
+        "inputBytes": source.get("inputSizeBytes"),
+        "sourceTreeBytes": source.get("treeSizeBytes"),
+        "projectedBytes": projection.get("payloadSizeBytes"),
+        "savedBytes": projection.get("savedBytes"),
+    }
+    for field_name, expected in expected_sizes.items():
+        actual = _require_non_negative_manifest_integer(
+            size.get(field_name),
+            f"size.{field_name}",
+        )
+        if actual != expected:
+            raise MaaFWProjectStoreError(
+                f"project manifest size.{field_name} is inconsistent"
+            )
+    size_percent = size.get("savedPercent")
+    if (
+        type(size_percent) not in {int, float}
+        or float(size_percent) != float(projection.get("savedPercent"))
+    ):
+        raise MaaFWProjectStoreError(
+            "project manifest size.savedPercent is inconsistent"
+        )
+
+    flags = _require_manifest_mapping(manifest, "flags")
+    for field_name in ("opaqueAgent", "conservative"):
+        if type(flags.get(field_name)) is not bool:
+            raise MaaFWProjectStoreError(
+                f"project manifest flags.{field_name} must be boolean"
+            )
+
+
+def _require_manifest_relative_path_list(value: Any, field_name: str) -> list[str]:
+    paths = _require_manifest_text_list(
+        value,
+        field_name,
+        allow_empty=True,
+        require_unique=True,
+    )
+    for item in paths:
+        _normalize_relative_path(
+            item,
+            f"project manifest {field_name}",
+        )
+    return paths
+
+
+def _manifest_source_hash(manifest: Mapping[str, Any]) -> str:
+    return str(
+        _manifest_hash_descriptor(
+            manifest,
+            "source",
+            expected_scope="projected-source",
+        )["value"]
+    )
+
+
+def _manifest_payload_hash(manifest: Mapping[str, Any]) -> str:
+    return str(
+        _manifest_hash_descriptor(
+            manifest,
+            "payload",
+            expected_scope="store-payload",
+        )["value"]
+    )
+
+
+def _manifest_hash_schema_version(
+    manifest: Mapping[str, Any],
+    section_name: str,
+) -> int:
+    expected_scope = (
+        "projected-source" if section_name == "source" else "store-payload"
+    )
+    return int(
+        _manifest_hash_descriptor(
+            manifest,
+            section_name,
+            expected_scope=expected_scope,
+        )["schemaVersion"]
+    )
+
+
+def _calculate_store_payload_hash(
+    data_path: Path,
+    *,
+    hash_schema_version: int = _TREE_HASH_SCHEMA_VERSION,
+) -> str:
     _, files = _scan_safe_tree(data_path)
     files.discard(Path(MANIFEST_FILE_NAME))
-    return _calculate_projected_source_hash(data_path, files)
+    if hash_schema_version == _TREE_HASH_SCHEMA_VERSION:
+        return _calculate_tree_hash(
+            data_path,
+            files,
+            domain=_STORE_PAYLOAD_HASH_DOMAIN,
+        )
+    if hash_schema_version == _LEGACY_TREE_HASH_SCHEMA_VERSION:
+        return _calculate_projected_source_hash_legacy(data_path, files)
+    raise MaaFWProjectStoreError(
+        f"unsupported Store payload hash schema: {hash_schema_version}"
+    )
 
 
 def _checkout_id(identity: Mapping[str, str]) -> str:
@@ -4314,6 +5758,16 @@ def _build_inventory_summary(manifest: dict[str, Any]) -> dict[str, Any]:
         ),
         "sourceKind": source.get("kind") or "directory",
         "runtimeConstraint": runtime.get("constraint"),
+        "pythonConstraint": (
+            runtime.get("python", {}).get("constraint")
+            if isinstance(runtime.get("python"), Mapping)
+            else None
+        ),
+        "pythonImplementation": (
+            runtime.get("python", {}).get("implementation")
+            if isinstance(runtime.get("python"), Mapping)
+            else None
+        ),
         "requiredPythonAbi": _json_clone(
             manifest.get("requiredPythonAbi")
             if isinstance(manifest.get("requiredPythonAbi"), list)
