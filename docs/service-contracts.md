@@ -61,8 +61,8 @@ class Plugin:
 | `automas-maafw-project-store` | 0.2.3 | `maafw.project_store.v1` | 本地目录/ZIP 资源导入、不可变版本、Python 约束、隔离 checkout、全局盘点、引用和 GC |
 | `automas-maafw-runtime-pool` | 0.2.0 | `maafw.runtime_pool.v1` | 可配置根目录、CP312/CP313 解释器、按完整 requirement selector 隔离 venv 并复用 uv cache |
 | `automas-maafw-runner` | 0.4.0 | `maafw.runner.v1` | 运行计划、worker job、可信 runtime 路由、环境预热和结果模型 |
-| `automas-script-maafw` | 0.1.11 | `maafw.registry.v1`、`maafw.configuration_reuse.v1` | MaaFW 脚本适配、能力注册、原生配置导入、用户复制和 Pool 路由 |
-| `automas-script-maafw-managed` | 0.3.0 | `maafw.managed.environment.v1` | 单一 MaaFW 入口的原地托管转换、全局资源盘点、本地/远程资源管理、环境准备、运行绑定与 pack 升级计划 |
+| `automas-script-maafw` | 0.1.12 | `maafw.registry.v1`、`maafw.configuration_reuse.v1` | MaaFW 脚本适配、能力注册、原生配置导入、用户复制和 Pool 路由 |
+| `automas-script-maafw-managed` | 0.3.1 | `maafw.managed.environment.v1` | 单一 MaaFW 入口的原地托管转换、全局资源盘点、本地/远程资源管理、环境准备、运行绑定与 pack 升级计划 |
 | `automas-script-maafw-pack-m9a` | 0.1.5 | `maafw.pack.m9a.v1` | M9A 默认约定、资源 profile/升级规划和通知翻译 |
 | `automas-m9a` | 0.1.5 | 无 | 聚合安装上述 MaaFW/M9A 插件 |
 
@@ -75,8 +75,8 @@ class Plugin:
    `automas-maafw-runtime-pool` 0.2.0。
 2. `automas-maafw-agent-env` 0.1.4、`automas-maafw-project-update` 0.2.3。
 3. `automas-maafw-runner` 0.4.0。
-4. `automas-script-maafw` 0.1.11。
-5. `automas-script-maafw-managed` 0.3.0。
+4. `automas-script-maafw` 0.1.12。
+5. `automas-script-maafw-managed` 0.3.1。
 6. 在独立 M9A 仓库发布 `automas-script-maafw-pack-m9a` 0.1.5，随后发布
    聚合包 `automas-m9a` 0.1.5；二者不得早于前五层依赖在 PyPI 可安装。
 
@@ -1259,7 +1259,7 @@ python -m pip install automas-m9a
 ```text
 automas-maafw-interface >= 0.2.0
 automas-maafw-runner >= 0.4.0
-automas-script-maafw >= 0.1.11
+automas-script-maafw >= 0.1.12
 ```
 
 ## 14. 完整调用示例
@@ -1434,7 +1434,7 @@ summary
 `checkout_project(project_id, version, script_id)`，它在独立 RunRoot 中按
 `storeId + projectId + version + sourceHash + payloadHash + scriptId` 完整复制并原子发布可写副本，
 不使用 hardlink，也不复制私有 Store manifest。同一身份重复解析会复用 checkout 并
-保留运行产物；marker、接口或身份损坏时失败关闭且不覆盖原目录。Managed 0.3.0
+保留运行产物；marker、接口或身份损坏时失败关闭且不覆盖原目录。Managed 0.3.1
 无条件要求 Project Store 提供 checkout，并要求稳定 `scriptId`、`runRootId` 和
 `payloadHash`；缺少任一能力或身份都拒绝运行，绝不回落到不可变 Store 路径。
 
@@ -1455,6 +1455,14 @@ Store 结构、损坏 checkout 或已失去 Store 版本的孤儿 checkout 静�
 可在没有任何脚本记录时调用无 `scriptId` 的
 `POST /plugin/maafw-managed/inventory`，查看 Project Store、RunRoot、Runtime Pool、
 全部版本、引用、租约和孤儿资源；该全局接口只读，不提供无脚本上下文的删除旁路。
+
+`POST /plugin/maafw-managed/gc` 接受可选的 `scriptId`：非空值保持指定托管脚本上下文；
+缺失、空字符串或空白值则执行全局 GC，不要求仍存在任何 Managed 脚本记录。`dryRun`
+默认 `true`，只生成预览而不删除；只有 `dryRun=false` 且 `confirmation` 精确为
+`DELETE UNUSED` 时才允许实际回收。全局 GC 与任意脚本上下文 GC 在服务端双向排他，
+冲突返回活动操作而不能由客户端进度或 session 状态绕过。两条路径都在同一个
+Project Store 生命周期事务和宿主配置写锁内完成全量引用对账与回收，并继续受
+`refs`、`pin`、`lease`、完整盘点和失败关闭保护。
 
 删除操作只处理 Project Store 自己的根目录，并拒绝当前版本、固定版本和有引用
 版本。`collect_garbage()` 默认 dry-run。跨多个异步调用的资源引用新增/释放、
@@ -1481,6 +1489,10 @@ async with project_store.resource_lifecycle_transaction():
 `POST /plugin/maafw-managed/convert` 只接受现存普通 `MaaFW` 的 `scriptId`，
 项目目录从该记录的权威 `Info.Path` 读取，不能由 HTTP payload 改写。插件先在短
 `Config.script_config_transaction()` 中读取 source storage 快照并释放宿主全局写锁，
+快照可选地提供宿主锁定状态 `scriptLocked: bool`；缺少该字段的旧宿主按
+`false` 兼容。若字段为 `true`，插件在任何 source path reservation、Project Store
+资源事务或项目导入前立即返回 HTTP 400、`errorCode: "script_locked"` 和
+“脚本正在运行或配置被占用，暂时无法转换”，不得调用导入或取得资源锁。随后
 再按“Project Store 资源生命周期锁 → 单脚本锁”进入资源阶段，短暂复核 snapshot
 未变化后完成 interface 识别、非活动的不可变导入和稳定引用
 `maafw-script:<scriptId>`；转换不会改写 Project Store 的全局 current，托管绑定始终
@@ -1490,6 +1502,10 @@ async with project_store.resource_lifecycle_transaction():
 最终只在上述资源锁内取得第二个短宿主事务并调用
 `Config.convert_plugin_script_type()` 原地替换整条宿主记录；禁止通过 add/delete
 或复制脚本模拟转换。
+
+宿主在最终 CAS 提交阶段仍必须自行复核脚本锁；若锁竞争发生在插件预检之后，插件
+保留该宿主兜底，并将可识别的锁拒绝归一为相同的 `script_locked` 错误，而不报告为
+无信息的 500。
 
 宿主以加密 storage 快照做 CAS，并在一次原子 `ScriptConfig.json` replace 中更新
 父记录和全部用户的 `PluginTypeKey`/目标配置。脚本 UUID、用户 UUID/order、名称、
@@ -1654,7 +1670,7 @@ marker、runtime manifest 的完整 selector 和 Python identity；校验成功�
 selector 不一致、Pool 换身或 Python 约束不匹配均失败关闭。普通 MaaFW 仍由相同
 Pool 服务解析默认 selector。
 
-Managed 0.3.0 另提供 `maafw.managed.environment.v1`：
+Managed 0.3.1 另提供 `maafw.managed.environment.v1`：
 
 ```python
 await prepare_script_environment(
@@ -1701,7 +1717,7 @@ Agent 的替代方案。显式外部解释器和非托管项目保持原行为�
 stage/apply/prepare 交错。原地转换的只读 source snapshot 是特例：它先单独取得并
 释放短宿主事务，随后资源导入与最终 CAS 提交仍严格按“资源生命周期 → 宿主配置”
 顺序执行，且不会在全局配置锁内做 Project Store I/O。
-Managed 0.3.0 在 Project Store 缺少该 Python 协调接口时失败关闭，不提供无锁
+Managed 0.3.1 在 Project Store 缺少该 Python 协调接口时失败关闭，不提供无锁
 兼容路径；它同时要求宿主提供 `Config.script_config_transaction()`、
 `Config.script_config_write_scope()` 和 ScriptConfigStore
 `write_transaction()`。原地转换还要求
@@ -1736,8 +1752,8 @@ ProjectInterface 或 Project Store 的不可变 `summary.remote`。GitHub 路径
 进度、日志及持久化 DTO 中统一脱敏；全局没有 CDK 时仍可发现 MirrorChyan 版本元数据，
 但没有可安装 URL 就不能执行导入或升级。
 
-普通脚本 0.1.11 的配置复用同样依赖上述宿主事务 API。M9A 集成下限必须为
-`automas-maafw-runner>=0.4.0` 与 `automas-script-maafw>=0.1.11`。
+普通脚本 0.1.12 的配置复用同样依赖上述宿主事务 API。M9A 集成下限必须为
+`automas-maafw-runner>=0.4.0` 与 `automas-script-maafw>=0.1.12`。
 
 ## 18. 变更规则
 
