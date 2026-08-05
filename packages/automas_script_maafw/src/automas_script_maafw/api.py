@@ -335,7 +335,12 @@ def _runtime_pool_entry(service: Any, runtime_id: str) -> dict[str, str] | None:
         raw_value = payload.get(key)
         if not isinstance(raw_value, str) or not raw_value.strip():
             raise MaaFWApiError(f"MaaFW Runtime Pool 条目缺少字符串字段 {key}")
-        identity[key] = raw_value.strip()
+        normalized = raw_value.strip()
+        if key in {"pythonExecutable", "venvPath"} and not Path(normalized).is_absolute():
+            raise MaaFWApiError(
+                f"MaaFW Runtime Pool 条目的 {key} 必须是绝对路径"
+            )
+        identity[key] = normalized
     return identity
 
 
