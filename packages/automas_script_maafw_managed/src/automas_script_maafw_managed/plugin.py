@@ -64,7 +64,7 @@ _USER_PENDING_KIND = "maafw.managed-user-upgrade-pending"
 _CONVERSION_KIND = "maafw.managed-conversion"
 _CONVERSION_API_VERSION = "maafw-managed.v1"
 _DISTRIBUTION_NAME = "automas-script-maafw-managed"
-_DISTRIBUTION_VERSION_FALLBACK = "0.3.0"
+_DISTRIBUTION_VERSION_FALLBACK = "0.3.1"
 _SOURCE_TYPE = "MaaFW"
 _SOURCE_TYPES = frozenset((_SOURCE_TYPE, "M9A"))
 _TARGET_TYPE = "MaaFWManaged"
@@ -73,6 +73,13 @@ _PROGRESS_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,200}$")
 _PROGRESS_MAX_STATES = 128
 _PROGRESS_MAX_LOGS = 80
 _PROGRESS_TERMINAL_STATES = frozenset({"success", "error"})
+# A private key is reserved for the inventory-page/global GC operation.  It is
+# deliberately not a script id and is never persisted into host script
+# configuration; keeping it in the same progress maps lets the global action
+# reuse the server-side active-operation and drain protections.  The public
+# progress DTO still carries an empty ``scriptId`` for this operation.
+_GLOBAL_PROGRESS_SCRIPT_ID = ""
+_GLOBAL_PROGRESS_KEY = "__global_gc__"
 _AUTO_UPDATE_PREWARM_LEASE_TTL_SECONDS = 24 * 60 * 60
 _JSON_OBJECT_FIELDS = frozenset(
     (str(getattr(group, "key", "")), str(getattr(field, "name", "")))
@@ -91,6 +98,19 @@ class _ActiveOperationConflict(ManagedServiceError):
 
 class _PluginDrainingError(ManagedServiceError):
     pass
+
+
+_SCRIPT_LOCKED_ERROR_CODE = "script_locked"
+_SCRIPT_LOCKED_MESSAGE = "脚本正在运行或配置被占用，暂时无法转换"
+
+
+class _ScriptLockedConversionError(ManagedServiceError):
+    """Stable, machine-readable conversion preflight/commit lock failure."""
+
+    error_code = _SCRIPT_LOCKED_ERROR_CODE
+
+    def __init__(self) -> None:
+        super().__init__(_SCRIPT_LOCKED_MESSAGE)
 
 
 class Plugin(ScriptAdapterPlugin):
@@ -689,16 +709,16 @@ class Plugin(ScriptAdapterPlugin):
         request: PluginHttpRequest,
     ) -> dict[str, Any]:
         payload = _payload(request)
-        try:
-            script_id = _required_script_id(payload)
-        except ManagedServiceError as exc:
+        script_id, script_error = _progress_script_id(payload)
+        if script_error is not None:
             return {
                 "code": 400,
                 "status": "error",
-                "message": str(exc),
+                "message": str(script_error),
             }
+        operation_key = _progress_operation_key(script_id)
         async with self._progress_lock:
-            operation_id = self._active_operations.get(script_id)
+            operation_id = self._active_operations.get(operation_key)
             state = (
                 self._progress_states.get(operation_id)
                 if operation_id is not None
@@ -710,7 +730,7 @@ class Plugin(ScriptAdapterPlugin):
                 or state.get("status") in _PROGRESS_TERMINAL_STATES
             ):
                 if operation_id is not None:
-                    self._active_operations.pop(script_id, None)
+                    self._active_operations.pop(operation_key, None)
                 active_operation = None
             else:
                 active_operation = _json_clone(state)
@@ -731,8 +751,14 @@ class Plugin(ScriptAdapterPlugin):
         request: PluginHttpRequest,
     ) -> dict[str, Any]:
         payload = _payload(request)
+        script_id, script_error = _progress_script_id(payload)
+        if script_error is not None:
+            return {
+                "code": 400,
+                "status": "error",
+                "message": str(script_error),
+            }
         try:
-            script_id = _required_script_id(payload)
             operation_id = _required_progress_id(payload)
         except ManagedServiceError as exc:
             return {
@@ -762,8 +788,15 @@ class Plugin(ScriptAdapterPlugin):
         message: str,
         *,
         owner_task: asyncio.Task[Any] | None = None,
+        allow_global: bool = False,
     ) -> dict[str, str]:
-        script_id = _required_script_id(payload)
+        if allow_global:
+            script_id, script_error = _progress_script_id(payload)
+            if script_error is not None:
+                raise script_error
+        else:
+            script_id = _required_script_id(payload)
+        operation_key = _progress_operation_key(script_id)
         operation_id = _required_progress_id(payload, required=False)
         if not operation_id:
             operation_id = str(uuid.uuid4())
@@ -792,21 +825,36 @@ class Plugin(ScriptAdapterPlugin):
                 raise ManagedServiceError(
                     "progressId 已被使用；每次操作必须使用新的 progressId"
                 )
-            active_operation_id = self._active_operations.get(script_id)
-            active_state = (
-                self._progress_states.get(active_operation_id)
-                if active_operation_id is not None
-                else None
+            candidate_keys = (
+                tuple(self._active_operations)
+                if operation_key == _GLOBAL_PROGRESS_KEY
+                else (operation_key, _GLOBAL_PROGRESS_KEY)
             )
-            if (
-                active_state is not None
-                and active_state.get("scriptId") == script_id
-                and active_state.get("status")
-                not in _PROGRESS_TERMINAL_STATES
-            ):
+            active_operation_id = None
+            active_state = None
+            stale_keys: list[tuple[str, str]] = []
+            for candidate_key in candidate_keys:
+                candidate_operation_id = self._active_operations.get(candidate_key)
+                candidate_state = (
+                    self._progress_states.get(candidate_operation_id)
+                    if candidate_operation_id is not None
+                    else None
+                )
+                if (
+                    candidate_state is not None
+                    and candidate_state.get("status")
+                    not in _PROGRESS_TERMINAL_STATES
+                ):
+                    active_operation_id = candidate_operation_id
+                    active_state = candidate_state
+                    break
+                if candidate_operation_id is not None:
+                    stale_keys.append((candidate_key, candidate_operation_id))
+            if active_state is not None:
                 raise _ActiveOperationConflict(active_state)
-            if active_operation_id is not None:
-                self._active_operations.pop(script_id, None)
+            for stale_key, stale_operation_id in stale_keys:
+                if self._active_operations.get(stale_key) == stale_operation_id:
+                    self._active_operations.pop(stale_key, None)
             if len(self._progress_states) >= _PROGRESS_MAX_STATES:
                 active_ids = set(self._active_operations.values())
                 terminal_id = next(
@@ -824,7 +872,7 @@ class Plugin(ScriptAdapterPlugin):
                     )
                 self._progress_states.pop(terminal_id)
             self._progress_states[operation_id] = state
-            self._active_operations[script_id] = operation_id
+            self._active_operations[operation_key] = operation_id
             if owner_task is not None:
                 self._operation_tasks.add(owner_task)
         return {
@@ -846,7 +894,7 @@ class Plugin(ScriptAdapterPlugin):
         progress = dict(context or self._progress_context.get() or {})
         operation_id = str(progress.get("operationId") or "")
         script_id = str(progress.get("scriptId") or "")
-        if not operation_id or not script_id:
+        if not operation_id:
             return
         async with self._progress_lock:
             state = self._progress_states.get(operation_id)
@@ -901,12 +949,14 @@ class Plugin(ScriptAdapterPlugin):
                 state is None
                 or state.get("scriptId") != script_id
             ):
-                if self._active_operations.get(script_id) == operation_id:
-                    self._active_operations.pop(script_id, None)
+                operation_key = _progress_operation_key(script_id)
+                if self._active_operations.get(operation_key) == operation_id:
+                    self._active_operations.pop(operation_key, None)
                 return
             if state.get("status") in _PROGRESS_TERMINAL_STATES:
-                if self._active_operations.get(script_id) == operation_id:
-                    self._active_operations.pop(script_id, None)
+                operation_key = _progress_operation_key(script_id)
+                if self._active_operations.get(operation_key) == operation_id:
+                    self._active_operations.pop(operation_key, None)
                 return
             state["status"] = status
             state["stage"] = "completed" if status == "success" else "failed"
@@ -920,8 +970,9 @@ class Plugin(ScriptAdapterPlugin):
             state["logs"] = logs[-_PROGRESS_MAX_LOGS:]
             state["updatedAt"] = datetime.now(timezone.utc).isoformat()
             snapshot = _json_clone(state)
-            if self._active_operations.get(script_id) == operation_id:
-                self._active_operations.pop(script_id, None)
+            operation_key = _progress_operation_key(script_id)
+            if self._active_operations.get(operation_key) == operation_id:
+                self._active_operations.pop(operation_key, None)
         await self._publish_progress(snapshot)
 
     @staticmethod
@@ -1065,6 +1116,8 @@ class Plugin(ScriptAdapterPlugin):
         operation_name: str,
         initial_message: str,
         operation: Callable[[], Awaitable[Any]],
+        *,
+        allow_global: bool = False,
     ) -> dict[str, Any]:
         owner_task = asyncio.current_task()
         try:
@@ -1073,6 +1126,7 @@ class Plugin(ScriptAdapterPlugin):
                 operation_name,
                 initial_message,
                 owner_task=owner_task,
+                allow_global=allow_global,
             )
         except _ActiveOperationConflict as exc:
             return {
@@ -1088,11 +1142,7 @@ class Plugin(ScriptAdapterPlugin):
                 "message": _sanitize_public_message(str(exc)),
             }
         except ManagedServiceError as exc:
-            return {
-                "code": 400,
-                "status": "error",
-                "message": _sanitize_public_message(str(exc)),
-            }
+            return _managed_error_response(exc)
 
         token = self._progress_context.set(progress)
         terminal_status = "success"
@@ -1125,11 +1175,7 @@ class Plugin(ScriptAdapterPlugin):
         except ManagedServiceError as exc:
             terminal_status = "error"
             terminal_message = _sanitize_public_message(str(exc))
-            response = {
-                "code": 400,
-                "status": "error",
-                "message": terminal_message,
-            }
+            response = _managed_error_response(exc)
         except Exception as exc:
             terminal_status = "error"
             terminal_message = _sanitize_public_message(
@@ -1245,6 +1291,7 @@ class Plugin(ScriptAdapterPlugin):
                 raise ManagedServiceError(
                     "宿主转换快照中的 source type 与当前脚本不一致，拒绝导入资源"
                 )
+            _raise_if_script_locked(snapshot)
 
             source_config = _conversion_form_config(
                 _record_config(record, f"脚本 {script_id}"),
@@ -1289,6 +1336,7 @@ class Plugin(ScriptAdapterPlugin):
                         current_snapshot,
                         script_id,
                     )
+                    _raise_if_script_locked(current_snapshot)
                     if current_snapshot != snapshot:
                         raise ManagedServiceError(
                             "脚本或用户配置在资源导入前已变化，请刷新后重试"
@@ -1477,6 +1525,14 @@ class Plugin(ScriptAdapterPlugin):
                         "warning": str(exc),
                     },
                 )
+            if commit_state == "script_locked" or _is_script_locked_error(exc):
+                if commit_state != "committed":
+                    await gateway.release_project_reference(
+                        imported_project_id,
+                        imported_version,
+                        reference,
+                    )
+                raise _ScriptLockedConversionError() from exc
             if commit_state == "source":
                 await gateway.release_project_reference(
                     imported_project_id,
@@ -3448,6 +3504,37 @@ class Plugin(ScriptAdapterPlugin):
         payload = _payload(request)
         dry_run = _as_bool(payload.get("dryRun"), True)
 
+        # The inventory page has no script context.  Keep this branch fully
+        # global: it must never validate or mutate an individual script, while
+        # still going through the same progress/active-operation wrapper and
+        # the gateway's authoritative reference, pin and lease protections.
+        raw_script_id = str(
+            payload.get("scriptId") or payload.get("script_id") or ""
+        ).strip()
+        if not raw_script_id:
+            async def collect_global() -> dict[str, Any]:
+                if (
+                    not dry_run
+                    and str(payload.get("confirmation") or "")
+                    != "DELETE UNUSED"
+                ):
+                    raise ManagedServiceError(
+                        "实际回收前请在确认字段中输入 DELETE UNUSED"
+                    )
+                return await self._collect_garbage_with_script_references(
+                    payload,
+                    dry_run=dry_run,
+                    requesting_script_id="",
+                )
+
+            return await self._respond_with_progress(
+                payload,
+                "gc-preview" if dry_run else "gc-apply",
+                "正在预览空间回收" if dry_run else "正在回收无引用资源",
+                collect_global,
+                allow_global=True,
+            )
+
         async def collect(script_id: str) -> dict[str, Any]:
             if (
                 not dry_run
@@ -3578,6 +3665,7 @@ class Plugin(ScriptAdapterPlugin):
                     active_script_ids = sorted(
                         script_id
                         for script_id in self._active_operations
+                        if script_id != _GLOBAL_PROGRESS_KEY
                         if script_id != requesting_script_id
                     )
                 return await gateway.collect_garbage(
@@ -3621,11 +3709,7 @@ class Plugin(ScriptAdapterPlugin):
                 "message": _sanitize_public_message(str(exc)),
             }
         except ManagedServiceError as exc:
-            return {
-                "code": 400,
-                "status": "error",
-                "message": _sanitize_public_message(str(exc)),
-            }
+            return _managed_error_response(exc)
         except Exception as exc:
             return {
                 "code": 500,
@@ -4029,6 +4113,38 @@ def _required_script_id(payload: Mapping[str, Any]) -> str:
         raise ManagedServiceError("scriptId 不是有效 UUID") from exc
 
 
+def _progress_operation_key(script_id: str) -> str:
+    """Map the public progress script id to the server-side exclusion key."""
+
+    return (
+        _GLOBAL_PROGRESS_KEY
+        if script_id == _GLOBAL_PROGRESS_SCRIPT_ID
+        else script_id
+    )
+
+
+def _progress_script_id(
+    payload: Mapping[str, Any],
+) -> tuple[str, ManagedServiceError | None]:
+    """Read a progress owner, allowing an empty id for global operations.
+
+    Script-bound mutations continue to use :func:`_required_script_id`; this
+    helper is intentionally limited to progress lookup and the global GC
+    entrypoint.  The returned public id stays empty for global operations,
+    while the progress map uses a private sentinel key for exclusion.
+    """
+
+    raw_script_id = str(
+        payload.get("scriptId") or payload.get("script_id") or ""
+    ).strip()
+    if not raw_script_id:
+        return _GLOBAL_PROGRESS_SCRIPT_ID, None
+    try:
+        return str(uuid.UUID(raw_script_id)), None
+    except ValueError:
+        return "", ManagedServiceError("scriptId 不是有效 UUID")
+
+
 def _required_progress_id(
     payload: Mapping[str, Any],
     *,
@@ -4114,6 +4230,11 @@ def _validate_conversion_snapshot(
         raise ManagedServiceError("宿主转换快照 script.config 不是 JSON object")
     if not isinstance(users, Mapping) or not isinstance(user_order, list):
         raise ManagedServiceError("宿主转换快照缺少 users/userOrder")
+    script_locked = snapshot.get("scriptLocked")
+    if script_locked is not None and type(script_locked) is not bool:
+        raise ManagedServiceError(
+            "宿主转换快照 scriptLocked 必须是 boolean"
+        )
     normalized_order = [str(item).strip() for item in user_order]
     if any(not item for item in normalized_order):
         raise ManagedServiceError("宿主转换快照包含空 userId")
@@ -4147,6 +4268,17 @@ def _validate_conversion_snapshot(
     snapshot["userOrder"] = normalized_order
     snapshot["users"] = normalized_users
     return snapshot
+
+
+def _snapshot_script_locked(snapshot: Mapping[str, Any]) -> bool:
+    """Read the optional host lock flag without breaking legacy hosts."""
+
+    return snapshot.get("scriptLocked") is True
+
+
+def _raise_if_script_locked(snapshot: Mapping[str, Any]) -> None:
+    if _snapshot_script_locked(snapshot):
+        raise _ScriptLockedConversionError()
 
 
 def _snapshot_script_type(snapshot: Mapping[str, Any]) -> str:
@@ -4342,6 +4474,8 @@ async def _conversion_commit_state(
         current_snapshot = _validate_conversion_snapshot(current, script_id)
     except Exception:
         return "unknown"
+    if _snapshot_script_locked(current_snapshot):
+        return "script_locked"
     return "source" if current_snapshot == expected_snapshot else "unknown"
 
 
@@ -4393,6 +4527,37 @@ def _sanitize_public_message(message: Any) -> str:
             flags=re.IGNORECASE,
         )
     return sanitized
+
+
+def _managed_error_response(exc: ManagedServiceError) -> dict[str, Any]:
+    response = {
+        "code": 400,
+        "status": "error",
+        "message": _sanitize_public_message(str(exc)),
+    }
+    error_code = str(getattr(exc, "error_code", "") or "").strip()
+    if error_code:
+        response["errorCode"] = error_code
+    return response
+
+
+def _is_script_locked_error(exc: BaseException) -> bool:
+    """Recognize host-side lock rejection while retaining old host support."""
+
+    for attribute in ("error_code", "machine_code", "errorCode"):
+        if str(getattr(exc, attribute, "") or "").strip() == (
+            _SCRIPT_LOCKED_ERROR_CODE
+        ):
+            return True
+    message = str(exc or "").casefold()
+    return (
+        "script_locked" in message
+        or "脚本正在运行" in message
+        or "配置被占用" in message
+        or ("脚本" in message and "运行" in message and "转换" in message)
+        or ("脚本" in message and ("锁" in message or "占用" in message))
+        or ("script" in message and "lock" in message)
+    )
 
 
 def _sanitize_public_value(value: Any) -> Any:

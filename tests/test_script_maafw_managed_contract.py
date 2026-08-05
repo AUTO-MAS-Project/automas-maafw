@@ -29,7 +29,7 @@ class ScriptMaaFWManagedContractTest(unittest.TestCase):
             (PACKAGE_ROOT / "pyproject.toml").read_text(encoding="utf-8")
         )
         self.assertEqual(project["project"]["name"], "automas-script-maafw-managed")
-        self.assertEqual(project["project"]["version"], "0.3.0")
+        self.assertEqual(project["project"]["version"], "0.3.1")
         self.assertEqual(
             project["project"]["entry-points"]["auto_mas.plugins"],
             {
@@ -45,7 +45,7 @@ class ScriptMaaFWManagedContractTest(unittest.TestCase):
         self.assertIn("automas-maafw-runtime-pool>=0.2.0", dependencies)
         self.assertIn("automas-maafw-project-update>=0.2.3", dependencies)
         plugin_source = (MODULE_ROOT / "plugin.py").read_text(encoding="utf-8")
-        self.assertIn('_DISTRIBUTION_VERSION_FALLBACK = "0.3.0"', plugin_source)
+        self.assertIn('_DISTRIBUTION_VERSION_FALLBACK = "0.3.1"', plugin_source)
 
     def test_adapter_registration_is_declarative_and_reuses_icon(self) -> None:
         tree = ast.parse((MODULE_ROOT / "plugin.py").read_text(encoding="utf-8"))
@@ -3294,6 +3294,54 @@ class ManagedInPlaceConversionTest(unittest.TestCase):
         self.assertEqual(first, retry)
         self.assertEqual(len({first, different_version, different_project, different_runtime}), 4)
 
+    def test_conversion_fails_fast_when_script_is_locked(self) -> None:
+        config = self._fake_config(
+            script_locked=True,
+            include_script_locked=True,
+        )
+        gateway = self._Gateway(config.events)
+        self.module.Config = config
+        plugin = self.module.Plugin(self._context())
+        plugin._gateway = lambda: gateway
+        original_reserve = self.module.try_reserve_project_path
+
+        async def reserve(path):
+            self.fail(f"locked conversion must not reserve {path}")
+
+        self.module.try_reserve_project_path = reserve
+        try:
+            response = asyncio.run(
+                plugin._convert_project(
+                    self._request({"scriptId": self.script_id})
+                )
+            )
+        finally:
+            self.module.try_reserve_project_path = original_reserve
+
+        self.assertEqual(response["code"], 400, response)
+        self.assertEqual(response["errorCode"], "script_locked")
+        self.assertEqual(
+            response["message"],
+            "脚本正在运行或配置被占用，暂时无法转换",
+        )
+        self.assertEqual(gateway.imports, 0)
+        self.assertNotIn("resource:enter", config.events)
+
+    def test_conversion_accepts_legacy_snapshot_without_script_locked(self) -> None:
+        config = self._fake_config()
+        gateway = self._Gateway(config.events)
+        self.module.Config = config
+        plugin = self.module.Plugin(self._context())
+        plugin._gateway = lambda: gateway
+
+        response = asyncio.run(
+            plugin._convert_project(self._request({"scriptId": self.script_id}))
+        )
+
+        self.assertEqual(response["code"], 200, response)
+        self.assertTrue(response["data"]["converted"])
+        self.assertEqual(gateway.imports, 1)
+
     def test_conversion_fails_fast_when_source_project_is_busy(self) -> None:
         config = self._fake_config()
         gateway = self._Gateway(config.events)
@@ -3487,6 +3535,28 @@ class ManagedInPlaceConversionTest(unittest.TestCase):
         self.assertEqual(response["code"], 400, response)
         self.assertIn("已保留项目引用", response["message"])
         self.assertEqual(gateway.releases, [])
+
+    def test_commit_lock_rejection_keeps_stable_error_code(self) -> None:
+        config = self._fake_config(conversion_mode="locked")
+        gateway = self._Gateway(config.events)
+        self.module.Config = config
+        plugin = self.module.Plugin(self._context())
+        plugin._gateway = lambda: gateway
+
+        response = asyncio.run(
+            plugin._convert_project(self._request({"scriptId": self.script_id}))
+        )
+
+        self.assertEqual(response["code"], 400, response)
+        self.assertEqual(response["errorCode"], "script_locked")
+        self.assertEqual(
+            response["message"],
+            "脚本正在运行或配置被占用，暂时无法转换",
+        )
+        self.assertEqual(
+            gateway.releases,
+            [("m9a", "1.0", f"maafw-script:{self.script_id}")],
+        )
 
     def test_source_changed_cas_releases_inactive_project_reference(self) -> None:
         config = self._fake_config(conversion_mode="source_changed")
@@ -3820,6 +3890,262 @@ class ManagedInPlaceConversionTest(unittest.TestCase):
         self.assertEqual(len(received), 1)
         self.assertEqual(received[0]["active_script_ids"], [other_script_id])
         self.assertTrue(received[0]["checkout_gc_confirmed"])
+
+    def test_gc_without_script_id_runs_global_dry_run_without_script_write(self) -> None:
+        plugin = self.module.Plugin(self._context())
+        received: list[dict[str, object]] = []
+
+        async def collect(payload, *, dry_run, requesting_script_id):
+            received.append(
+                {
+                    "payload": dict(payload),
+                    "dryRun": dry_run,
+                    "requestingScriptId": requesting_script_id,
+                }
+            )
+            return {"global": True, "dryRun": dry_run}
+
+        async def forbidden(*_args, **_kwargs):
+            raise AssertionError("global GC must not validate a script")
+
+        original_collect = plugin._collect_garbage_with_script_references
+        original_require = plugin._require_managed_script
+        plugin._collect_garbage_with_script_references = collect
+        plugin._require_managed_script = forbidden
+        try:
+            response = asyncio.run(
+                plugin._collect_garbage(self._request({"dryRun": True}))
+            )
+        finally:
+            plugin._collect_garbage_with_script_references = original_collect
+            plugin._require_managed_script = original_require
+
+        self.assertEqual(response["code"], 200, response)
+        self.assertEqual(response["data"], {"global": True, "dryRun": True})
+        self.assertEqual(
+            received,
+            [
+                {
+                    "payload": {"dryRun": True},
+                    "dryRun": True,
+                    "requestingScriptId": "",
+                }
+            ],
+        )
+        self.assertNotIn(self.module._GLOBAL_PROGRESS_KEY, plugin._active_operations)
+
+    def test_gc_without_script_id_requires_confirmation_for_apply(self) -> None:
+        plugin = self.module.Plugin(self._context())
+        calls = 0
+
+        async def collect(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            return {"unexpected": True}
+
+        original_collect = plugin._collect_garbage_with_script_references
+        plugin._collect_garbage_with_script_references = collect
+        try:
+            rejected = asyncio.run(
+                plugin._collect_garbage(
+                    self._request(
+                        {
+                            "dryRun": False,
+                            "confirmation": "delete everything",
+                        }
+                    )
+                )
+            )
+        finally:
+            plugin._collect_garbage_with_script_references = original_collect
+
+        self.assertEqual(rejected["code"], 400, rejected)
+        self.assertIn("DELETE UNUSED", rejected["message"])
+        self.assertEqual(calls, 0)
+        self.assertNotIn(self.module._GLOBAL_PROGRESS_KEY, plugin._active_operations)
+
+    def test_gc_without_script_id_apply_passes_global_reference_context(self) -> None:
+        plugin = self.module.Plugin(self._context())
+        other_script_id = "44444444-4444-4444-8444-444444444444"
+        plugin._active_operations = {
+            other_script_id: "other-operation",
+            self.module._GLOBAL_PROGRESS_KEY: "global-operation",
+        }
+        received: list[dict[str, object]] = []
+
+        class Gateway:
+            @asynccontextmanager
+            async def resource_transaction(self):
+                yield
+
+            async def collect_garbage(self, **kwargs):
+                received.append(dict(kwargs))
+                return {"deleted": [], "kept": [{"reason": "active-lease"}]}
+
+        class Config:
+            @classmethod
+            @asynccontextmanager
+            async def script_config_write_scope(cls, script_id):
+                del cls
+                self.assertIsNone(script_id)
+                yield
+
+        async def script_records():
+            return [
+                {
+                    "id": self.script_id,
+                    "type": "MaaFWManaged",
+                    "config": {"Managed": {"ProjectId": "m9a", "Version": "1.0"}},
+                }
+            ]
+
+        original_config = self.module.Config
+        original_script_records = self.module._managed_script_record_dtos
+        self.module.Config = Config
+        self.module._managed_script_record_dtos = script_records
+        plugin._gateway = Gateway
+        try:
+            result = asyncio.run(
+                plugin._collect_garbage_with_script_references(
+                    {"confirmation": "DELETE UNUSED"},
+                    dry_run=False,
+                    requesting_script_id="",
+                )
+            )
+        finally:
+            self.module.Config = original_config
+            self.module._managed_script_record_dtos = original_script_records
+
+        self.assertEqual(result["deleted"], [])
+        self.assertEqual(len(received), 1)
+        self.assertEqual(received[0]["active_script_ids"], [other_script_id])
+        self.assertTrue(received[0]["checkout_gc_confirmed"])
+        self.assertEqual(
+            received[0]["script_records"][0]["config"]["Managed"]["ProjectId"],
+            "m9a",
+        )
+
+    def test_global_gc_and_script_operations_are_mutually_exclusive(self) -> None:
+        plugin = self.module.Plugin(self._context())
+
+        async def scenario():
+            script_started = asyncio.Event()
+            global_started = asyncio.Event()
+            release_script = asyncio.Event()
+            release_global = asyncio.Event()
+
+            async def script_operation():
+                script_started.set()
+                await release_script.wait()
+                return {"script": True}
+
+            async def global_operation():
+                global_started.set()
+                await release_global.wait()
+                return {"global": True}
+
+            script_task = asyncio.create_task(
+                plugin._respond_with_progress(
+                    {
+                        "scriptId": self.script_id,
+                        "progressId": f"{self.script_id}:active-script",
+                    },
+                    "pin",
+                    "正在固定资源",
+                    script_operation,
+                )
+            )
+            await script_started.wait()
+            global_rejected = await plugin._collect_garbage(
+                self._request({"dryRun": True})
+            )
+            release_script.set()
+            script_result = await script_task
+
+            global_task = asyncio.create_task(
+                plugin._respond_with_progress(
+                    {},
+                    "gc-preview",
+                    "正在预览空间回收",
+                    global_operation,
+                    allow_global=True,
+                )
+            )
+            await global_started.wait()
+            script_rejected = await plugin._respond_with_progress(
+                {
+                    "scriptId": self.script_id,
+                    "progressId": f"{self.script_id}:blocked-by-global",
+                },
+                "pin",
+                "正在固定资源",
+                lambda: asyncio.sleep(0),
+            )
+            release_global.set()
+            global_result = await global_task
+            return global_rejected, script_rejected, script_result, global_result
+
+        global_rejected, script_rejected, script_result, global_result = asyncio.run(
+            scenario()
+        )
+
+        self.assertEqual(global_rejected["code"], 409, global_rejected)
+        self.assertEqual(script_rejected["code"], 409, script_rejected)
+        self.assertEqual(script_result["code"], 200, script_result)
+        self.assertEqual(global_result["code"], 200, global_result)
+        self.assertNotIn(self.module._GLOBAL_PROGRESS_KEY, plugin._active_operations)
+
+    def test_global_progress_cancellation_and_failure_clear_private_key(self) -> None:
+        plugin = self.module.Plugin(self._context())
+
+        async def scenario():
+            async def fail_operation():
+                raise self.module.ManagedServiceError("synthetic global GC failure")
+
+            failed = await plugin._respond_with_progress(
+                {},
+                "gc-apply",
+                "正在回收无引用资源",
+                fail_operation,
+                allow_global=True,
+            )
+            failed_cleared = self.module._GLOBAL_PROGRESS_KEY not in plugin._active_operations
+
+            started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def cancellable_operation():
+                started.set()
+                await release.wait()
+                return {"cancelled": True}
+
+            task = asyncio.create_task(
+                plugin._respond_with_progress(
+                    {},
+                    "gc-preview",
+                    "正在预览空间回收",
+                    cancellable_operation,
+                    allow_global=True,
+                )
+            )
+            await started.wait()
+            task.cancel()
+            await asyncio.sleep(0)
+            release.set()
+            cancelled = False
+            try:
+                await task
+            except asyncio.CancelledError:
+                cancelled = True
+            cancelled_cleared = self.module._GLOBAL_PROGRESS_KEY not in plugin._active_operations
+            return failed, failed_cleared, cancelled, cancelled_cleared
+
+        failed, failed_cleared, cancelled, cancelled_cleared = asyncio.run(scenario())
+
+        self.assertEqual(failed["code"], 400, failed)
+        self.assertTrue(failed_cleared)
+        self.assertTrue(cancelled)
+        self.assertTrue(cancelled_cleared)
 
     def test_on_stop_drains_active_operation_and_rejects_new_mutation(self) -> None:
         plugin = self.module.Plugin(self._context())
@@ -4291,7 +4617,13 @@ class ManagedInPlaceConversionTest(unittest.TestCase):
         self.assertEqual(received[0]["downloadRoot"], ROOT)
         self.assertEqual(received[0]["package"], package)
 
-    def _fake_config(self, *, conversion_mode: str = "success"):
+    def _fake_config(
+        self,
+        *,
+        conversion_mode: str = "success",
+        script_locked: bool = False,
+        include_script_locked: bool = False,
+    ):
         script = SimpleNamespace(
             id=self.script_id,
             type="MaaFW",
@@ -4337,7 +4669,7 @@ class ManagedInPlaceConversionTest(unittest.TestCase):
         ]
 
         def snapshot():
-            return {
+            result = {
                 "script": {
                     "id": script.id,
                     "type": script.type,
@@ -4355,6 +4687,9 @@ class ManagedInPlaceConversionTest(unittest.TestCase):
                     for user in users
                 },
             }
+            if include_script_locked:
+                result["scriptLocked"] = script_locked
+            return result
 
         initial_snapshot = snapshot()
 
@@ -4426,6 +4761,10 @@ class ManagedInPlaceConversionTest(unittest.TestCase):
                 cls.events.append("convert")
                 if conversion_mode == "fail":
                     raise RuntimeError("host rejected before commit")
+                if conversion_mode == "locked":
+                    raise RuntimeError(
+                        f"脚本 {script.id} 正在运行，无法转换"
+                    )
                 if conversion_mode == "source_changed":
                     error = RuntimeError("host source-current CAS rejected")
                     error.conversion_state = "source_changed"

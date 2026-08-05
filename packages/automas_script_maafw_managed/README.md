@@ -64,7 +64,7 @@ operation; all mutations and remote checks are excluded by `scriptId`, and
 plugin shutdown drains registered work before releasing the active slot.
 Browser session storage is only a compatibility hint for older hosts.
 
-Managed 0.3.0 registers `maafw.managed.environment.v1` for host-side
+Managed 0.3.1 registers `maafw.managed.environment.v1` for host-side
 preparation by `scriptId`. The service resolves the authoritative Store
 version, reserves the writable checkout, and invokes
 Runner's exact prewarm route without starting the project Agent, controller, or
@@ -75,7 +75,7 @@ reference deltas before either transaction unlocks; incomplete compensation is
 attached to the original failure and never reported ready. The later run
 consumes the same complete selector, `poolId`, `runtimeId`,
 and `runtime.python` constraint, so an existing matching CP312/CP313 runtime is
-reused instead of rebuilt. Managed 0.3.0 requires Script MaaFW 0.1.11, Runner
+reused instead of rebuilt. Managed 0.3.1 requires Script MaaFW 0.1.11, Runner
 0.4.0, Project Store 0.2.3 and Runtime Pool 0.2.0 or newer compatible releases.
 
 `ImportProjectId` is an optional first-import alias and is cleared after a successful
@@ -90,11 +90,20 @@ editable form data.
 the configured Store, RunRoot and Runtime Pool identities plus every project,
 version, checkout, runtime, reference, pin and lease. Corrupt entries are
 returned as explicit errors and make the snapshot incomplete. This endpoint is
-read-only; deletion still requires a selected Managed script and a complete
-preflight inventory. Project Store `Root`/`RunRoot` and Runtime Pool `Root` are
+read-only; project-version deletion still requires a selected Managed script and
+a complete preflight inventory. Project Store `Root`/`RunRoot` and Runtime Pool `Root` are
 configured on their plugin instances as absolute paths; changing them does not
 migrate data, and a stored `StoreId` prevents accidental reuse of a same-name
 project from another root.
+
+`POST /plugin/maafw-managed/gc` accepts an optional `scriptId`. A non-empty value
+keeps the selected Managed script context; a missing, empty, or whitespace value
+selects global GC and does not require any surviving Managed script. `dryRun`
+defaults to `true`; real collection requires `dryRun=false` and the exact
+`confirmation: "DELETE UNUSED"`. Global and per-script GC are mutually exclusive
+in both directions on the server. Both paths reconcile references under the shared
+Project Store lifecycle transaction and host config write gate, while retaining
+`refs`/pin/lease, complete-inventory, and fail-closed deletion guards.
 
 Task, user and pack-owned configuration stays outside the immutable resource
 tree. A local upgrade imports the candidate as an inactive version, then asks
@@ -120,7 +129,7 @@ or runtime bind cannot lose its new reference before the matching script config
 is durable. Import, stage, apply, cancel, delete and runtime installation use
 resource-lifecycle → per-script upgrade → host-config ordering; destructive GC
 holds the host's global config write gate from snapshot through collection.
-Managed 0.3.0 requires this Project Store 0.2.3 capability and fails closed
+Managed 0.3.1 requires this Project Store 0.2.3 capability and fails closed
 instead of falling back to an unlocked older service.
 
 It also requires an AUTO-MAS host that provides
@@ -140,7 +149,7 @@ exact retry reuses the artifact but a changed target cannot do so accidentally.
 Failures known to be pre-commit release the project reference; uncertain commit
 states retain the reference for idempotent recovery. Hosts without both
 conversion methods report `inPlaceConversion=false` and the convert action fails
-closed. Do not enable or publish Managed 0.3.0 before these host transaction and
+closed. Do not enable or publish Managed 0.3.1 before these host transaction and
 conversion changes are merged.
 
 Managed HTTP operations and automatic updates use the host's global update
