@@ -3,6 +3,9 @@
 ## Unreleased
 
 - 将通用 MaaFW 插件从 AUTO-MAS 主仓迁移到独立工作区仓库。
+- Script MaaFW 0.1.12 将普通项目更新、Agent 环境预热、进度 WebSocket 与配置
+  复用 transport 收敛到插件通用 gateway，并用 Runtime Pool 身份绑定的 sidecar
+  复用已验证环境；宿主只保留通用桥接。
 - Runtime Pool 0.2.0 接收宿主通过 `AUTO_MAS_UV_INDEX_URL` 提供的首选镜像，
   同时保留用户显式设置的 `UV_INDEX_URL`/`UV_DEFAULT_INDEX`；并统一规范化
   pool 内 Python 与 uv cache 路径，拒绝越出所属 pool 的路径。

@@ -61,7 +61,7 @@ class Plugin:
 | `automas-maafw-project-store` | 0.2.3 | `maafw.project_store.v1` | 本地目录/ZIP 资源导入、不可变版本、Python 约束、隔离 checkout、全局盘点、引用和 GC |
 | `automas-maafw-runtime-pool` | 0.2.0 | `maafw.runtime_pool.v1` | 可配置根目录、CP312/CP313 解释器、按完整 requirement selector 隔离 venv 并复用 uv cache |
 | `automas-maafw-runner` | 0.4.0 | `maafw.runner.v1` | 运行计划、worker job、可信 runtime 路由、环境预热和结果模型 |
-| `automas-script-maafw` | 0.1.12 | `maafw.registry.v1`、`maafw.configuration_reuse.v1` | MaaFW 脚本适配、能力注册、原生配置导入、用户复制和 Pool 路由 |
+| `automas-script-maafw` | 0.1.12 | `maafw.registry.v1`、`maafw.configuration_reuse.v1`、`maafw.api.v1` | MaaFW 脚本适配、能力注册、原生配置导入、项目更新/环境预热 transport、用户复制和 Pool 路由 |
 | `automas-script-maafw-managed` | 0.3.2 | `maafw.managed.environment.v1` | 单一 MaaFW 入口的原地托管转换、全局资源盘点、本地/远程资源管理、环境准备、运行绑定与 pack 升级计划 |
 | `automas-script-maafw-pack-m9a` | 0.1.5 | `maafw.pack.m9a.v1` | M9A 默认约定、资源 profile/升级规划和通知翻译 |
 | `automas-m9a` | 0.1.5 | 无 | 聚合安装上述 MaaFW/M9A 插件 |
@@ -1136,6 +1136,27 @@ MFAAvalonia 与 MFW/CFA 共用的 `multi_config.json + configs/*.json`，以及 
 `Config.script_config_transaction()` 内完成。新增用户导入不会覆盖脚本级项目
 绑定；复制内部用户只复制 `Info/Task/Notify` 业务配置，并重置 `Data`、journal、
 lease 与资源引用。计划有效期为 30 分钟。
+
+### 11.2 `maafw.api.v1` 普通项目 transport
+
+普通 MaaFW 的项目更新、Runner/Agent 环境预热与进度通道由脚本插件通过宿主
+通用 plugin gateway 注册；宿主不再复制 MaaFW 专属 orchestration。对外请求路径为：
+
+```text
+POST /plugin/maafw/project/update
+POST /plugin/maafw/agent-env/prepare
+WS   /plugin/maafw/progress
+```
+
+请求与返回值只使用 JSON object/array、标量和稳定 DTO。`project/update` 接收
+`{scriptId, apply}`，先校验脚本记录与普通目录身份，再调用
+`maafw.project_update.v1`；`apply=true` 后会用同一 Runtime Pool root/poolId
+预热 Runner 环境。`agent-env/prepare` 接收 `{path, scriptId?}`，可用
+`X-MaaFW-Progress-Id` 关联进度，`X-MaaFW-Cache-Only: 1` 只查询缓存。
+
+环境 sidecar 只在项目 fingerprint、绝对 Python/venv 路径以及 Runtime Pool 的
+`runtimeId/poolId` 身份仍匹配时复用；配置写回或项目资源更新会使对应脚本缓存失效。
+Managed/project-store 记录拒绝进入普通目录 transport，必须走其自己的服务。
 
 ## 12. `maafw.pack.m9a.v1`
 

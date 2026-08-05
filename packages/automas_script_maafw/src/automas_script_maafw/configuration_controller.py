@@ -12,6 +12,7 @@ from typing import Any
 from app.core import Config
 from app.plugins import PluginHttpRequest
 
+from .agent_env_state import invalidate_maafw_agent_env_state
 from .configuration_reuse import (
     MaaFWConfigurationReuseError,
     discover_configuration_sources,
@@ -205,6 +206,17 @@ class MaaFWConfigurationReuseController:
             owner = f"maafw-config-reuse:{script_id}:{plan_id}"
             async with Config.script_config_transaction(script_id, owner=owner):
                 result = await self._apply_in_transaction(script_id, plan)
+        if bool(result.get("scriptUpdated")):
+            # Script-level changes can move the project path or alter update
+            # inputs.  Never let a configuration import resurrect an old
+            # ordinary-directory environment cache.
+            try:
+                await asyncio.to_thread(invalidate_maafw_agent_env_state, script_id)
+            except Exception:
+                # The config transaction already succeeded; cache invalidation
+                # is best-effort and the next prepare call still revalidates
+                # the fingerprint and Runtime Pool identity.
+                pass
         self._plans.pop(plan_id, None)
         return result
 

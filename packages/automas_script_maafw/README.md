@@ -23,7 +23,9 @@ fingerprinted and CAS-checked before the host creates the first/new user;
 internal user copies exclude runtime state and resource journals. Project packs
 may override source discovery and plan generation through JSON-only methods.
 
-Script MaaFW 0.1.12 requires the active `maafw.runtime_pool.v1` service and
+Script MaaFW 0.1.12 exposes ordinary project update, environment preparation,
+progress, and configuration-reuse transport through the generic plugin gateway.
+It requires the active `maafw.runtime_pool.v1` service and
 routes its resolved `Root`/`poolId` into both environment preparation and the
 real worker run. Managed execution additionally consumes the prevalidated
 Store/runtime route (complete selector, binding and Python constraint), so the
