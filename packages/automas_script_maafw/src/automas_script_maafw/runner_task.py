@@ -101,6 +101,13 @@ _FRAMEWORK_DEBUG_PAYLOAD_MARKERS = (
     '"expected":',
     '"pipeline_override":',
 )
+
+_RAW_FAILURE_UI_LOG_MARKERS = (
+    "任务失败，将继续后续任务:",
+    "MaaFW 任务执行失败:",
+    "[MaaFW Tasker] 失败:",
+    "任务执行失败: <entry=",
+)
 _NATIVE_FRAMEWORK_STATUS_RE = re.compile(
     r"(?:\*\*)?\[\d{4}-\d{2}-\d{2}[^\]]*\]\[(?:ERR|WARN|INFO|DEBUG)\]",
     re.IGNORECASE,
@@ -406,7 +413,7 @@ class MaaFWPluginAutoProxyTask(TaskExecuteBase):
                         "MaaFW 任务完成: " + ", ".join(completed_task_labels)
                     )
                 else:
-                    message = result.errorMessage or "MaaFW 任务失败"
+                    message = _failed_task_user_summary(result, self.run_plan)
                     if self.cur_user_log is not None:
                         self.cur_user_log.status = message
                     self._append_log(message)
@@ -1629,6 +1636,8 @@ def _framework_ui_message(message: str) -> str:
 
 
 def _should_forward_framework_log(message: str) -> bool:
+    if any(marker in message for marker in _RAW_FAILURE_UI_LOG_MARKERS):
+        return False
     cleaned = _clean_framework_output(message).strip()
     if _FRAMEWORK_COORDINATE_RE.search(cleaned):
         return False
@@ -1691,6 +1700,19 @@ def _read_native_debug_log_delta(path: Path, start_offset: int) -> str:
     with path.open("rb") as native_debug_log_file:
         native_debug_log_file.seek(start_offset)
         return _decode_subprocess_output(native_debug_log_file.read())
+
+
+def _failed_task_user_summary(result: Any, plan: Any | None) -> str:
+    failed_task = str(getattr(result, "failedTask", "") or "").strip()
+    tasks = tuple(getattr(plan, "tasks", ()) or ()) if plan is not None else ()
+    if tasks:
+        for task in tasks:
+            task_name = str(getattr(task, "name", "") or "").strip()
+            task_entry = str(getattr(task, "entry", "") or "").strip()
+            if failed_task and failed_task not in {task_name, task_entry}:
+                continue
+            return f"{_task_display_name(task)}：任务执行失败"
+    return f"{failed_task or 'MaaFW 任务'}：任务执行失败"
 
 
 def _task_display_name(task: Any) -> str:
