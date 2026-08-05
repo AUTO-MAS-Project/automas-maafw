@@ -61,10 +61,14 @@ schema = {
 
 _PENDING_KIND = "maafw.managed-upgrade-pending"
 _USER_PENDING_KIND = "maafw.managed-user-upgrade-pending"
-_CONVERSION_KIND = "maafw.managed-conversion"
+_CONVERSION_KIND = "plugin.script-type-conversion.v1"
+_LEGACY_CONVERSION_KINDS = frozenset(("maafw.managed-conversion",))
+# Keep the deterministic operation ID stable across the generic journal-kind
+# migration so an interrupted 0.3.1 conversion can resume with 0.3.2.
+_CONVERSION_OPERATION_ID_NAMESPACE = "maafw.managed-conversion"
 _CONVERSION_API_VERSION = "maafw-managed.v1"
 _DISTRIBUTION_NAME = "automas-script-maafw-managed"
-_DISTRIBUTION_VERSION_FALLBACK = "0.3.1"
+_DISTRIBUTION_VERSION_FALLBACK = "0.3.2"
 _SOURCE_TYPE = "MaaFW"
 _SOURCE_TYPES = frozenset((_SOURCE_TYPE, "M9A"))
 _TARGET_TYPE = "MaaFWManaged"
@@ -468,6 +472,7 @@ class Plugin(ScriptAdapterPlugin):
                     "creatable": False,
                     "create_mode": "convert-only",
                     "editor_reuse_type": "MaaFW",
+                    "project_label": True,
                     "m9a_standalone": False,
                 },
             )
@@ -4205,7 +4210,7 @@ def _conversion_operation_id(
         uuid.uuid5(
             uuid.NAMESPACE_URL,
             (
-                f"{_CONVERSION_KIND}:{script_id}:{source_fingerprint}:"
+                f"{_CONVERSION_OPERATION_ID_NAMESPACE}:{script_id}:{source_fingerprint}:"
                 f"{target_identity}"
             ),
         )
@@ -4402,7 +4407,10 @@ async def _committed_conversion_response(
     journal = _mapping(managed.get("ConversionJournal"))
     if (
         journal.get("schemaVersion") != 1
-        or journal.get("kind") != _CONVERSION_KIND
+        or journal.get("kind") not in {
+            _CONVERSION_KIND,
+            *_LEGACY_CONVERSION_KINDS,
+        }
         or journal.get("state") != "committed"
         or str(journal.get("scriptId") or "") != script_id
     ):
@@ -4459,7 +4467,10 @@ async def _conversion_commit_state(
             return "unknown"
         if (
             journal.get("schemaVersion") == 1
-            and journal.get("kind") == _CONVERSION_KIND
+            and journal.get("kind") in {
+                _CONVERSION_KIND,
+                *_LEGACY_CONVERSION_KINDS,
+            }
             and journal.get("operationId") == operation_id
             and journal.get("state") == "committed"
         ):

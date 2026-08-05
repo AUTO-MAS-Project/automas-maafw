@@ -29,7 +29,7 @@ class ScriptMaaFWManagedContractTest(unittest.TestCase):
             (PACKAGE_ROOT / "pyproject.toml").read_text(encoding="utf-8")
         )
         self.assertEqual(project["project"]["name"], "automas-script-maafw-managed")
-        self.assertEqual(project["project"]["version"], "0.3.1")
+        self.assertEqual(project["project"]["version"], "0.3.2")
         self.assertEqual(
             project["project"]["entry-points"]["auto_mas.plugins"],
             {
@@ -45,7 +45,7 @@ class ScriptMaaFWManagedContractTest(unittest.TestCase):
         self.assertIn("automas-maafw-runtime-pool>=0.2.0", dependencies)
         self.assertIn("automas-maafw-project-update>=0.2.3", dependencies)
         plugin_source = (MODULE_ROOT / "plugin.py").read_text(encoding="utf-8")
-        self.assertIn('_DISTRIBUTION_VERSION_FALLBACK = "0.3.1"', plugin_source)
+        self.assertIn('_DISTRIBUTION_VERSION_FALLBACK = "0.3.2"', plugin_source)
 
     def test_adapter_registration_is_declarative_and_reuses_icon(self) -> None:
         tree = ast.parse((MODULE_ROOT / "plugin.py").read_text(encoding="utf-8"))

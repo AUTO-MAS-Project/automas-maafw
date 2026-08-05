@@ -64,7 +64,7 @@ operation; all mutations and remote checks are excluded by `scriptId`, and
 plugin shutdown drains registered work before releasing the active slot.
 Browser session storage is only a compatibility hint for older hosts.
 
-Managed 0.3.1 registers `maafw.managed.environment.v1` for host-side
+Managed 0.3.2 registers `maafw.managed.environment.v1` for host-side
 preparation by `scriptId`. The service resolves the authoritative Store
 version, reserves the writable checkout, and invokes
 Runner's exact prewarm route without starting the project Agent, controller, or
@@ -75,7 +75,7 @@ reference deltas before either transaction unlocks; incomplete compensation is
 attached to the original failure and never reported ready. The later run
 consumes the same complete selector, `poolId`, `runtimeId`,
 and `runtime.python` constraint, so an existing matching CP312/CP313 runtime is
-reused instead of rebuilt. Managed 0.3.1 requires Script MaaFW 0.1.11, Runner
+reused instead of rebuilt. Managed 0.3.2 requires Script MaaFW 0.1.11, Runner
 0.4.0, Project Store 0.2.3 and Runtime Pool 0.2.0 or newer compatible releases.
 
 `ImportProjectId` is an optional first-import alias and is cleared after a successful
@@ -129,7 +129,7 @@ or runtime bind cannot lose its new reference before the matching script config
 is durable. Import, stage, apply, cancel, delete and runtime installation use
 resource-lifecycle → per-script upgrade → host-config ordering; destructive GC
 holds the host's global config write gate from snapshot through collection.
-Managed 0.3.1 requires this Project Store 0.2.3 capability and fails closed
+Managed 0.3.2 requires this Project Store 0.2.3 capability and fails closed
 instead of falling back to an unlocked older service.
 
 It also requires an AUTO-MAS host that provides
@@ -149,7 +149,7 @@ exact retry reuses the artifact but a changed target cannot do so accidentally.
 Failures known to be pre-commit release the project reference; uncertain commit
 states retain the reference for idempotent recovery. Hosts without both
 conversion methods report `inPlaceConversion=false` and the convert action fails
-closed. Do not enable or publish Managed 0.3.1 before these host transaction and
+closed. Do not enable or publish Managed 0.3.2 before these host transaction and
 conversion changes are merged.
 
 Managed HTTP operations and automatic updates use the host's global update

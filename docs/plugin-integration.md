@@ -35,7 +35,7 @@ Managed 服务、类型和后端契约保留，待资源管理器重新设计完
 | `automas-maafw-runtime-pool` 0.2.0 | `automas_maafw_runtime_pool.plugin:Plugin` | `maafw.runtime_pool.v1` | 按完整依赖 selector 与 Python ABI 隔离/复用运行环境 |
 | `automas-maafw-runner` 0.4.0 | `automas_maafw_runner.plugin:Plugin` | `maafw.runner.v1` | 可信 runtime 路由、预热、worker 生命周期与结果模型 |
 | `automas-script-maafw` 0.1.12 | `automas_script_maafw.plugin:Plugin` | `maafw.registry.v1`、`maafw.configuration_reuse.v1` | 注册普通 MaaFW 适配器、配置导入/复制、运行绑定 |
-| `automas-script-maafw-managed` 0.3.1 | `automas_script_maafw_managed.plugin:Plugin` | `maafw.managed.environment.v1` | 内部 Managed 转换、资源升级/切换、运行绑定、进度与回收动作 |
+| `automas-script-maafw-managed` 0.3.2 | `automas_script_maafw_managed.plugin:Plugin` | `maafw.managed.environment.v1` | 内部 Managed 转换、资源升级/切换、运行绑定、进度与回收动作 |
 
 M9A 的 project pack 和聚合包位于独立仓库；通用 MaaFW 包不得反向依赖 M9A、MaaEnd
 或其他具体项目适配包。project pack 通过 `maafw.registry.v1` 注册自己的资源服务和
@@ -95,7 +95,7 @@ ProjectInterface
 
 ## 5. 事务与宿主最低能力
 
-发布或启用普通脚本 0.1.12 / Managed 0.3.1 前，宿主必须提供：
+发布或启用普通脚本 0.1.12 / Managed 0.3.2 前，宿主必须提供：
 
 ```text
 Config.script_config_transaction()
@@ -109,6 +109,10 @@ ScriptConfigStore.write_transaction()
 Config.get_plugin_script_type_conversion_snapshot()
 Config.convert_plugin_script_type()
 ```
+
+新转换统一使用宿主通用 journal kind `plugin.script-type-conversion.v1`，目标快照
+使用 `plugin.script-type-conversion.v1.target`。旧的
+`maafw.managed-conversion[-target]` 仅用于恢复已经开始的本地事务，不再写入。
 
 转换顺序是“短宿主快照事务 → Project Store 生命周期锁 → 脚本锁与 CAS 复核 →
 导入资源 → 短宿主提交事务”。任何宿主写入失败都必须恢复 Project Store 引用和
@@ -128,7 +132,7 @@ Managed 的远程更新源由宿主全局配置统一决定，其请求字段仅
 2. Agent Env 0.1.4、Project Update 0.2.3。
 3. Runner 0.4.0。
 4. Script MaaFW 0.1.12。
-5. Script MaaFW Managed 0.3.1。
+5. Script MaaFW Managed 0.3.2。
 6. 独立 M9A 仓库的 pack，再发布聚合包。
 
 Project Store、Runtime Pool、Managed 的首次 PyPI 发布仍需要对应 GitHub Environment
