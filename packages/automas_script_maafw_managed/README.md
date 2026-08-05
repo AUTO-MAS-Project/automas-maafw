@@ -76,10 +76,12 @@ attached to the original failure and never reported ready. The later run
 consumes the same complete selector, `poolId`, `runtimeId`,
 and `runtime.python` constraint, so an existing matching CP312/CP313 runtime is
 reused instead of rebuilt. Managed 0.3.0 requires Script MaaFW 0.1.11, Runner
-0.4.0, Project Store 0.2.2 and Runtime Pool 0.2.0 or newer compatible releases.
+0.4.0, Project Store 0.2.3 and Runtime Pool 0.2.0 or newer compatible releases.
 
-`ImportProjectId` is a first-import input only and is cleared after a successful
-bind. The displayed `ProjectId` and `Version` are read-only. Once bound,
+`ImportProjectId` is an optional first-import alias and is cleared after a successful
+bind. If omitted, Project Store resolves the identity from the ProjectInterface's
+formal ID, `name`, or source directory name. The displayed `ProjectId` and `Version`
+are read-only. Once bound,
 execution, upgrade validation, runtime installation and reference
 reconciliation use the immutable Project Store manifest identity rather than
 editable form data.
@@ -118,7 +120,7 @@ or runtime bind cannot lose its new reference before the matching script config
 is durable. Import, stage, apply, cancel, delete and runtime installation use
 resource-lifecycle → per-script upgrade → host-config ordering; destructive GC
 holds the host's global config write gate from snapshot through collection.
-Managed 0.3.0 requires this Project Store 0.2.2 capability and fails closed
+Managed 0.3.0 requires this Project Store 0.2.3 capability and fails closed
 instead of falling back to an unlocked older service.
 
 It also requires an AUTO-MAS host that provides
@@ -141,7 +143,13 @@ conversion methods report `inPlaceConversion=false` and the convert action fails
 closed. Do not enable or publish Managed 0.3.0 before these host transaction and
 conversion changes are merged.
 
-MirrorChyan uses an explicit per-script CDK when provided and otherwise inherits
-the host's global update CDK. GitHub never reads that value. Secret-bearing
-fields and signed download URLs are redacted from HTTP responses, progress,
-logs and persisted discovery/import payloads.
+Managed HTTP operations and automatic updates use the host's global update
+source and MirrorChyan CDK as their only provider settings. Request and legacy
+script fields are accepted for compatibility but cannot override them;
+AutoSite/CNB must be changed to MirrorChyan or GitHub before a Managed remote
+operation. Each project's stable/beta channel is written only through
+`/maafw-managed/settings`. The first remote import records its non-sensitive
+repository/RID/tag/asset identity in the immutable Project Store manifest so
+later upgrades never fall back to request fields. Secret-bearing fields and
+signed download URLs are redacted from HTTP responses, progress, logs and
+persisted discovery/import payloads.

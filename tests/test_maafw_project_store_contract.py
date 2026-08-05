@@ -50,7 +50,7 @@ class MaaFWProjectStoreContractTest(unittest.TestCase):
             (PACKAGE_ROOT / "pyproject.toml").read_text(encoding="utf-8")
         )
         entrypoints = pyproject["project"]["entry-points"]["auto_mas.plugins"]
-        self.assertEqual(pyproject["project"]["version"], "0.2.2")
+        self.assertEqual(pyproject["project"]["version"], "0.2.3")
         self.assertEqual(
             entrypoints["automas_maafw_project_store"],
             "automas_maafw_project_store.plugin:Plugin",
@@ -1660,7 +1660,7 @@ class MaaFWProjectStoreContractTest(unittest.TestCase):
         )
         self.assertEqual(
             [(item["projectId"], item["version"]) for item in preview["candidates"]],
-            [("gc", "1.0")],
+            [("gc", "2.0"), ("gc", "1.0")],
         )
         self.assertEqual(preview["deleted"], [])
 
@@ -1671,12 +1671,17 @@ class MaaFWProjectStoreContractTest(unittest.TestCase):
             keep_latest=1,
             now=future,
         )
-        self.assertEqual([item["version"] for item in applied["deleted"]], ["1.0"])
+        self.assertEqual(
+            [item["version"] for item in applied["deleted"]],
+            ["2.0", "1.0"],
+        )
         self.assertGreater(applied["reclaimedBytes"], 0)
         self.assertEqual(
             {item["version"] for item in self.store.list_versions("gc")},
-            {"2.0", "3.0"},
+            {"3.0"},
         )
+        self.assertIsNone(self.store._read_current("gc"))
+        self.assertEqual(self.store.resolve_project("gc")["version"], "3.0")
 
     def test_real_gc_refuses_incomplete_inventory_but_dry_run_reports_it(self) -> None:
         self._write_minimal_project()
@@ -1894,6 +1899,114 @@ class MaaFWProjectStoreContractTest(unittest.TestCase):
             resolved["summary"],
         )
         self.assertEqual(list((self.store.root / ".staging").iterdir()), [])
+
+    def test_remote_source_identity_is_immutable_and_exposed(self) -> None:
+        self._write_json(
+            self.source / "interface.json",
+            {
+                "interface_version": 2,
+                "name": "remote-project",
+                "version": "1.0.0",
+                "github": "owner/canonical",
+                "github_tag": "release-1.0.0",
+                "task": [],
+            },
+        )
+        remote = {
+            "source": "GitHub",
+            "github": "owner/bootstrap",
+            "github_tag": "requested-tag",
+            "github_asset_pattern": "win-x64\\.zip$",
+        }
+        stored_remote = {
+            "source": "GitHub",
+            "github": "owner/canonical",
+            "github_tag": "release-1.0.0",
+            "github_asset_pattern": "win-x64\\.zip$",
+        }
+
+        imported = self.store.import_project(
+            self.source,
+            remote_source=remote,
+        )
+
+        self.assertEqual(imported["manifest"]["remote"], stored_remote)
+        self.assertEqual(imported["summary"]["remote"], stored_remote)
+        with self.assertRaisesRegex(
+            MaaFWProjectStoreError,
+            "different remote source identity",
+        ):
+            self.store.import_project(
+                self.source,
+                remote_source={
+                    **remote,
+                    "github_asset_pattern": "linux-x64\\.zip$",
+                },
+            )
+        with self.assertRaisesRegex(
+            MaaFWProjectStoreError,
+            "unsupported fields",
+        ):
+            self.store.import_project(
+                self.source,
+                remote_source={**remote, "cdk": "must-not-persist"},
+            )
+        manifest_path = Path(imported["manifestPath"])
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["remote"]["github"] = "owner/tampered"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        with self.assertRaisesRegex(
+            MaaFWProjectStoreError,
+            "does not match ProjectInterface",
+        ):
+            self.store.resolve_project("remote-project", "1.0.0")
+
+    def test_import_project_id_resolution_separates_formal_id_and_display_name(self) -> None:
+        for formal_key in ("projectId", "project_id"):
+            with self.subTest(formal_key=formal_key):
+                interface = {formal_key: "official-id", "name": "Display Name 中文"}
+                self.assertEqual(
+                    project_store_service._resolve_import_project_id(
+                        "official-id",
+                        interface,
+                        self.source,
+                    ),
+                    "official-id",
+                )
+                self.assertEqual(
+                    project_store_service._resolve_import_project_id(
+                        None,
+                        interface,
+                        self.source,
+                    ),
+                    "official-id",
+                )
+                with self.assertRaisesRegex(
+                    MaaFWProjectStoreError,
+                    "does not match ProjectInterface",
+                ):
+                    project_store_service._resolve_import_project_id(
+                        "different-id",
+                        interface,
+                        self.source,
+                    )
+
+        self.assertEqual(
+            project_store_service._resolve_import_project_id(
+                "store-alias",
+                {"name": "显示 名称"},
+                self.source,
+            ),
+            "store-alias",
+        )
+        self.assertEqual(
+            project_store_service._resolve_import_project_id(
+                None,
+                {"name": "legal-name"},
+                self.source,
+            ),
+            "legal-name",
+        )
 
     def test_explicit_version_must_match_project_interface_version(self) -> None:
         self._write_json(

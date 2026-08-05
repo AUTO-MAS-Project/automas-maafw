@@ -41,9 +41,9 @@ class ScriptMaaFWManagedContractTest(unittest.TestCase):
         dependencies = project["project"]["dependencies"]
         self.assertIn("automas-script-maafw>=0.1.11", dependencies)
         self.assertIn("automas-maafw-runner>=0.4.0", dependencies)
-        self.assertIn("automas-maafw-project-store>=0.2.2", dependencies)
+        self.assertIn("automas-maafw-project-store>=0.2.3", dependencies)
         self.assertIn("automas-maafw-runtime-pool>=0.2.0", dependencies)
-        self.assertIn("automas-maafw-project-update>=0.2.2", dependencies)
+        self.assertIn("automas-maafw-project-update>=0.2.3", dependencies)
         plugin_source = (MODULE_ROOT / "plugin.py").read_text(encoding="utf-8")
         self.assertIn('_DISTRIBUTION_VERSION_FALLBACK = "0.3.0"', plugin_source)
 
@@ -234,6 +234,112 @@ class ScriptMaaFWManagedContractTest(unittest.TestCase):
 
         self.assertEqual(asyncio.run(scenario()), [True, False])
 
+    def test_gateway_import_forwards_only_validated_remote_source_identity(self) -> None:
+        services = self._load_services_module()
+
+        class ProjectStore:
+            def __init__(self) -> None:
+                self.remote_sources: list[dict | None] = []
+
+            def import_project(
+                self,
+                _source_path,
+                project_id,
+                version,
+                *,
+                remote_source=None,
+                **_kwargs,
+            ):
+                self.remote_sources.append(copy.deepcopy(remote_source))
+                return {
+                    "projectId": project_id,
+                    "version": version,
+                    "dataPath": str(ROOT),
+                    "manifest": {},
+                }
+
+        async def scenario():
+            project_store = ProjectStore()
+            gateway = services.ManagedServiceGateway(project_store, object())
+            remote = {
+                "source": "GitHub",
+                "github": "owner/project",
+                "github_tag": "v1.0.0",
+                "github_asset_pattern": "win-x64\\.zip$",
+            }
+            await gateway.import_project(
+                {
+                    "sourcePath": str(ROOT),
+                    "projectId": "m9a",
+                    "version": "1.0.0",
+                    "remoteSource": remote,
+                }
+            )
+            with self.assertRaisesRegex(
+                services.ManagedServiceError,
+                "不受支持的字段",
+            ):
+                await gateway.import_project(
+                    {
+                        "sourcePath": str(ROOT),
+                        "projectId": "m9a",
+                        "version": "2.0.0",
+                        "remoteSource": {**remote, "cdk": "must-not-persist"},
+                    }
+                )
+            return project_store.remote_sources
+
+        self.assertEqual(
+            asyncio.run(scenario()),
+            [
+                {
+                    "source": "GitHub",
+                    "github": "owner/project",
+                    "github_tag": "v1.0.0",
+                    "github_asset_pattern": "win-x64\\.zip$",
+                }
+            ],
+        )
+
+    def test_gateway_import_requires_authoritative_store_identity(self) -> None:
+        services = self._load_services_module()
+
+        class ProjectStore:
+            def __init__(self, result):
+                self.result = result
+
+            def import_project(self, *_args, **_kwargs):
+                return dict(self.result)
+
+        async def import_with(result):
+            gateway = services.ManagedServiceGateway(ProjectStore(result), object())
+            return await gateway.import_project(
+                {
+                    "sourcePath": str(ROOT),
+                    "projectId": "requested-id",
+                    "version": "1.0",
+                }
+            )
+
+        with self.assertRaisesRegex(
+            services.ManagedServiceError,
+            "Project Store 返回的项目 ID",
+        ):
+            asyncio.run(import_with({"version": "1.0"}))
+        with self.assertRaisesRegex(
+            services.ManagedServiceError,
+            "与请求绑定不一致",
+        ):
+            asyncio.run(
+                import_with({"projectId": "different-id", "version": "1.0"})
+            )
+        self.assertEqual(
+            asyncio.run(
+                import_with({"projectId": "requested-id", "version": "1.0"})
+            )["projectId"],
+            "requested-id",
+        )
+
     def test_missing_bound_runtime_is_rebuilt_from_exact_recorded_version(self) -> None:
         source = (MODULE_ROOT / "services.py").read_text(encoding="utf-8")
         tree = ast.parse(source)
@@ -251,10 +357,8 @@ class ScriptMaaFWManagedContractTest(unittest.TestCase):
         resolve_source = ast.unparse(resolve)
         self.assertIn("manifest_binding.get('maafwVersion')", resolve_source)
         self.assertIn("runtime_request.pop('runtimeId', None)", resolve_source)
-        self.assertIn(
-            "_runner_requirements(store_project_path, bound_maafw_version)",
-            resolve_source,
-        )
+        self.assertIn("_runner_requirements", resolve_source)
+        self.assertIn("(store_project_path, bound_maafw_version)", resolve_source)
         self.assertIn("recovered_binding", resolve_source)
         self.assertIn("await self.bind_project_runtime", resolve_source)
 
@@ -1107,6 +1211,155 @@ class ManagedAdapterLeaseLifecycleTest(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_auto_update_holds_transition_lease_until_prewarm_then_collects(self) -> None:
+        adapter = self.adapter
+        events: list[str] = []
+        update_payloads: list[dict] = []
+
+        class Gateway:
+            async def release_project_lease(self, project_id, version, lease_id):
+                events.append(f"release:{project_id}@{version}:{lease_id}")
+                return {}
+
+        class Storage:
+            async def read_script_data(self):
+                return {
+                    "Update": {"IfAutoUpdate": True, "Source": "GitHub"},
+                    "Managed": {"ProjectId": "m9a", "Version": "1.0"},
+                }
+
+        class Service:
+            async def update_script_before_run(
+                self,
+                _script_id,
+                payload,
+                **_kwargs,
+            ):
+                events.append("update")
+                update_payloads.append(copy.deepcopy(dict(payload)))
+                return {
+                    "updated": True,
+                    "_prewarmProjectLease": {
+                        "projectId": "m9a",
+                        "version": "1.0",
+                        "leaseId": "transition-one",
+                    },
+                }
+
+            async def prepare_script_environment(self, *_args, **_kwargs):
+                events.append("prewarm")
+
+            async def collect_unreferenced_resources(self):
+                events.append("collect")
+
+        runtime = SimpleNamespace(
+            extra={
+                adapter._GATEWAY_KEY: Gateway(),
+            },
+            script_info=SimpleNamespace(script_id="script-one", uid="script-one"),
+            storage=Storage(),
+            get_service=lambda _key: Service(),
+        )
+        hooks = adapter.MaaFWManagedAdapterHooks()
+        gateway = runtime.extra[adapter._GATEWAY_KEY]
+        hooks._gateway = lambda _runtime: gateway
+        hooks._emit_log = lambda *_args, **_kwargs: None
+
+        asyncio.run(hooks._run_managed_auto_update(runtime))
+
+        self.assertEqual(
+            events,
+            ["update", "prewarm", "release:m9a@1.0:transition-one", "collect"],
+        )
+        self.assertEqual(
+            update_payloads,
+            [{"projectId": "m9a", "source": "GitHub", "channel": "stable"}],
+        )
+        self.assertNotIn(adapter._PREWARM_PROJECT_LEASE_KEY, runtime.extra)
+
+    def test_auto_update_rejects_unsupported_current_global_source(self) -> None:
+        adapter = self.adapter
+        original_config = adapter.Config
+        logs: list[str] = []
+        calls: list[str] = []
+
+        class HostConfig:
+            @staticmethod
+            def get(_group, name):
+                return "AutoSite" if name == "Source" else "global-cdk"
+
+        class Storage:
+            async def read_script_data(self):
+                return {
+                    "Update": {
+                        "IfAutoUpdate": True,
+                        "Source": "MirrorChyan",
+                        "MirrorChyanCDK": "legacy-cdk",
+                    },
+                    "ManagedRemote": {"Channel": "beta"},
+                    "Managed": {"ProjectId": "m9a", "Version": "1.0"},
+                }
+
+        class Service:
+            async def update_script_before_run(self, *_args, **_kwargs):
+                calls.append("update")
+                return {}
+
+        runtime = SimpleNamespace(
+            extra={},
+            script_info=SimpleNamespace(script_id="script-one", uid="script-one"),
+            storage=Storage(),
+            get_service=lambda _key: Service(),
+        )
+        hooks = adapter.MaaFWManagedAdapterHooks()
+        hooks._emit_log = lambda _runtime, message: logs.append(str(message))
+        adapter.Config = HostConfig
+        try:
+            asyncio.run(hooks._run_managed_auto_update(runtime))
+        finally:
+            adapter.Config = original_config
+
+        self.assertEqual(calls, [])
+        self.assertTrue(any("不支持 MaaFW 托管远程资源" in item for item in logs))
+
+    def test_auto_update_does_not_fallback_when_global_read_fails(self) -> None:
+        adapter = self.adapter
+        original_config = adapter.Config
+        logs: list[str] = []
+        calls: list[str] = []
+
+        class HostConfig:
+            @staticmethod
+            def get(_group, _name):
+                raise RuntimeError("synthetic global read failure")
+
+        class Storage:
+            async def read_script_data(self):
+                return {
+                    "Update": {
+                        "IfAutoUpdate": True,
+                        "Source": "GitHub",
+                    },
+                    "Managed": {"ProjectId": "m9a", "Version": "1.0"},
+                }
+
+        runtime = SimpleNamespace(
+            extra={},
+            script_info=SimpleNamespace(script_id="script-one", uid="script-one"),
+            storage=Storage(),
+            get_service=lambda _key: calls.append("service"),
+        )
+        hooks = adapter.MaaFWManagedAdapterHooks()
+        hooks._emit_log = lambda _runtime, message: logs.append(str(message))
+        adapter.Config = HostConfig
+        try:
+            asyncio.run(hooks._run_managed_auto_update(runtime))
+        finally:
+            adapter.Config = original_config
+
+        self.assertEqual(calls, [])
+        self.assertTrue(any("无法读取 AUTO-MAS 全局更新来源" in item for item in logs))
+
 
 class ManagedUpgradeStateMachineTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -1161,6 +1414,10 @@ class ManagedUpgradeStateMachineTest(unittest.TestCase):
     def test_remote_discovery_drops_ephemeral_download_url_before_persistence(self) -> None:
         public = self.module._public_remote_discovery(
             {
+                "_remoteAuthority": {
+                    "source": "GitHub",
+                    "github": "owner/project",
+                },
                 "latestVersion": "2.0.0",
                 "installable": True,
                 "mirrorChyanCDK": "synthetic-discovery-cdk",
@@ -1179,6 +1436,7 @@ class ManagedUpgradeStateMachineTest(unittest.TestCase):
         self.assertTrue(public["candidate"]["downloadAvailable"])
         self.assertEqual(public["candidate"]["sha256"], "a" * 64)
         serialized = json.dumps(public, ensure_ascii=False)
+        self.assertNotIn("_remoteAuthority", public)
         self.assertNotIn("synthetic-discovery-cdk", serialized)
         self.assertNotIn("synthetic-candidate-cdk", serialized)
 
@@ -1187,34 +1445,50 @@ class ManagedUpgradeStateMachineTest(unittest.TestCase):
 
         class HostConfig:
             calls = []
+            source = "MirrorChyan"
 
             @classmethod
             def get(cls, group, name):
                 cls.calls.append((group, name))
-                return "synthetic-host-cdk"
+                if name == "Source":
+                    return cls.source
+                if name == "MirrorChyanCDK":
+                    return "synthetic-host-cdk"
+                return ""
 
         self.module.Config = HostConfig
         try:
             mirror = self.module._remote_source_config(
-                {"source": "MirrorChyan", "channel": "stable"}
+                {"source": "GitHub", "channel": "stable"}
             )
+            HostConfig.source = "GitHub"
             github = self.module._remote_source_config(
-                {"source": "GitHub", "githubRepo": "owner/project"}
+                {"source": "MirrorChyan", "githubRepo": "owner/project"}
             )
         finally:
             self.module.Config = original_config
 
         self.assertEqual(mirror["cdk"], "synthetic-host-cdk")
-        self.assertEqual(HostConfig.calls, [("Update", "MirrorChyanCDK")])
+        self.assertEqual(
+            HostConfig.calls,
+            [
+                ("Update", "Source"),
+                ("Update", "MirrorChyanCDK"),
+                ("Update", "Source"),
+            ],
+        )
         self.assertNotIn("cdk", github)
 
-    def test_remote_source_config_explicit_cdk_overrides_host(self) -> None:
+    def test_remote_source_config_ignores_request_source_and_cdk(self) -> None:
         original_config = self.module.Config
 
         class HostConfig:
             @staticmethod
-            def get(_group, _name):
-                raise AssertionError("显式 CDK 不应读取宿主全局配置")
+            def get(_group, name):
+                return {
+                    "Source": "MirrorChyan",
+                    "MirrorChyanCDK": "synthetic-host-cdk",
+                }.get(name, "")
 
         self.module.Config = HostConfig
         try:
@@ -1227,41 +1501,260 @@ class ManagedUpgradeStateMachineTest(unittest.TestCase):
         finally:
             self.module.Config = original_config
 
-        self.assertEqual(source["cdk"], "synthetic-request-cdk")
+        self.assertEqual(source["source"], "mirrorchyan")
+        self.assertEqual(source["cdk"], "synthetic-host-cdk")
 
-    def test_mirror_check_allows_blank_cdk_but_install_requires_url(self) -> None:
+    def test_remote_source_config_rejects_unsupported_global_source(self) -> None:
         original_config = self.module.Config
 
         class HostConfig:
             @staticmethod
             def get(_group, _name):
-                return ""
+                return "AutoSite"
 
         self.module.Config = HostConfig
         try:
-            source = self.module._remote_source_config({"source": "MirrorChyan"})
+            with self.assertRaisesRegex(
+                self.module.ManagedServiceError,
+                "不支持 MaaFW 托管远程资源",
+            ):
+                self.module._remote_source_config(
+                    {"source": "MirrorChyan", "mirrorChyanCDK": "request-cdk"}
+                )
         finally:
             self.module.Config = original_config
-        self.assertEqual(source["cdk"], "")
 
+    def test_remote_initial_discovery_reuses_configured_import_project_id(self) -> None:
         plugin = self.module.Plugin(self._context())
+        original_record = self.module._managed_script_record
+
+        async def managed_record(_script_id):
+            return {
+                "type": "MaaFWManaged",
+                "config": {
+                    "Managed": {
+                        "ProjectId": "",
+                        "Version": "",
+                        "ImportProjectId": "configured-id",
+                    },
+                    "ManagedRemote": {"Channel": "beta"},
+                },
+            }
+
+        class HostConfig:
+            @staticmethod
+            def get(_group, name):
+                return "GitHub" if name == "Source" else ""
+
+        class Gateway:
+            def __init__(self) -> None:
+                self.interface = None
+
+            async def discover_remote_update(
+                self,
+                interface,
+                *,
+                current_version,
+                source_config,
+            ):
+                self.interface = dict(interface)
+                self.current_version = current_version
+                self.source_config = dict(source_config)
+                return None
+
+        gateway = Gateway()
+        plugin._gateway = lambda: gateway
+        self.module._managed_script_record = managed_record
+        original_config = self.module.Config
+        self.module.Config = HostConfig
+        try:
+            result = asyncio.run(
+                plugin._discover_remote_project(
+                    self.script_id,
+                    {
+                        "source": "MirrorChyan",
+                        "channel": "stable",
+                        "githubRepo": "owner/project",
+                        "githubTag": "v2.0.0",
+                        "githubAssetPattern": "win-x64\\.zip$",
+                    },
+                )
+            )
+            with self.assertRaisesRegex(
+                self.module.ManagedServiceError,
+                "与脚本中的 ImportProjectId 不一致",
+            ):
+                asyncio.run(
+                    plugin._discover_remote_project(
+                        self.script_id,
+                        {
+                            "projectId": "different-id",
+                            "source": "GitHub",
+                            "githubRepo": "owner/project",
+                        },
+                    )
+                )
+        finally:
+            self.module.Config = original_config
+            self.module._managed_script_record = original_record
+
+        self.assertEqual(result["mode"], "initial")
+        self.assertEqual(gateway.interface["name"], "configured-id")
+        self.assertEqual(gateway.interface["github_tag"], "v2.0.0")
+        self.assertEqual(
+            gateway.interface["github_asset_pattern"],
+            "win-x64\\.zip$",
+        )
+        self.assertEqual(gateway.current_version, "0.0.0")
+        self.assertEqual(gateway.source_config["channel"], "beta")
+        self.assertEqual(
+            result["_remoteAuthority"],
+            {
+                "source": "GitHub",
+                "github": "owner/project",
+                "github_tag": "v2.0.0",
+                "github_asset_pattern": "win-x64\\.zip$",
+            },
+        )
+
+    def test_before_run_update_applies_only_ready_lossless_plan(self) -> None:
+        plugin = self.module.Plugin(self._context())
+        logs: list[str] = []
+        calls: list[str] = []
+        original_record = self.module._managed_script_record
+
+        async def managed_record(_script_id):
+            return {
+                "type": "MaaFWManaged",
+                "config": {
+                    "Managed": {
+                        "ProjectId": "m9a",
+                        "Version": "1.0",
+                    }
+                },
+            }
+
+        class TransitionGateway:
+            async def acquire_project_lease(
+                self,
+                project_id,
+                version,
+                lease_id,
+                **kwargs,
+            ):
+                calls.append("acquire")
+                self.acquired = (project_id, version, lease_id, kwargs)
+                return {}
+
+            async def release_project_lease(self, *args):
+                calls.append("release")
+                return {}
+
+        async def run_locked(_script_id, operation):
+            calls.append("lock")
+            return await operation()
 
         async def discover(_script_id, _payload):
             return {
-                "installable": False,
-                "candidate": None,
-                "unavailableReason": "MirrorChyan 未返回下载地址",
+                "updateAvailable": True,
+                "installable": True,
+                "latestVersion": "2.0",
+                "candidate": {"source": "github_release", "version": "2.0"},
             }
 
+        async def stage(_script_id, _payload, *, initial):
+            self.assertFalse(initial)
+            calls.append("stage")
+            return {
+                "upgradePlan": {
+                    "state": "ready",
+                    "readyToApply": True,
+                    "lossless": True,
+                    "errors": [],
+                    "manualActions": [],
+                    "planId": "plan-one",
+                    "confirmationToken": "confirm-one",
+                }
+            }
+
+        async def apply(_script_id, payload):
+            self.assertEqual(
+                payload,
+                {"planId": "plan-one", "confirmation": "confirm-one"},
+            )
+            calls.append("apply")
+            return {"project": {"version": "2.0"}}
+
+        self.module._managed_script_record = managed_record
+        plugin._run_upgrade_locked = run_locked
         plugin._discover_remote_project = discover
-        with self.assertRaisesRegex(self.module.ManagedServiceError, "未返回下载地址"):
-            asyncio.run(
-                plugin._download_and_import_remote(
-                    "11111111-1111-4111-8111-111111111111",
-                    {"source": "MirrorChyan", "mirrorChyanRid": "demo"},
-                    initial=True,
+        plugin._download_and_import_remote = stage
+        plugin._apply_pending_upgrade_transaction = apply
+        plugin._gateway = lambda: TransitionGateway()
+        try:
+            result = asyncio.run(
+                plugin._auto_update_before_run(
+                    self.script_id,
+                    {"source": "GitHub"},
+                    logs.append,
                 )
             )
+        finally:
+            self.module._managed_script_record = original_record
+
+        self.assertTrue(result["updated"])
+        # Discovery/download is deliberately outside the global resource
+        # transaction; only the short apply phase takes the upgrade lock.
+        self.assertEqual(calls, ["stage", "lock", "acquire", "apply"])
+        self.assertEqual(
+            set(result["_prewarmProjectLease"]),
+            {"projectId", "version", "leaseId"},
+        )
+        self.assertTrue(any("自动更新完成" in item for item in logs))
+
+    def test_generic_interface_surface_ignores_release_metadata(self) -> None:
+        base = {
+            "name": "demo",
+            "version": "1.0",
+            "github": "owner/old",
+            "controller": [{"name": "ADB", "type": "Adb"}],
+            "resource": [{"name": "Default"}],
+            "task": [{"name": "Start"}],
+            "option": {},
+            "preset": [],
+        }
+        updated = {
+            **base,
+            "version": "2.0",
+            "github": "owner/new",
+        }
+        self.assertEqual(
+            self.module._interface_config_surface(base),
+            self.module._interface_config_surface(updated),
+        )
+        updated["task"] = [{"name": "Start"}, {"name": "NewTask"}]
+        self.assertNotEqual(
+            self.module._interface_config_surface(base),
+            self.module._interface_config_surface(updated),
+        )
+
+    def test_mirror_remote_operation_requires_a_cdk(self) -> None:
+        original_config = self.module.Config
+
+        class HostConfig:
+            @staticmethod
+            def get(_group, name):
+                return "MirrorChyan" if name == "Source" else ""
+
+        self.module.Config = HostConfig
+        try:
+            with self.assertRaisesRegex(
+                self.module.ManagedServiceError,
+                "需要 AUTO-MAS 全局 CDK",
+            ):
+                self.module._remote_source_config({"source": "MirrorChyan"})
+        finally:
+            self.module.Config = original_config
 
     def test_remote_initial_import_releases_package_after_config_commit(self) -> None:
         config = self._fake_config(manual_user=False)
@@ -1283,6 +1776,10 @@ class ManagedUpgradeStateMachineTest(unittest.TestCase):
 
         async def discover(_script_id, _payload):
             return {
+                "_remoteAuthority": {
+                    "source": "GitHub",
+                    "github": "owner/project",
+                },
                 "latestVersion": "2.0",
                 "installable": True,
                 "candidate": {
@@ -1348,6 +1845,10 @@ class ManagedUpgradeStateMachineTest(unittest.TestCase):
         self.assertFalse(result["download"]["retained"])
         self.assertNotIn("path", result["download"])
         self.assertNotIn("path", last_download)
+        self.assertEqual(
+            gateway.import_payloads[0]["remoteSource"],
+            {"source": "GitHub", "github": "owner/project"},
+        )
 
     def test_remote_cleanup_failure_keeps_import_success_and_reports_retained(
         self,
@@ -1372,6 +1873,10 @@ class ManagedUpgradeStateMachineTest(unittest.TestCase):
 
         async def discover(_script_id, _payload):
             return {
+                "_remoteAuthority": {
+                    "source": "GitHub",
+                    "github": "owner/project",
+                },
                 "latestVersion": "2.0",
                 "installable": True,
                 "candidate": {
@@ -1435,6 +1940,10 @@ class ManagedUpgradeStateMachineTest(unittest.TestCase):
 
         async def discover(_script_id, _payload):
             return {
+                "_remoteAuthority": {
+                    "source": "GitHub",
+                    "github": "owner/project",
+                },
                 "latestVersion": "2.0",
                 "installable": True,
                 "candidate": {
@@ -1502,6 +2011,10 @@ class ManagedUpgradeStateMachineTest(unittest.TestCase):
 
         async def discover(_script_id, _payload):
             return {
+                "_remoteAuthority": {
+                    "source": "GitHub",
+                    "github": "owner/project",
+                },
                 "latestVersion": "2.0",
                 "installable": True,
                 "candidate": {
@@ -1575,6 +2088,10 @@ class ManagedUpgradeStateMachineTest(unittest.TestCase):
 
         async def discover(_script_id, _payload):
             return {
+                "_remoteAuthority": {
+                    "source": "GitHub",
+                    "github": "owner/project",
+                },
                 "latestVersion": "2.0",
                 "installable": True,
                 "candidate": {
@@ -1662,6 +2179,10 @@ class ManagedUpgradeStateMachineTest(unittest.TestCase):
 
                 async def discover(_script_id, _payload):
                     return {
+                        "_remoteAuthority": {
+                            "source": "GitHub",
+                            "github": "owner/project",
+                        },
                         "latestVersion": "2.0",
                         "installable": True,
                         "candidate": {
@@ -1693,6 +2214,10 @@ class ManagedUpgradeStateMachineTest(unittest.TestCase):
 
                     async def upgrade(payload):
                         self.assertEqual(payload["sourceArchive"], str(package_path))
+                        self.assertEqual(
+                            payload["remoteSource"],
+                            {"source": "GitHub", "github": "owner/project"},
+                        )
                         self.assertTrue(package_path.is_file())
                         return {
                             "updated": True,
@@ -1861,6 +2386,10 @@ class ManagedUpgradeStateMachineTest(unittest.TestCase):
             self.assertNotIn(secret, serialized)
         self.assertIn("***", serialized)
         self.assertNotIn("C:/safe/package.zip", serialized)
+        persisted_remote = persisted[0][1]["ManagedRemote"]
+        self.assertNotIn("Source", persisted_remote)
+        self.assertNotIn("Channel", persisted_remote)
+        self.assertNotIn("MirrorChyanCDK", persisted_remote)
 
     def test_plans_and_persists_every_user_without_switching(self) -> None:
         config = self._fake_config(manual_user=True)
@@ -2461,6 +2990,7 @@ class ManagedUpgradeStateMachineTest(unittest.TestCase):
             self.switches: list[str] = []
             self.releases: list[tuple[str, str, str]] = []
             self.reconciliations = 0
+            self.import_payloads: list[dict] = []
 
         @asynccontextmanager
         async def resource_transaction(self):
@@ -2468,6 +2998,7 @@ class ManagedUpgradeStateMachineTest(unittest.TestCase):
 
         async def import_project(self, payload):
             assert payload["projectId"] == "m9a"
+            self.import_payloads.append(copy.deepcopy(dict(payload)))
             return self.new_project
 
         async def resolve_project(self, project_id, version):
@@ -2637,6 +3168,102 @@ class ManagedInPlaceConversionTest(unittest.TestCase):
         )
         self.assertEqual(response["code"], 400)
         self.assertIn("原子脚本类型转换", response["message"])
+
+    def test_remote_settings_share_remote_stage_lock_and_restore_failed_write(
+        self,
+    ) -> None:
+        events: list[str] = []
+
+        class FakeConfig:
+            channel = "stable"
+            fail_next_update = True
+
+            @classmethod
+            async def get_script_records(cls, script_id=None):
+                if script_id != self.script_id:
+                    return []
+                return [
+                    {
+                        "id": self.script_id,
+                        "type": "MaaFWManaged",
+                        "config": {
+                            "Managed": {},
+                            "ManagedRemote": {"Channel": cls.channel},
+                        },
+                    }
+                ]
+
+            @classmethod
+            async def update_script(cls, script_id, update):
+                self.assertEqual(script_id, self.script_id)
+                next_channel = update["ManagedRemote"]["Channel"]
+                events.append(f"write:{next_channel}")
+                cls.channel = next_channel
+                if cls.fail_next_update:
+                    cls.fail_next_update = False
+                    raise OSError("synthetic config write failure")
+
+        plugin = self.module.Plugin(self._context())
+
+        async def require_managed(payload):
+            self.assertEqual(payload["scriptId"], self.script_id)
+            return self.script_id
+
+        async def run_remote_stage(script_id, operation):
+            self.assertEqual(script_id, self.script_id)
+            events.append("remote:enter")
+            try:
+                return await operation()
+            finally:
+                events.append("remote:exit")
+
+        async def run_upgrade(script_id, operation):
+            self.assertEqual(script_id, self.script_id)
+            events.append("upgrade:enter")
+            try:
+                return await operation()
+            finally:
+                events.append("upgrade:exit")
+
+        async def run_config(script_id, owner, operation):
+            self.assertEqual(script_id, self.script_id)
+            self.assertEqual(owner, f"maafw-remote-settings:{self.script_id}")
+            events.append("config:enter")
+            try:
+                return await operation()
+            finally:
+                events.append("config:exit")
+
+        original_config = self.module.Config
+        self.module.Config = FakeConfig
+        plugin._require_managed_script = require_managed
+        plugin._run_remote_stage_locked = run_remote_stage
+        plugin._run_upgrade_locked = run_upgrade
+        plugin._run_config_transaction = run_config
+        try:
+            response = asyncio.run(
+                plugin._update_remote_settings(
+                    self._request({"scriptId": self.script_id, "channel": "beta"})
+                )
+            )
+        finally:
+            self.module.Config = original_config
+
+        self.assertEqual(response["code"], 500)
+        self.assertEqual(FakeConfig.channel, "stable")
+        self.assertEqual(
+            events,
+            [
+                "remote:enter",
+                "upgrade:enter",
+                "config:enter",
+                "write:beta",
+                "write:stable",
+                "config:exit",
+                "upgrade:exit",
+                "remote:exit",
+            ],
+        )
 
     def test_conversion_operation_id_includes_target_identity(self) -> None:
         build = self.module._conversion_operation_id

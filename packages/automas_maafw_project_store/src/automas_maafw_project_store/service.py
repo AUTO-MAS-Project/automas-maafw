@@ -455,13 +455,14 @@ class MaaFWProjectStoreService:
     def import_project(
         self,
         source_path: str | Path,
-        project_id: str,
+        project_id: str | None = None,
         version: str | None = None,
         *,
         runtime_constraint: str | None = None,
         platform: str | None = None,
         arch: str | None = None,
         runtime_binding: dict[str, Any] | None = None,
+        remote_source: Mapping[str, Any] | None = None,
         reference: str | None = None,
         pinned: bool = False,
         activate: bool = True,
@@ -482,6 +483,7 @@ class MaaFWProjectStoreService:
                 platform=platform,
                 arch=arch,
                 runtime_binding=runtime_binding,
+                remote_source=remote_source,
                 reference=reference,
                 pinned=pinned,
                 activate=activate,
@@ -496,24 +498,33 @@ class MaaFWProjectStoreService:
     def _import_materialized_project(
         self,
         imported_source: _ImportSource,
-        project_id: str,
+        project_id: str | None,
         version: str | None,
         *,
         runtime_constraint: str | None,
         platform: str | None,
         arch: str | None,
         runtime_binding: dict[str, Any] | None,
+        remote_source: Mapping[str, Any] | None,
         reference: str | None,
         pinned: bool,
         activate: bool,
     ) -> dict[str, Any]:
-        normalized_project_id = _validate_component(project_id, "project_id")
         source_root = imported_source.root
         interface_base, source_interface_path = _discover_project_interface(source_root)
         interface_data = _read_json_object(source_interface_path)
         plan = _build_projection_plan(source_root, source_interface_path, interface_data)
+        normalized_project_id = _resolve_import_project_id(
+            project_id,
+            plan.interface_data,
+            source_root,
+        )
         interface_version = _optional_string(plan.interface_data.get("version"))
         normalized_version = _resolve_import_version(version, interface_version)
+        normalized_remote_source = _merge_remote_source_metadata(
+            remote_source,
+            plan.interface_data,
+        )
         source_hash_metadata = _projected_source_hash_metadata(plan.python_runtime)
         source_hash = _calculate_projected_source_hash(
             source_root,
@@ -526,6 +537,15 @@ class MaaFWProjectStoreService:
             final_dir = self._version_dir(normalized_project_id, normalized_version)
             if final_dir.exists():
                 existing = self._load_manifest(normalized_project_id, normalized_version)
+                if (
+                    normalized_remote_source is not None
+                    and existing.get("remote") != normalized_remote_source
+                ):
+                    raise MaaFWProjectStoreError(
+                        "immutable project version already exists with different "
+                        "remote source identity: "
+                        f"{normalized_project_id}@{normalized_version}"
+                    )
                 existing_hash = _manifest_source_hash(existing)
                 existing_hash_schema = _manifest_hash_schema_version(
                     existing,
@@ -713,6 +733,8 @@ class MaaFWProjectStoreService:
                     },
                     "warnings": warnings,
                 }
+                if normalized_remote_source is not None:
+                    manifest["remote"] = normalized_remote_source
                 _validate_project_manifest(
                     manifest,
                     expected_project_id=normalized_project_id,
@@ -751,6 +773,7 @@ class MaaFWProjectStoreService:
         platform: str | None = None,
         arch: str | None = None,
         runtime_binding: dict[str, Any] | None = None,
+        remote_source: Mapping[str, Any] | None = None,
         reference: str | None = None,
         pinned: bool = False,
         activate: bool = True,
@@ -765,6 +788,7 @@ class MaaFWProjectStoreService:
             platform=platform,
             arch=arch,
             runtime_binding=runtime_binding,
+            remote_source=remote_source,
             reference=reference,
             pinned=pinned,
             activate=activate,
@@ -1696,6 +1720,11 @@ class MaaFWProjectStoreService:
                         manifest,
                         now=current_time,
                     )
+                    # ``current`` is a convenience pointer, not ownership.
+                    # Manual deletion keeps its strict current protection, but
+                    # GC may remove it once references/pins/leases, grace and
+                    # keep-latest have all released the version.
+                    reasons = [reason for reason in reasons if reason != "current"]
                     if not dry_run:
                         runtime = manifest.setdefault("runtime", {})
                         active_leases = _active_leases(
@@ -1745,6 +1774,14 @@ class MaaFWProjectStoreService:
                         candidate["projectId"],
                         candidate["version"],
                     )
+                    if (
+                        self._read_current(candidate["projectId"])
+                        == candidate["version"]
+                    ):
+                        self._clear_current(
+                            candidate["projectId"],
+                            candidate["version"],
+                        )
                     _safe_remove_tree(version_dir, self.root)
                     reclaimed_bytes += int(candidate["bytes"])
                     deleted.append(dict(candidate))
@@ -2092,6 +2129,19 @@ class MaaFWProjectStoreService:
             },
             self.root,
         )
+
+    def _clear_current(self, project_id: str, expected_version: str) -> None:
+        current_path = self._current_path(project_id)
+        if not current_path.exists() and not current_path.is_symlink():
+            return
+        current = self._read_current(project_id)
+        if current != expected_version:
+            raise MaaFWProjectStoreError(
+                "current pointer changed while collecting garbage: "
+                f"{project_id}@{current or '<none>'}"
+            )
+        _assert_path_chain_within_root(current_path, self.root)
+        current_path.unlink()
 
     def _iter_projects(self) -> list[str]:
         if not self._projects_root.exists():
@@ -4468,6 +4518,53 @@ def _validate_component(value: str, field_name: str) -> str:
     return normalized
 
 
+def _resolve_import_project_id(
+    explicit_project_id: str | None,
+    interface_data: Mapping[str, Any],
+    source_root: Path,
+) -> str:
+    """Resolve the immutable project identity for a local import.
+
+    ProjectInterface ``projectId``/``project_id`` is authoritative when
+    present.  Without one, an explicit store ID remains a compatibility alias
+    and is validated independently from display-only ``name``.  Name and the
+    source directory are only fallbacks and still use component validation.
+    """
+
+    explicit = _optional_string(explicit_project_id)
+    declared: str | None = None
+    declared_key: str | None = None
+    for key in ("projectId", "project_id"):
+        candidate = _optional_string(interface_data.get(key))
+        if candidate:
+            if declared is not None and candidate != declared:
+                raise MaaFWProjectStoreError(
+                    "ProjectInterface projectId and project_id declarations "
+                    "do not match"
+                )
+            declared = candidate
+            declared_key = key
+
+    if declared is not None:
+        normalized_declared = _validate_component(declared, "project_id")
+        if explicit is not None and explicit != normalized_declared:
+            raise MaaFWProjectStoreError(
+                "explicit project_id does not match ProjectInterface "
+                f"authoritative ID ({declared_key}): "
+                f"{explicit!r} != {normalized_declared!r}"
+            )
+        return normalized_declared
+    if explicit:
+        return _validate_component(explicit, "project_id")
+
+    fallback = _optional_string(interface_data.get("name")) or source_root.name.strip()
+    if fallback:
+        return _validate_component(fallback, "project_id")
+    raise MaaFWProjectStoreError(
+        "ProjectInterface 未声明 name/projectId，且无法从项目目录自动识别 project_id"
+    )
+
+
 def _resolve_import_version(
     explicit_version: str | None,
     interface_version: str | None,
@@ -4712,6 +4809,12 @@ def _validate_project_manifest(
     _validate_component(expected_project_id, "project_id")
     _validate_component(expected_version, "version")
     _require_manifest_timestamp(value.get("createdAt"), "createdAt")
+    if "remote" in value:
+        normalized_remote = _normalize_remote_source_metadata(value.get("remote"))
+        if normalized_remote is None or value.get("remote") != normalized_remote:
+            raise MaaFWProjectStoreError(
+                "project manifest remote source identity is not canonical"
+            )
 
     source = _require_manifest_mapping(value, "source")
     source_kind = source.get("kind")
@@ -4858,7 +4961,14 @@ def _validate_project_manifest(
         raise MaaFWProjectStoreError(
             "project manifest ProjectInterface does not match the payload root"
         )
-    _read_json_object(interface_path)
+    stored_interface = _read_json_object(interface_path)
+    if "remote" in value and _merge_remote_source_metadata(
+        value.get("remote"),
+        stored_interface,
+    ) != value.get("remote"):
+        raise MaaFWProjectStoreError(
+            "project manifest remote source identity does not match ProjectInterface"
+        )
 
     runtime = _require_manifest_mapping(value, "runtime")
     runtime_constraint = runtime.get("constraint")
@@ -5661,6 +5771,7 @@ def _build_shell_summary(excluded_reasons: dict[str, str]) -> dict[str, Any]:
     family_names = {
         "mfaavalonia": "MFAAvalonia",
         "mxu": "MXU",
+        "cfa": "CFA",
         "mfw": "MFW",
         "maapicli": "MaaPiCli",
     }
@@ -5751,6 +5862,7 @@ def _build_inventory_summary(manifest: dict[str, Any]) -> dict[str, Any]:
     return {
         "projectId": manifest.get("projectId"),
         "version": manifest.get("version"),
+        "remote": _json_clone(manifest.get("remote")),
         "interfaceVersion": (
             source.get("interfaceVersion")
             if source.get("interfaceVersion") is not None
@@ -5849,6 +5961,171 @@ def _string_or_list(value: Any) -> list[str]:
     if isinstance(value, list):
         return [item for item in value if isinstance(item, str) and item.strip()]
     return []
+
+
+def _normalize_remote_source_metadata(
+    value: Any,
+) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise MaaFWProjectStoreError(
+            "remote source identity must be a JSON object"
+        )
+    source = str(value.get("source") or "").strip().casefold()
+    if source in {"github", "github_release"}:
+        allowed = {
+            "source",
+            "github",
+            "github_tag",
+            "github_asset_pattern",
+        }
+        if set(value) - allowed:
+            raise MaaFWProjectStoreError(
+                "GitHub remote source identity contains unsupported fields"
+            )
+        repo = _optional_string(value.get("github"))
+        if repo is None:
+            raise MaaFWProjectStoreError(
+                "GitHub remote source identity is missing repository"
+            )
+        result = {"source": "GitHub", "github": repo}
+        tag = _optional_string(value.get("github_tag"))
+        asset_pattern = _optional_string(value.get("github_asset_pattern"))
+        if tag is not None:
+            result["github_tag"] = tag
+        if asset_pattern is not None:
+            result["github_asset_pattern"] = asset_pattern
+        return result
+    if source in {"mirrorchyan", "mirror_chyan", "mirror酱"}:
+        allowed = {
+            "source",
+            "mirrorchyan_rid",
+            "mirrorchyan_multiplatform",
+        }
+        if set(value) - allowed:
+            raise MaaFWProjectStoreError(
+                "MirrorChyan remote source identity contains unsupported fields"
+            )
+        rid = _optional_string(value.get("mirrorchyan_rid"))
+        if rid is None:
+            raise MaaFWProjectStoreError(
+                "MirrorChyan remote source identity is missing RID"
+            )
+        multiplatform = value.get("mirrorchyan_multiplatform", True)
+        if not isinstance(multiplatform, bool):
+            raise MaaFWProjectStoreError(
+                "MirrorChyan remote source multiplatform must be boolean"
+            )
+        return {
+            "source": "MirrorChyan",
+            "mirrorchyan_rid": rid,
+            "mirrorchyan_multiplatform": multiplatform,
+        }
+    raise MaaFWProjectStoreError(
+        "remote source identity must be MirrorChyan or GitHub"
+    )
+
+
+def _merge_remote_source_metadata(
+    value: Any,
+    interface: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    remote = _normalize_remote_source_metadata(value)
+    if remote is None:
+        return None
+    if remote["source"] == "GitHub":
+        repo = _project_interface_remote_text(
+            interface,
+            ("github", "githubRepo", "github_repo", "GitHubRepo"),
+        )
+        tag = _project_interface_remote_text(
+            interface,
+            ("github_tag", "githubTag", "GitHubTag"),
+        )
+        asset_pattern = _project_interface_remote_text(
+            interface,
+            (
+                "github_asset_pattern",
+                "githubAssetPattern",
+                "GitHubAssetPattern",
+                "asset_pattern",
+                "assetPattern",
+            ),
+        )
+        if repo:
+            remote["github"] = repo
+        if tag:
+            remote["github_tag"] = tag
+        if asset_pattern:
+            remote["github_asset_pattern"] = asset_pattern
+        return remote
+
+    rid = _project_interface_remote_text(
+        interface,
+        (
+            "mirrorchyan_rid",
+            "mirrorChyanRid",
+            "mirrorchyanRid",
+            "MirrorChyanRID",
+        ),
+    )
+    multiplatform = _project_interface_remote_bool(
+        interface,
+        (
+            "mirrorchyan_multiplatform",
+            "mirrorChyanMultiplatform",
+            "mirrorchyanMultiplatform",
+        ),
+    )
+    if rid:
+        remote["mirrorchyan_rid"] = rid
+    if multiplatform is not None:
+        remote["mirrorchyan_multiplatform"] = multiplatform
+    return remote
+
+
+def _project_interface_remote_sources(
+    interface: Mapping[str, Any],
+) -> list[Mapping[str, Any]]:
+    sources: list[Mapping[str, Any]] = [interface]
+    for key in (
+        "project",
+        "projectInterface",
+        "project_interface",
+        "remote",
+        "sourceConfig",
+        "source_config",
+        "update",
+    ):
+        nested = interface.get(key)
+        if isinstance(nested, Mapping):
+            sources.append(nested)
+    return sources
+
+
+def _project_interface_remote_text(
+    interface: Mapping[str, Any],
+    keys: tuple[str, ...],
+) -> str:
+    for source in _project_interface_remote_sources(interface):
+        for key in keys:
+            value = _optional_string(source.get(key))
+            if value is not None:
+                return value
+    return ""
+
+
+def _project_interface_remote_bool(
+    interface: Mapping[str, Any],
+    keys: tuple[str, ...],
+) -> bool | None:
+    for source in _project_interface_remote_sources(interface):
+        for key in keys:
+            value = source.get(key)
+            if isinstance(value, bool):
+                return value
+    return None
 
 
 def _optional_string(value: Any) -> str | None:

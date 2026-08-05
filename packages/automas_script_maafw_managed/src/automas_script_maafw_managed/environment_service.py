@@ -15,12 +15,19 @@ from automas_script_maafw.runtime_route import (
 from .services import (
     ManagedServiceError,
     ManagedServiceGateway,
-    managed_project_identity,
 )
 
 
 MANAGED_ENVIRONMENT_SERVICE = "maafw.managed.environment.v1"
 _MANAGED_SCRIPT_TYPE = "MaaFWManaged"
+_MANAGED_BINDING_KEYS = (
+    "projectId",
+    "version",
+    "storeId",
+    "runRootId",
+    "runtimeId",
+    "poolId",
+)
 
 
 class MaaFWManagedEnvironmentService:
@@ -35,6 +42,13 @@ class MaaFWManagedEnvironmentService:
         reserve_project_path: Callable[[str | Path], Awaitable[Any]],
         release_project_path: Callable[[Any], Awaitable[None]],
         import_paths_provider: Callable[[], Sequence[str | Path]] | None = None,
+        before_run_update_provider: Callable[
+            [str, Mapping[str, Any], Callable[[str], None] | None],
+            Awaitable[Mapping[str, Any]],
+        ]
+        | None = None,
+        garbage_collector_provider: Callable[[], Awaitable[Mapping[str, Any]]]
+        | None = None,
         operation_runner: Callable[
             [Callable[[], Awaitable[Any]]], Awaitable[Any]
         ]
@@ -46,7 +60,60 @@ class MaaFWManagedEnvironmentService:
         self._reserve_project_path = reserve_project_path
         self._release_project_path = release_project_path
         self._import_paths_provider = import_paths_provider or (lambda: ())
+        self._before_run_update_provider = before_run_update_provider
+        self._garbage_collector_provider = garbage_collector_provider
         self._operation_runner = operation_runner
+
+    async def update_script_before_run(
+        self,
+        script_id: str,
+        payload: Mapping[str, Any],
+        *,
+        send_log: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
+        """Run the Managed version transaction before adapter locks are held."""
+
+        normalized_script_id = str(script_id or "").strip()
+        if not normalized_script_id:
+            raise ManagedServiceError("运行前更新 MaaFW 资源需要 scriptId")
+        if self._before_run_update_provider is None:
+            raise ManagedServiceError("MaaFW Managed 服务未提供运行前更新能力")
+
+        async def operation() -> dict[str, Any]:
+            result = await self._before_run_update_provider(
+                normalized_script_id,
+                dict(payload),
+                send_log,
+            )
+            if not isinstance(result, Mapping):
+                raise ManagedServiceError("MaaFW 运行前更新结果必须是 JSON object")
+            return dict(result)
+
+        if self._operation_runner is None:
+            return await operation()
+        result = await self._operation_runner(operation)
+        if not isinstance(result, Mapping):
+            raise ManagedServiceError("MaaFW 运行前更新结果必须是 JSON object")
+        return dict(result)
+
+    async def collect_unreferenced_resources(self) -> dict[str, Any]:
+        """Reconcile script references and immediately collect unowned data."""
+
+        if self._garbage_collector_provider is None:
+            raise ManagedServiceError("MaaFW Managed 服务未提供资源回收能力")
+
+        async def operation() -> dict[str, Any]:
+            result = await self._garbage_collector_provider()
+            if not isinstance(result, Mapping):
+                raise ManagedServiceError("MaaFW 资源回收结果必须是 JSON object")
+            return dict(result)
+
+        if self._operation_runner is None:
+            return await operation()
+        result = await self._operation_runner(operation)
+        if not isinstance(result, Mapping):
+            raise ManagedServiceError("MaaFW 资源回收结果必须是 JSON object")
+        return dict(result)
 
     async def prepare_script_environment(
         self,
@@ -100,12 +167,22 @@ class MaaFWManagedEnvironmentService:
                     return None
                 config = _record_config(record, f"脚本 {script_id}")
                 managed = _mapping(config.get("Managed"))
+                managed_runtime = _mapping(config.get("ManagedRuntime"))
                 self._reject_blocking_upgrade(managed)
-                project_id, version = managed_project_identity(managed)
-                if not project_id or not version:
-                    raise ManagedServiceError(
-                        "MaaFWManaged 脚本尚未绑定权威 projectId/version"
-                    )
+                expected_binding = _build_managed_binding_identity(
+                    managed,
+                    managed_runtime,
+                )
+                project_id = _required_text(
+                    expected_binding,
+                    "projectId",
+                    "权威 projectId",
+                )
+                version = _required_text(
+                    expected_binding,
+                    "version",
+                    "权威 version",
+                )
 
                 project_reference = f"maafw-script:{script_id}"
                 resolution = await gateway.resolve_execution(
@@ -195,6 +272,7 @@ class MaaFWManagedEnvironmentService:
                         project=project,
                         runtime=runtime,
                         project_path=project_path,
+                        expected_binding=expected_binding,
                     )
                 finally:
                     await self._release_project_path(reservation)
@@ -213,9 +291,20 @@ class MaaFWManagedEnvironmentService:
         project: Mapping[str, Any],
         runtime: Mapping[str, Any],
         project_path: str,
+        expected_binding: Mapping[str, str],
     ) -> dict[str, Any]:
         resolved_project_id = _required_text(project, "projectId", "项目 ID")
         resolved_version = _required_text(project, "version", "项目版本")
+        resolved_store_id = _required_text(project, "storeId", "Project Store ID")
+        checkout = _required_mapping(
+            resolution.get("checkout"),
+            "Managed Gateway checkout DTO",
+        )
+        _required_text(
+            checkout,
+            "runRootId",
+            "checkout RunRoot 身份",
+        )
         storage = _required_runtime_storage(
             await gateway.runtime_storage_info()
         )
@@ -243,30 +332,42 @@ class MaaFWManagedEnvironmentService:
             project_path,
             send_log,
         )
-        prepare_result = await asyncio.to_thread(
+        import_paths = await ManagedServiceGateway.invoke(
+            self._import_paths_provider,
+            (),
+            {},
+            "读取 MaaFW 插件导入路径",
+        )
+        prepare_result = await ManagedServiceGateway.invoke(
             runner.prepare_project_environment,
-            project_path,
-            interface,
-            runtime_pool_root=storage["root"],
-            runtime_requirements=route.runtime_requirements,
-            runtime_requirement=route.maafw_requirement,
-            runtime_id=route.runtime_id,
-            runtime_pool_id=storage["poolId"],
-            runtime_python_constraint=route.python_constraint,
-            import_paths=list(self._import_paths_provider()),
-            send_log=send_log,
-            managed_shared_agent_dependencies_complete=(
-                route.shared_agent_dependencies_complete
-            ),
-            managed_python_agent_indexes=(
-                route.managed_python_agent_indexes
-            ),
-            progress=progress,
+            (project_path, interface),
+            {
+                "runtime_pool_root": storage["root"],
+                "runtime_requirements": route.runtime_requirements,
+                "runtime_requirement": route.maafw_requirement,
+                "runtime_id": route.runtime_id,
+                "runtime_pool_id": storage["poolId"],
+                "runtime_python_constraint": route.python_constraint,
+                "import_paths": list(import_paths),
+                "send_log": send_log,
+                "managed_shared_agent_dependencies_complete": (
+                    route.shared_agent_dependencies_complete
+                ),
+                "managed_python_agent_indexes": (
+                    route.managed_python_agent_indexes
+                ),
+                "progress": progress,
+            },
+            "准备 MaaFW 项目环境",
         )
         if not isinstance(prepare_result, Mapping):
             raise ManagedServiceError(
                 "maafw.runner.v1 环境准备结果必须是 JSON object"
             )
+        # Runner preparation is the long-running part of this transaction.
+        # Re-read the script binding before touching Project Store so a stale
+        # result can never bind or persist after a version/runtime switch.
+        await self._assert_managed_binding(script_id, expected_binding)
         binding_commit = _required_mapping(
             await gateway.bind_project_runtime_reversible(
                 resolved_project_id,
@@ -285,6 +386,20 @@ class MaaFWManagedEnvironmentService:
                 binding_commit.get("project"),
                 "Project Store runtime binding",
             )
+            bound_identity = (
+                _required_text(bound_project, "projectId", "项目 ID"),
+                _required_text(bound_project, "version", "项目版本"),
+                _required_text(bound_project, "storeId", "Project Store ID"),
+            )
+            if bound_identity != (
+                resolved_project_id,
+                resolved_version,
+                resolved_store_id,
+            ):
+                raise ManagedServiceError(
+                    "Project Store runtime binding 返回的 projectId/version/storeId "
+                    "与本次准备身份不一致"
+                )
             # Revalidate the authoritative response after the resource commit.
             # A broken Store/Gateway contract must never be promoted to script
             # ready state.  The host config write is the second phase; any
@@ -296,6 +411,11 @@ class MaaFWManagedEnvironmentService:
                 runtime_binding=runtime,
                 expected_pool_id=storage["poolId"],
             )
+            # The script config write is the final authority update.  Keep the
+            # check immediately before it even though the transaction normally
+            # serializes public config writers; this also protects alternate
+            # callers that mutate the in-memory record during preparation.
+            await self._assert_managed_binding(script_id, expected_binding)
             resolution["project"] = bound_project
             await self._persist_resolution(
                 script_id,
@@ -322,7 +442,43 @@ class MaaFWManagedEnvironmentService:
         return {
             "projectPath": project_path,
             "prepareResult": dict(prepare_result),
+            "bindingIdentity": _build_resolved_binding_identity(
+                bound_project,
+                checkout,
+                runtime,
+            ),
         }
+
+    async def _assert_managed_binding(
+        self,
+        script_id: str,
+        expected_binding: Mapping[str, str],
+    ) -> None:
+        current_binding = await self._read_managed_binding_identity(script_id)
+        normalized_expected = {
+            key: str(expected_binding.get(key) or "").strip()
+            for key in _MANAGED_BINDING_KEYS
+        }
+        if current_binding != normalized_expected:
+            raise ManagedServiceError(
+                "MaaFW Managed 脚本绑定在环境准备期间发生变化；"
+                "拒绝写入旧的 projectId/version/storeId/runRootId/runtimeId/poolId"
+            )
+
+    async def _read_managed_binding_identity(
+        self,
+        script_id: str,
+    ) -> dict[str, str]:
+        record = await self._read_unique_script(script_id)
+        if _record_field(record, "type") != _MANAGED_SCRIPT_TYPE:
+            raise ManagedServiceError(
+                f"脚本 {script_id} 已不是 MaaFWManaged，拒绝写入环境结果"
+            )
+        config = _record_config(record, f"脚本 {script_id}")
+        return _build_managed_binding_identity(
+            _mapping(config.get("Managed")),
+            _mapping(config.get("ManagedRuntime")),
+        )
 
     async def _read_unique_script(self, script_id: str) -> Any:
         try:
@@ -502,6 +658,63 @@ class MaaFWManagedEnvironmentService:
             ) from exc
 
 
+def _build_managed_binding_identity(
+    managed: Mapping[str, Any],
+    runtime: Mapping[str, Any],
+) -> dict[str, str]:
+    manifest_value = managed.get("ProjectManifest")
+    if manifest_value is not None and not isinstance(manifest_value, Mapping):
+        raise ManagedServiceError("ProjectManifest 必须是 JSON object")
+    manifest = dict(manifest_value) if isinstance(manifest_value, Mapping) else {}
+    project_id = _optional_identity_text(
+        manifest.get("projectId"),
+        "ProjectManifest.projectId",
+    ) or _optional_identity_text(managed.get("ProjectId"), "Managed.ProjectId")
+    version = _optional_identity_text(
+        manifest.get("version"),
+        "ProjectManifest.version",
+    ) or _optional_identity_text(managed.get("Version"), "Managed.Version")
+    return {
+        "projectId": project_id,
+        "version": version,
+        "storeId": _optional_identity_text(
+            managed.get("StoreId"),
+            "Managed.StoreId",
+        ),
+        "runRootId": _optional_identity_text(
+            managed.get("RunRootId"),
+            "Managed.RunRootId",
+        ),
+        "runtimeId": _optional_identity_text(
+            runtime.get("RuntimeId"),
+            "ManagedRuntime.RuntimeId",
+        ),
+        "poolId": _optional_identity_text(
+            runtime.get("PoolId"),
+            "ManagedRuntime.PoolId",
+        ),
+    }
+
+
+def _build_resolved_binding_identity(
+    project: Mapping[str, Any],
+    checkout: Mapping[str, Any],
+    runtime: Mapping[str, Any],
+) -> dict[str, str]:
+    return {
+        "projectId": _required_text(project, "projectId", "项目 ID"),
+        "version": _required_text(project, "version", "项目版本"),
+        "storeId": _required_text(project, "storeId", "Project Store ID"),
+        "runRootId": _required_text(
+            checkout,
+            "runRootId",
+            "checkout RunRoot 身份",
+        ),
+        "runtimeId": _required_text(runtime, "runtimeId", "运行时 ID"),
+        "poolId": _required_text(runtime, "poolId", "Runtime Pool ID"),
+    }
+
+
 def _required_runtime_storage(value: Any) -> dict[str, str]:
     storage = _required_mapping(value, "Runtime Pool storage_info")
     if storage.get("available") is False:
@@ -510,14 +723,37 @@ def _required_runtime_storage(value: Any) -> dict[str, str]:
         )
     root = _required_text(storage, "root", "Runtime Pool root")
     pool_id = _required_text(storage, "poolId", "Runtime Pool ID")
-    root_identity = storage.get("rootIdentity")
-    if isinstance(root_identity, Mapping):
-        identity_pool_id = str(root_identity.get("poolId") or "").strip()
-        if identity_pool_id and identity_pool_id != pool_id:
+    if "rootIdentity" in storage:
+        root_identity = storage["rootIdentity"]
+        if not isinstance(root_identity, Mapping):
+            raise ManagedServiceError(
+                "Runtime Pool storage_info 的 rootIdentity 必须是 JSON object"
+            )
+        if "poolId" in root_identity:
+            identity_pool_id = root_identity["poolId"]
+            if not isinstance(identity_pool_id, str):
+                raise ManagedServiceError(
+                    "Runtime Pool rootIdentity.poolId必须是字符串"
+                )
+            identity_pool_id = identity_pool_id.strip()
+        else:
+            raise ManagedServiceError(
+                "Runtime Pool rootIdentity 缺少 poolId"
+            )
+        if not identity_pool_id:
+            raise ManagedServiceError(
+                "Runtime Pool rootIdentity.poolId不能为空"
+            )
+        if identity_pool_id != pool_id:
             raise ManagedServiceError(
                 "Runtime Pool storage_info 的 poolId 与 rootIdentity 不一致"
             )
-    return {"root": str(Path(root).resolve()), "poolId": pool_id}
+    root_path = Path(root)
+    if not root_path.is_absolute():
+        raise ManagedServiceError(
+            "Runtime Pool storage_info 的 root 必须是绝对路径"
+        )
+    return {"root": str(root_path.resolve()), "poolId": pool_id}
 
 
 def _validate_runtime_selector(runtime: Mapping[str, Any]) -> None:
@@ -638,10 +874,21 @@ def _required_mapping(value: Any, label: str) -> dict[str, Any]:
 
 
 def _required_text(value: Mapping[str, Any], key: str, label: str) -> str:
-    normalized = str(value.get(key) or "").strip()
+    raw = value.get(key)
+    if raw is not None and not isinstance(raw, str):
+        raise ManagedServiceError(f"{label}必须是字符串")
+    normalized = raw.strip() if isinstance(raw, str) else ""
     if not normalized:
         raise ManagedServiceError(f"{label}不能为空")
     return normalized
+
+
+def _optional_identity_text(value: Any, label: str) -> str:
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ManagedServiceError(f"{label}必须是字符串")
+    return value.strip()
 
 
 __all__ = [

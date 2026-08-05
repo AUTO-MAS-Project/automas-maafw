@@ -54,11 +54,11 @@ class Plugin:
 | PyPI 包 | 当前版本 | 服务名 | 主要职责 |
 |---|---:|---|---|
 | `automas-maafw-interface` | 0.2.0 | `maafw.interface.v1` | PI 加载、校验、预览、任务快照和 option 归一化 |
-| `automas-maafw-project-update` | 0.2.2 | `maafw.project_update.v1` | MirrorChyan/GitHub Release 版本发现、受限下载、临时包安全释放、可安装候选与更新 |
+| `automas-maafw-project-update` | 0.2.3 | `maafw.project_update.v1` | MirrorChyan/GitHub Release 版本发现、受限下载、临时包安全释放、可安装候选与更新 |
 | `automas-maafw-agent-env` | 0.1.4 | `maafw.agent_env.v1` | agent 运行方式识别、命令规划和 Python 环境准备 |
 | `automas-maafw-controller-adb` | 0.1.1 | `maafw.controller.adb` | ADB provider 与设备参数构建 |
 | `automas-maafw-controller-win32` | 0.1.2 | `maafw.controller.win32` | Win32 provider、窗口扫描与设备参数构建 |
-| `automas-maafw-project-store` | 0.2.2 | `maafw.project_store.v1` | 本地目录/ZIP 资源导入、不可变版本、Python 约束、隔离 checkout、全局盘点、引用和 GC |
+| `automas-maafw-project-store` | 0.2.3 | `maafw.project_store.v1` | 本地目录/ZIP 资源导入、不可变版本、Python 约束、隔离 checkout、全局盘点、引用和 GC |
 | `automas-maafw-runtime-pool` | 0.2.0 | `maafw.runtime_pool.v1` | 可配置根目录、CP312/CP313 解释器、按完整 requirement selector 隔离 venv 并复用 uv cache |
 | `automas-maafw-runner` | 0.4.0 | `maafw.runner.v1` | 运行计划、worker job、可信 runtime 路由、环境预热和结果模型 |
 | `automas-script-maafw` | 0.1.11 | `maafw.registry.v1`、`maafw.configuration_reuse.v1` | MaaFW 脚本适配、能力注册、原生配置导入、用户复制和 Pool 路由 |
@@ -71,9 +71,9 @@ class Plugin:
 `publish.yml` 每次只发布一个 distribution。当前版本按以下层级发布；同层可并行，
 下一层必须等待依赖版本已经可从 PyPI 安装：
 
-1. `automas-maafw-interface` 0.2.0、`automas-maafw-project-store` 0.2.2、
+1. `automas-maafw-interface` 0.2.0、`automas-maafw-project-store` 0.2.3、
    `automas-maafw-runtime-pool` 0.2.0。
-2. `automas-maafw-agent-env` 0.1.4、`automas-maafw-project-update` 0.2.2。
+2. `automas-maafw-agent-env` 0.1.4、`automas-maafw-project-update` 0.2.3。
 3. `automas-maafw-runner` 0.4.0。
 4. `automas-script-maafw` 0.1.11。
 5. `automas-script-maafw-managed` 0.3.0。
@@ -269,6 +269,7 @@ await discover_update(
     interface,
     *,
     current_version=None,
+    project_path=None,
     source_config=None,
     proxy=None,
     send_log=None,
@@ -378,11 +379,11 @@ MaaFWProjectUpdateResult:
 遇到这种状态会抛出可诊断错误，绝不会返回伪 candidate。
 
 省略 `source` 或传空字符串表示自动模式。PI 有 MirrorChyan RID 时，MirrorChyan
-始终是版本元数据权威；即使 CDK 为空、响应没有下载地址，也会保留已发现版本。
-只有 GitHub Release 给出相同规范化版本且 ZIP asset 选择唯一时，安装包才回退到
-GitHub。显式 `mirrorchyan` 不回退，显式 `github_release` 不查询 MirrorChyan；PI
-没有 RID 的自动模式直接使用 GitHub。脚本级空 `cdk`/`mirror_cdk` 会继承宿主传入
-的非空 `mirror_cdk`。
+始终是版本元数据权威；即使 CDK 为空、响应没有下载地址，也会保留已发现版本，
+但不会暴露可安装候选。自动模式不再静默回退 GitHub，避免 GitHub API 限流和
+来源漂移；显式 `mirrorchyan` 不回退，显式 `github_release` 不查询 MirrorChyan；
+PI 没有 RID 的自动模式才直接使用 GitHub。脚本级空 `cdk`/`mirror_cdk` 会继承
+宿主传入的非空 `mirror_cdk`。
 
 GitHub 包选择只接受 Release assets，不把仓库 `zipball` 当作发行包。显式
 `github_asset_pattern` 命中多个文件或按项目名、Windows/x64 约定仍无法得到唯一
@@ -407,8 +408,8 @@ ZIP/SHA256 校验后以内容哈希文件名原子发布到调用方管理的目
 `downloaded_bytes`、`total_bytes` 和 `percent`：已知总长按 200 ms 或 1% 节流，
 未知总长按 250 ms 或 1 MiB 节流。整个下载（含重试）共用 300 秒墙钟 deadline；
 超时会删除临时文件并发出 `failed/download_timeout`，不会进入校验、解压或切换。
-版本发现事件同时给出 `metadata_source` 和 `package_source`，用于区分 MirrorChyan
-元数据与 GitHub 安装包回退。
+版本发现事件同时给出 `metadata_source` 和 `package_source`；后者仅在确有可安装候选
+时出现，用于区分版本元数据来源与实际安装包来源，不代表提供者之间会自动回退。
 
 ### 5.4 调用示例：检查并应用更新
 
@@ -450,6 +451,9 @@ if result.updated:
 ```
 
 更新检查或应用失败抛出 `MaaFWProjectUpdateError`。调用方不得在更新失败后把项目版本写成候选版本。
+若提供者响应带有结构化错误码，异常的 `provider_error_code` 保留原始整数码；
+MirrorChyan 的 CDK 错误（如 `7001`--`7005`）不得被改写成通用 HTTP 错误，宿主
+接口应同时在响应数据的 `providerErrorCode` 中透传该值。
 
 ## 6. `maafw.agent_env.v1`
 
@@ -1345,13 +1349,14 @@ ProjectInterface 可达资源和运行内容，不保留可识别的外部 UI �
 ```python
 import_project(
     source_path,
-    project_id,
+    project_id=None,
     version=None,
     *,
     runtime_constraint=None,
     platform=None,
     arch=None,
     runtime_binding=None,
+    remote_source=None,
     reference=None,
     pinned=False,
     activate=True,
@@ -1375,9 +1380,21 @@ collect_garbage(*, project_id=None, dry_run=True, grace_seconds=86400, keep_late
 resource_lifecycle_transaction() -> AsyncContextManager[None]
 ```
 
+本地首次导入的 `project_id` 可省略。Project Store 按以下层级确定不可变项目身份：
+优先使用 ProjectInterface 的正式 `projectId`/`project_id`（二者同时声明时必须一致）；
+若未声明正式 ID，再使用调用方显式 `project_id` 作为兼容 alias；仍未提供时依次
+回退到 ProjectInterface 的 `name` 和项目目录名。调用方显式 ID 与正式 ID 不一致时
+拒绝导入，所有解析结果仍经过项目 ID 的安全组件校验。
+
 显式 `version` 与 `ProjectInterface.version` 同时存在时必须语义等价；最终使用
 ProjectInterface 的原始版本拼写。未显式给版本时必须能从 ProjectInterface
 推断，否则拒绝导入。
+
+Managed 远程导入可传入不含凭据的 `remote_source`。Project Store 只接受
+GitHub repo/tag/asset selector 或 MirrorChyan RID/multiplatform 身份，将其写入
+私有不可变 manifest 并通过 `summary.remote` 返回。包内 ProjectInterface 的同名声明
+优先，调用方身份只补齐缺失字段；同一项目版本若以不同远程身份再次导入则拒绝。
+CDK、token 和未知字段不属于该接口，不能进入 Store。
 
 MaaFW 约束优先使用调用方、ProjectInterface 或 requirements 的有效声明；均未钉
 版本时，可从发行包内某个 `MaaFramework.dll` 自身唯一的静态 `vX.Y.Z` 标记推导
@@ -1385,7 +1402,7 @@ MaaFW 约束优先使用调用方、ProjectInterface 或 requirements 的有效�
 版本证据，临时/更新目录和 pip `~*` 卸载残留也必须忽略。显式约束不包含唯一
 推导版本或多份唯一二进制版本不一致时失败关闭。
 
-Project Store 0.2.2 在私有 manifest 的 `runtime.python` 中保存
+从 Project Store 0.2.2 起，私有 manifest 的 `runtime.python` 中保存
 `implementation=cpython`、硬版本 `constraint` 与 `sources`。优先读取
 ProjectInterface 的显式声明；脱壳项目没有声明时，只静态读取被剥离解释器同目录
 唯一的 `python3XY._pth`，或 Windows 发行包根/声明解释器目录唯一的
@@ -1405,7 +1422,7 @@ manifest
 summary
 ```
 
-`summary` 是供本地资源管理界面消费的 JSON 摘要，包含 `interfaceVersion`、
+`summary` 是供本地资源管理界面消费的 JSON 摘要，包含 `interfaceVersion`、`remote`、
 `sourceKind`、`runtimeConstraint`、`pythonConstraint`、`pythonImplementation`、
 `agents`/`agentCount`、`capabilities`、
 `shells`、`size`、`flags` 和 `warningCount`。`shells` 记录被剥离壳的类别与路径；
@@ -1668,7 +1685,11 @@ Controller 与 Tasker 前加载这些目录；任一路径越出项目根、缺�
 托管项目中原本指向被剥离 `python/` 的 Python Agent，只有在私有 manifest 明确
 设置 `runtime.sharedAgentDependenciesComplete: true` 时才会复用 worker 当前的
 `sys.executable`。该标志要求根 requirements 能完整、平面地表达 Agent 依赖；
-否则继续使用隔离环境。项目二进制 Agent、显式外部解释器和非托管项目保持原行为。
+否则继续使用隔离环境。托管项目的 `project_binary` Agent 使用同一完整
+`runtimeId` 选定的 MaaFW native runtime：Runner 会在可写 checkout 的
+`maafw/` 下准备带哈希标记的 overlay，递归投影 `maa/bin`（含 `plugins/`）和
+`MaaAgentBinary` 资产，并优先保留项目自带 runtime；只加 PATH 不作为 native
+Agent 的替代方案。显式外部解释器和非托管项目保持原行为。
 
 `MaaFWManaged` 在实际 GC 前从全部脚本配置对账 `maafw-script:*` 项目引用，并从
 现存项目 binding 对账 `maafw-project:*` runtime 引用。dry-run 不删除任何目录，
@@ -1690,13 +1711,14 @@ Managed 0.3.0 在 Project Store 缺少该 Python 协调接口时失败关闭，�
 
 Managed 的远程检查把“发现新版本”与“存在可安装候选”分开；只有候选带有效
 下载地址时才允许导入/升级。下载发生在宿主配置事务之外，校验后的本地 ZIP 再
-进入 Project Store 的不可变导入和既有升级计划流程。首次导入使用用户填写的
-`ImportProjectId` 与最小来源元数据，绑定后升级只信任 Project Store manifest
+进入 Project Store 的不可变导入和既有升级计划流程。首次导入可使用用户填写的
+`ImportProjectId` 作为显式 alias；未填写时由 Project Store 按 ProjectInterface 正式
+ID、`name` 和目录名分层解析。绑定后升级只信任 Project Store manifest
 和活动 ProjectInterface。下载 URL（可能包含短期签名或凭据）不会写入脚本配置，
 持久化发现结果只保留来源、版本、hash 与是否可下载。
 
 远程 ZIP 只作为本次请求的 staging：Project Store 导入/升级计划与宿主配置事务均
-成功后，Managed 通过 Project Update 0.2.2 的 `release_download_package()` 释放
+成功后，Managed 通过 Project Update 0.2.3 的 `release_download_package()` 释放
 该内容寻址包。后续 apply、cancel 和启动恢复只解析不可变 Store 版本，不依赖 ZIP。
 `ManagedRemote.LastDownload` 仅保留来源、版本、大小、SHA-256、`retained` 和
 `cleanupStatus`，不保存本地 staging 路径；远程首次导入也会把
@@ -1704,11 +1726,15 @@ Managed 的远程检查把“发现新版本”与“存在可安装候选”分
 持久化 `retained=true`，不能把已完成的资源导入改判失败。下载观察元数据
 `ManagedRemote` 不参与升级配置 CAS，真实脚本/任务/用户配置变化仍会使计划失效。
 
-MirrorChyan 的显式脚本 CDK 优先；留空时后端继承宿主全局
-`Update.MirrorChyanCDK`，GitHub 路径从不读取或携带 CDK。CDK/token/Authorization、
-Bearer 和带签名下载地址在 HTTP、WebSocket 进度、日志及持久化 DTO 中统一脱敏；
-全局和脚本都没有 CDK 时仍可发现 MirrorChyan 版本元数据，但没有可安装 URL 就不能
-执行导入或升级。
+Managed 管理 HTTP 与自动更新都只使用宿主全局 `Update.Source` 和
+`Update.MirrorChyanCDK`；请求及旧脚本字段仅兼容接收，不能覆盖全局值。全局来源为
+AutoSite/CNB 时远程 Managed 操作失败关闭，必须先保存 MirrorChyan 或 GitHub。
+每个项目的 stable/beta 渠道只由 `/maafw-managed/settings` 写入并由远程检查/下载读取，
+首次导入也不得从请求回写渠道。绑定后的 repo/RID/tag/asset selector 只取活动
+ProjectInterface 或 Project Store 的不可变 `summary.remote`。GitHub 路径从不读取或
+携带 CDK。CDK/token/Authorization、Bearer 和带签名下载地址在 HTTP、WebSocket
+进度、日志及持久化 DTO 中统一脱敏；全局没有 CDK 时仍可发现 MirrorChyan 版本元数据，
+但没有可安装 URL 就不能执行导入或升级。
 
 普通脚本 0.1.11 的配置复用同样依赖上述宿主事务 API。M9A 集成下限必须为
 `automas-maafw-runner>=0.4.0` 与 `automas-script-maafw>=0.1.11`。

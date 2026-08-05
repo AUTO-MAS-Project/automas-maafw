@@ -58,6 +58,17 @@ class ManagedServiceGateway:
         self.project_update = project_update
         self.interface_service = interface_service
 
+    @staticmethod
+    async def invoke(
+        method: Any,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        operation: str,
+    ) -> Any:
+        """Run one synchronous boundary with cancellation-safe cleanup."""
+
+        return await _invoke(method, args, kwargs, operation)
+
     @asynccontextmanager
     async def resource_transaction(self) -> AsyncIterator[None]:
         """Serialize project reference reconciliation and destructive GC."""
@@ -84,6 +95,29 @@ class ManagedServiceGateway:
         requested_version = _optional_text(request.get("version"))
         defer_runtime_binding = request.get("deferRuntimeBinding") is True
         project = await self.resolve_project(project_id, requested_version)
+        # A service implementation must not be able to return a same-shaped
+        # DTO for a different project/version and make the caller run it under
+        # the requested identity.  The concrete Project Store validates this
+        # internally, but keep the boundary fail-closed for legacy adapters
+        # and alternate service implementations as well.
+        resolved_project_id = _required_text(
+            project,
+            "projectId",
+            "Project Store 项目 ID",
+        )
+        resolved_project_version = _required_text(
+            project,
+            "version",
+            "Project Store 项目版本",
+        )
+        if resolved_project_id != project_id or (
+            requested_version is not None
+            and resolved_project_version != requested_version
+        ):
+            raise ManagedServiceError(
+                "Project Store 返回的 projectId/version 与请求身份不一致；"
+                "拒绝按同名资源继续运行。"
+            )
         _validate_project_store_binding(request, project)
         # Runtime identity must be derived from the immutable Store payload.
         # A checkout is writable execution state and may have been changed by
@@ -102,10 +136,20 @@ class ManagedServiceGateway:
             )
         checkout = await self.checkout_project(
             project_id,
-            str(project.get("version") or requested_version or "") or None,
+            resolved_project_version,
             script_id,
         )
         project_path = _project_path(checkout)
+        checkout_project_id = _optional_text(checkout.get("projectId"))
+        checkout_version = _optional_text(checkout.get("version"))
+        if (
+            checkout_project_id != project_id
+            or checkout_version != resolved_project_version
+        ):
+            raise ManagedServiceError(
+                "Project Store checkout 的 projectId/version 与不可变资源身份不一致；"
+                "拒绝运行错误的脱壳目录。"
+            )
         for field, label in (
             ("runRootId", "RunRoot 身份"),
             ("payloadHash", "Store payload 哈希"),
@@ -126,7 +170,12 @@ class ManagedServiceGateway:
                 "拒绝创建未约束的 MaaFW 运行时。请先声明版本约束或绑定已验证运行时。"
             )
         requirements = (
-            _runner_requirements(store_project_path, constraint)
+            await _invoke(
+                _runner_requirements,
+                (store_project_path, constraint),
+                {},
+                "解析 MaaFW 运行时依赖",
+            )
             if constraint
             else []
         )
@@ -158,9 +207,11 @@ class ManagedServiceGateway:
             if bound_runtime_id and bound_maafw_version:
                 runtime_request = dict(runtime_request)
                 runtime_request.pop("runtimeId", None)
-                runtime_request["requirements"] = _runner_requirements(
-                    store_project_path,
-                    bound_maafw_version,
+                runtime_request["requirements"] = await _invoke(
+                    _runner_requirements,
+                    (store_project_path, bound_maafw_version),
+                    {},
+                    "恢复 MaaFW 运行时依赖",
                 )
                 runtime_request["metadata"] = {
                     **dict(runtime_request.get("metadata") or {}),
@@ -377,15 +428,21 @@ class ManagedServiceGateway:
         references are preserved by the reconciliation methods.
         """
 
-        project_inventory = await self._resource_inventory(
-            self.project_store,
-            "Project Store",
-            self.list_projects,
-        )
-        runtime_inventory = await self._resource_inventory(
-            self.runtime_pool,
-            "Runtime Pool",
-            self.list_runtimes,
+        # Both initial snapshots are read-only and independent.  Keep the
+        # event loop responsive while a large Project Store or Runtime Pool is
+        # being walked; _resource_inventory/_invoke already move synchronous
+        # provider work to worker threads.
+        project_inventory, runtime_inventory = await asyncio.gather(
+            self._resource_inventory(
+                self.project_store,
+                "Project Store",
+                self.list_projects,
+            ),
+            self._resource_inventory(
+                self.runtime_pool,
+                "Runtime Pool",
+                self.list_runtimes,
+            ),
         )
         inventory_errors = [
             *project_inventory["errors"],
@@ -409,15 +466,17 @@ class ManagedServiceGateway:
                     script_records
                 )
                 runtime_reconciliation = await self.reconcile_runtime_references()
-                project_inventory = await self._resource_inventory(
-                    self.project_store,
-                    "Project Store",
-                    self.list_projects,
-                )
-                runtime_inventory = await self._resource_inventory(
-                    self.runtime_pool,
-                    "Runtime Pool",
-                    self.list_runtimes,
+                project_inventory, runtime_inventory = await asyncio.gather(
+                    self._resource_inventory(
+                        self.project_store,
+                        "Project Store",
+                        self.list_projects,
+                    ),
+                    self._resource_inventory(
+                        self.runtime_pool,
+                        "Runtime Pool",
+                        self.list_runtimes,
+                    ),
                 )
                 inventory_errors = [
                     *project_inventory["errors"],
@@ -440,26 +499,35 @@ class ManagedServiceGateway:
                 }
 
         projects = project_inventory["items"]
-        versions: list[dict[str, Any]] = []
-        for project in projects:
+
+        async def load_project_versions(
+            project: Mapping[str, Any],
+        ) -> tuple[str | None, list[dict[str, Any]] | Exception]:
             project_id = _optional_text(project.get("projectId"))
             if not project_id:
+                return None, ManagedServiceError(
+                    "Project Store inventory returned an item without projectId"
+                )
+            try:
+                return project_id, await self.list_versions(project_id)
+            except Exception as exc:
+                return project_id, exc
+
+        version_results = await asyncio.gather(
+            *(load_project_versions(project) for project in projects)
+        )
+        versions: list[dict[str, Any]] = []
+        for project_id, result in version_results:
+            if isinstance(result, Exception):
+                scope = "project-store" if not project_id else f"project:{project_id}"
                 inventory_errors.append(
                     {
-                        "scope": "project-store",
-                        "error": "Project Store inventory returned an item without projectId",
+                        "scope": scope,
+                        "error": f"{type(result).__name__}: {result}",
                     }
                 )
                 continue
-            try:
-                versions.extend(await self.list_versions(project_id))
-            except Exception as exc:
-                inventory_errors.append(
-                    {
-                        "scope": f"project:{project_id}",
-                        "error": f"{type(exc).__name__}: {exc}",
-                    }
-                )
+            versions.extend(result)
         runtimes = runtime_inventory["items"]
         checkout_inventory = _annotate_checkout_inventory(
             project_inventory.get("checkouts", []),
@@ -611,7 +679,12 @@ class ManagedServiceGateway:
         )
         package = _as_dict(value, "maafw.project_update.v1 download_package")
         path = _required_text(package, "path", "远程下载包路径")
-        if not Path(path).is_file():
+        if not await _invoke(
+            Path(path).is_file,
+            (),
+            {},
+            "校验远程下载包路径",
+        ):
             raise ManagedServiceError("远程下载服务未返回可读取的本地 ZIP")
         return package
 
@@ -668,9 +741,13 @@ class ManagedServiceGateway:
 
     async def import_project(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         source_path = _local_source_path(payload)
-        project_id = _required_text(payload, "projectId", "项目 ID")
+        # Local ProjectInterface imports carry their authoritative identity in
+        # interface.json.  Keep projectId optional for the first import; the
+        # Project Store validates/derives it and returns the canonical value.
+        project_id = _optional_text(payload.get("projectId"))
         version = _optional_text(payload.get("version"))
         runtime_constraint = _optional_text(payload.get("runtimeConstraint"))
+        remote_source = _remote_source_metadata(payload.get("remoteSource"))
         activate = payload.get("activate", True)
         if not isinstance(activate, bool):
             raise ManagedServiceError("项目导入 activate 必须是 boolean")
@@ -682,28 +759,48 @@ class ManagedServiceGateway:
             "projectId": project_id,
             "version": version,
             "runtimeConstraint": runtime_constraint,
+            "remoteSource": remote_source,
             "activate": activate,
             "pinned": False,
             "reference": project_reference,
         }
+        import_options = {
+            "runtime_constraint": runtime_constraint,
+            "activate": activate,
+            "pinned": False,
+            "reference": project_reference,
+        }
+        if remote_source is not None:
+            import_options["remote_source"] = remote_source
         value = await _call_variants(
             self.project_store,
             ("import_project", "import_version", "import_release"),
             (
                 (
                     (source_path, project_id, version),
-                    {
-                        "runtime_constraint": runtime_constraint,
-                        "activate": activate,
-                        "pinned": False,
-                        "reference": project_reference,
-                    },
+                    import_options,
                 ),
                 ((request,), {}),
             ),
             operation="导入 MaaFW 项目",
         )
-        return _as_dict(value, "project_store import")
+        project = _as_dict(value, "project_store import")
+        returned_project_id = _required_text(
+            project,
+            "projectId",
+            "Project Store 返回的项目 ID",
+        )
+        _required_text(
+            project,
+            "version",
+            "Project Store 返回的项目版本",
+        )
+        if project_id and returned_project_id != project_id:
+            raise ManagedServiceError(
+                "Project Store 返回的项目 ID 与请求绑定不一致："
+                f"{returned_project_id} != {project_id}"
+            )
+        return project
 
     async def upgrade_project(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         """Import a caller-supplied folder/ZIP as a new immutable version.
@@ -730,27 +827,32 @@ class ManagedServiceGateway:
         project_reference = _project_script_reference(
             _optional_text(payload.get("projectReference"))
         )
+        remote_source = _remote_source_metadata(payload.get("remoteSource"))
         request = {
             "sourcePath": source_path,
             "projectId": project_id,
             "version": version,
             "runtimeConstraint": runtime_constraint,
+            "remoteSource": remote_source,
             "activate": False,
             "pinned": False,
             "reference": project_reference,
         }
+        import_options = {
+            "runtime_constraint": runtime_constraint,
+            "activate": False,
+            "pinned": False,
+            "reference": project_reference,
+        }
+        if remote_source is not None:
+            import_options["remote_source"] = remote_source
         imported = await _call_variants(
             self.project_store,
             ("update_project", "import_project"),
             (
                 (
                     (source_path, project_id, version),
-                    {
-                        "runtime_constraint": runtime_constraint,
-                        "activate": False,
-                        "pinned": False,
-                        "reference": project_reference,
-                    },
+                    import_options,
                 ),
                 ((request,), {}),
             ),
@@ -2073,6 +2175,56 @@ def _local_source_path(payload: Mapping[str, Any]) -> str:
     if source is None:
         raise ManagedServiceError("请选择待导入的本地 ZIP 或资源目录")
     return source
+
+
+def _remote_source_metadata(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ManagedServiceError("远程来源身份必须是 JSON object")
+    source = str(value.get("source") or "").strip().casefold()
+    if source in {"github", "github_release"}:
+        allowed = {
+            "source",
+            "github",
+            "github_tag",
+            "github_asset_pattern",
+        }
+        if set(value) - allowed:
+            raise ManagedServiceError("GitHub 远程来源身份包含不受支持的字段")
+        repo = _optional_text(value.get("github"))
+        if repo is None:
+            raise ManagedServiceError("GitHub 远程来源身份缺少仓库")
+        result = {"source": "GitHub", "github": repo}
+        tag = _optional_text(value.get("github_tag"))
+        asset_pattern = _optional_text(value.get("github_asset_pattern"))
+        if tag is not None:
+            result["github_tag"] = tag
+        if asset_pattern is not None:
+            result["github_asset_pattern"] = asset_pattern
+        return result
+    if source in {"mirrorchyan", "mirror_chyan", "mirror酱"}:
+        allowed = {
+            "source",
+            "mirrorchyan_rid",
+            "mirrorchyan_multiplatform",
+        }
+        if set(value) - allowed:
+            raise ManagedServiceError("MirrorChyan 远程来源身份包含不受支持的字段")
+        rid = _optional_text(value.get("mirrorchyan_rid"))
+        if rid is None:
+            raise ManagedServiceError("MirrorChyan 远程来源身份缺少 RID")
+        multiplatform = value.get("mirrorchyan_multiplatform", True)
+        if not isinstance(multiplatform, bool):
+            raise ManagedServiceError(
+                "MirrorChyan 远程来源 multiplatform 必须是 boolean"
+            )
+        return {
+            "source": "MirrorChyan",
+            "mirrorchyan_rid": rid,
+            "mirrorchyan_multiplatform": multiplatform,
+        }
+    raise ManagedServiceError("远程来源身份必须是 MirrorChyan 或 GitHub")
 
 
 def _project_python_runtime_request(

@@ -8,7 +8,7 @@ import json
 import math
 import re
 import uuid
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
@@ -66,12 +66,14 @@ _CONVERSION_API_VERSION = "maafw-managed.v1"
 _DISTRIBUTION_NAME = "automas-script-maafw-managed"
 _DISTRIBUTION_VERSION_FALLBACK = "0.3.0"
 _SOURCE_TYPE = "MaaFW"
+_SOURCE_TYPES = frozenset((_SOURCE_TYPE, "M9A"))
 _TARGET_TYPE = "MaaFWManaged"
 _PROGRESS_EVENT_TYPE = "maafw.managed.progress"
 _PROGRESS_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,200}$")
 _PROGRESS_MAX_STATES = 128
 _PROGRESS_MAX_LOGS = 80
 _PROGRESS_TERMINAL_STATES = frozenset({"success", "error"})
+_AUTO_UPDATE_PREWARM_LEASE_TTL_SECONDS = 24 * 60 * 60
 _JSON_OBJECT_FIELDS = frozenset(
     (str(getattr(group, "key", "")), str(getattr(field, "name", "")))
     for group in (*SCRIPT_GROUPS, *USER_GROUPS)
@@ -112,6 +114,9 @@ class Plugin(ScriptAdapterPlugin):
     def __init__(self, ctx: Any) -> None:
         super().__init__(ctx)
         self._upgrade_locks: dict[str, asyncio.Lock] = {}
+        # Remote discovery/download is deliberately serialized per script,
+        # but must not hold the global Project Store lifecycle transaction.
+        self._remote_stage_locks: dict[str, asyncio.Lock] = {}
         self._progress_states: dict[str, dict[str, Any]] = {}
         self._active_operations: dict[str, str] = {}
         self._progress_lock = asyncio.Lock()
@@ -132,6 +137,8 @@ class Plugin(ScriptAdapterPlugin):
             reserve_project_path=try_reserve_project_path,
             release_project_path=release_project_path,
             import_paths_provider=get_plugin_import_paths,
+            before_run_update_provider=self._auto_update_before_run,
+            garbage_collector_provider=self._collect_all_unreferenced_resources,
             operation_runner=self._run_drain_protected,
         )
 
@@ -141,6 +148,23 @@ class Plugin(ScriptAdapterPlugin):
             lock = asyncio.Lock()
             self._upgrade_locks[script_id] = lock
         return lock
+
+    def _remote_stage_lock(self, script_id: str) -> asyncio.Lock:
+        lock = self._remote_stage_locks.get(script_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._remote_stage_locks[script_id] = lock
+        return lock
+
+    async def _run_remote_stage_locked(
+        self,
+        script_id: str,
+        operation: Callable[[], Awaitable[dict[str, Any]]],
+    ) -> dict[str, Any]:
+        """Serialize one script's remote fetch without taking the resource lock."""
+
+        async with self._remote_stage_lock(script_id):
+            return await operation()
 
     async def _run_upgrade_locked(
         self,
@@ -157,6 +181,231 @@ class Plugin(ScriptAdapterPlugin):
     ) -> dict[str, Any]:
         async with self._gateway().resource_transaction():
             return await operation()
+
+    async def _auto_update_before_run(
+        self,
+        script_id: str,
+        payload: Mapping[str, Any],
+        send_log: Callable[[str], None] | None,
+    ) -> dict[str, Any]:
+        """Discover, stage and safely apply a Managed resource update."""
+
+        def log(message: str) -> None:
+            if send_log is None:
+                return
+            try:
+                send_log(f"[MaaFW Managed] {message}")
+            except Exception:
+                # Runtime logging is observational and must not abort updates.
+                return
+
+        async def update() -> dict[str, Any]:
+            record = await _managed_script_record(script_id)
+            managed = _mapping(_record_config(record, "脚本").get("Managed"))
+            project_id, current_version = managed_project_identity(managed)
+            pending = _mapping(managed.get("PendingUpgrade"))
+            if pending:
+                pending_version = str(
+                    _mapping(pending.get("project")).get("toVersion") or ""
+                ).strip()
+                log(
+                    "已有待处理的托管资源升级计划"
+                    + (f"（目标 {pending_version}）" if pending_version else "")
+                    + "；本次继续使用当前版本"
+                )
+                return {
+                    "updated": False,
+                    "staged": True,
+                    "upgradePlan": _public_upgrade_plan(pending),
+                }
+            discovery = await self._discover_remote_project(script_id, payload)
+            public_discovery = _public_remote_discovery(discovery)
+            if discovery.get("updateAvailable") is not True:
+                log("运行前检查完成，当前托管资源已是最新版本")
+                return {
+                    "updated": False,
+                    "staged": False,
+                    "discovery": public_discovery,
+                }
+            if discovery.get("installable") is not True:
+                reason = str(
+                    discovery.get("unavailableReason")
+                    or discovery.get("message")
+                    or "远程来源没有可下载候选"
+                )
+                log(f"发现新版本但当前不可安装，继续使用现有版本：{reason}")
+                return {
+                    "updated": False,
+                    "staged": False,
+                    "discovery": public_discovery,
+                    "reason": reason,
+                }
+
+            latest_version = str(discovery.get("latestVersion") or "").strip()
+            log(f"发现托管资源新版本 {latest_version}，开始下载并生成安全升级计划")
+            staged = await self._download_and_import_remote(
+                script_id,
+                payload,
+                initial=False,
+            )
+            plan = _mapping(staged.get("upgradePlan"))
+            if (
+                plan.get("state") != "ready"
+                or plan.get("readyToApply") is not True
+                or plan.get("lossless") is not True
+                or bool(plan.get("errors"))
+                or bool(plan.get("manualActions"))
+            ):
+                log(
+                    f"新版本 {latest_version} 已导入，但配置需要人工确认；"
+                    "本次继续使用当前版本，可在“项目与依赖”中处理"
+                )
+                return {
+                    "updated": False,
+                    "staged": True,
+                    "discovery": public_discovery,
+                    "upgradePlan": plan,
+                }
+
+            transition_lease: dict[str, str] | None = None
+            async def apply_with_protection() -> dict[str, Any]:
+                nonlocal transition_lease
+                if project_id and current_version:
+                    transition_lease = (
+                        await self._acquire_auto_update_prewarm_lease(
+                            script_id,
+                            project_id,
+                            current_version,
+                        )
+                    )
+                try:
+                    return await self._apply_pending_upgrade_transaction(
+                        script_id,
+                        {
+                            "planId": str(plan.get("planId") or ""),
+                            "confirmation": str(
+                                plan.get("confirmationToken") or ""
+                            ),
+                        },
+                    )
+                except BaseException:
+                    if transition_lease is not None:
+                        await self._release_auto_update_prewarm_lease(
+                            transition_lease,
+                        )
+                        transition_lease = None
+                    raise
+
+            applied = await self._run_upgrade_locked(
+                script_id,
+                apply_with_protection,
+            )
+            applied_project = _mapping(applied.get("project"))
+            applied_version = str(
+                applied_project.get("version") or latest_version
+            ).strip()
+            log(f"托管资源自动更新完成，当前版本 {applied_version}")
+            result = {
+                "updated": True,
+                "staged": False,
+                "version": applied_version,
+                "discovery": public_discovery,
+                "result": applied,
+            }
+            if transition_lease is not None:
+                # The adapter owns this lease until the selected environment
+                # has been prewarmed.  Keep it private to this service result;
+                # callers must not persist it as script configuration.
+                result["_prewarmProjectLease"] = transition_lease
+            return result
+
+        # The adapter prewarms the newly selected runtime before collecting
+        # the old version, so successful automatic updates do not discard the
+        # previous resource before the selected environment has been checked.
+        return await self._run_remote_stage_locked(script_id, update)
+
+    async def _acquire_auto_update_prewarm_lease(
+        self,
+        script_id: str,
+        project_id: str,
+        version: str,
+    ) -> dict[str, str]:
+        lease_id = f"maafw-managed-auto-update-{uuid.uuid4().hex}"
+        gateway = self._gateway()
+        try:
+            await gateway.acquire_project_lease(
+                project_id,
+                version,
+                lease_id,
+                owner=f"maafw-managed-auto-update-prewarm:{script_id}",
+                ttl_seconds=_AUTO_UPDATE_PREWARM_LEASE_TTL_SECONDS,
+            )
+        except BaseException as exc:
+            # _invoke waits for a cancelled synchronous acquire worker to
+            # reach a terminal state, but it cannot return its result after
+            # re-raising CancelledError.  The lease id is known in advance;
+            # release it while the enclosing resource/script locks remain held.
+            try:
+                await gateway.release_project_lease(
+                    project_id,
+                    version,
+                    lease_id,
+                )
+            except BaseException as cleanup_exc:
+                exc.add_note(
+                    "MaaFW 自动更新过渡 lease 补偿未完成："
+                    f"{type(cleanup_exc).__name__}: {cleanup_exc}"
+                )
+            raise
+        return {
+            "projectId": project_id,
+            "version": version,
+            "leaseId": lease_id,
+        }
+
+    async def _release_auto_update_prewarm_lease(
+        self,
+        lease: Mapping[str, Any],
+    ) -> None:
+        project_id = str(lease.get("projectId") or "").strip()
+        version = str(lease.get("version") or "").strip() or None
+        lease_id = str(lease.get("leaseId") or "").strip()
+        if not project_id or not lease_id:
+            return
+        try:
+            await self._gateway().release_project_lease(
+                project_id,
+                version,
+                lease_id,
+            )
+        except Exception as exc:
+            self.ctx.logger.warning(
+                "MaaFW 自动更新过渡 lease 释放失败，"
+                f"将由 TTL 回收（{project_id}@{version or ''}/{lease_id}）：{exc}"
+            )
+
+    async def _collect_all_unreferenced_resources(self) -> dict[str, Any]:
+        return await self._collect_garbage_with_script_references(
+            {"graceDays": 0, "keepLatest": 0},
+            dry_run=False,
+            requesting_script_id="",
+        )
+
+    async def _run_upgrade_locked_then_collect(
+        self,
+        script_id: str,
+        operation: Callable[[], Awaitable[dict[str, Any]]],
+    ) -> dict[str, Any]:
+        result = await self._run_upgrade_locked(script_id, operation)
+        try:
+            result["garbageCollection"] = (
+                await self._collect_all_unreferenced_resources()
+            )
+        except Exception as exc:
+            self.ctx.logger.warning(
+                f"MaaFW 资源操作已提交，无引用资源回收暂未完成：{exc}"
+            )
+        return result
 
     @staticmethod
     async def _run_config_transaction(
@@ -210,6 +459,11 @@ class Plugin(ScriptAdapterPlugin):
             "/maafw-managed/capabilities",
             self._capabilities,
             methods=("GET", "POST"),
+        )
+        self.ctx.server.http(
+            "/maafw-managed/settings",
+            self._update_remote_settings,
+            methods=("POST",),
         )
         self.ctx.server.http(
             "/maafw-managed/progress",
@@ -313,6 +567,13 @@ class Plugin(ScriptAdapterPlugin):
         )
         await self._recover_interrupted_upgrades()
         await self._repair_upgrade_artifacts_on_start()
+        try:
+            await self._collect_all_unreferenced_resources()
+        except Exception as exc:
+            # Inventory and reference reconciliation fail closed. Startup must
+            # stay available so the project manager can expose and repair the
+            # damaged resource instead of hiding the whole Managed service.
+            self.ctx.logger.warning(f"MaaFW 启动时无引用资源回收暂未完成：{exc}")
         # Publish the service only after startup recovery has restored every
         # authoritative project/config transaction to a runnable state.
         self.ctx.set(MANAGED_ENVIRONMENT_SERVICE, self.environment_service)
@@ -357,6 +618,71 @@ class Plugin(ScriptAdapterPlugin):
             "status": "success",
             "data": data,
         }
+
+    async def _update_remote_settings(
+        self,
+        request: PluginHttpRequest,
+    ) -> dict[str, Any]:
+        payload = _payload(request)
+        channel = str(payload.get("channel") or "").strip().casefold()
+        if channel not in {"stable", "beta"}:
+            return {
+                "code": 400,
+                "status": "error",
+                "message": "托管项目更新渠道必须是 stable 或 beta",
+            }
+
+        async def persist(script_id: str) -> dict[str, Any]:
+            async def transaction() -> dict[str, Any]:
+                # _respond_for_script validates before waiting for the
+                # per-script lock. Revalidate after the config transaction
+                # is acquired so a concurrent type conversion cannot turn
+                # this into a cross-type ManagedRemote write.
+                await self._require_managed_script({"scriptId": script_id})
+                record = await _managed_script_record(script_id)
+                config = _record_config(record, f"脚本 {script_id}")
+                previous_channel = str(
+                    _mapping(config.get("ManagedRemote")).get("Channel") or ""
+                ).strip().casefold()
+                if previous_channel not in {"stable", "beta"}:
+                    previous_channel = "stable"
+                try:
+                    await Config.update_script(
+                        script_id,
+                        {"ManagedRemote": {"Channel": channel}},
+                    )
+                except BaseException as exc:
+                    # Host config transactions provide exclusion, not an
+                    # automatic in-memory rollback. Restore the prior channel
+                    # before surfacing a failed write so the HTTP result and
+                    # the live script record cannot disagree.
+                    try:
+                        await Config.update_script(
+                            script_id,
+                            {"ManagedRemote": {"Channel": previous_channel}},
+                        )
+                    except BaseException as rollback_exc:
+                        if isinstance(exc, asyncio.CancelledError):
+                            raise exc from rollback_exc
+                        raise ManagedServiceError(
+                            "项目更新渠道保存失败，且原渠道回滚未完成"
+                        ) from exc
+                    raise
+                return {"scriptId": script_id, "channel": channel}
+
+            return await self._run_remote_stage_locked(
+                script_id,
+                lambda: self._run_upgrade_locked(
+                    script_id,
+                    lambda: self._run_config_transaction(
+                        script_id,
+                        owner=f"maafw-remote-settings:{script_id}",
+                        operation=transaction,
+                    ),
+                ),
+            )
+
+        return await self._respond_for_script(payload, persist)
 
     async def _read_active_operation(
         self,
@@ -903,9 +1229,9 @@ class Plugin(ScriptAdapterPlugin):
                     record,
                     script_id,
                 )
-            if source_type != _SOURCE_TYPE:
+            if source_type not in _SOURCE_TYPES:
                 raise ManagedServiceError(
-                    f"scriptId {script_id} 不是普通 MaaFW 脚本，拒绝转换"
+                    f"scriptId {script_id} 不是受支持的 MaaFW/M9A 脚本，拒绝转换"
                 )
 
             raw_snapshot = snapshot_reader(script_id)
@@ -915,9 +1241,9 @@ class Plugin(ScriptAdapterPlugin):
                 raw_snapshot,
                 script_id,
             )
-            if _snapshot_script_type(snapshot) != _SOURCE_TYPE:
+            if _snapshot_script_type(snapshot) != source_type:
                 raise ManagedServiceError(
-                    "宿主转换快照中的 source type 不是 MaaFW，拒绝导入资源"
+                    "宿主转换快照中的 source type 与当前脚本不一致，拒绝导入资源"
                 )
 
             source_config = _conversion_form_config(
@@ -928,17 +1254,23 @@ class Plugin(ScriptAdapterPlugin):
             source_path = str(source_info.get("Path") or "").strip()
             if not source_path:
                 raise ManagedServiceError(
-                    "普通 MaaFW 脚本没有配置 Info.Path"
+                    "MaaFW/M9A 源脚本没有配置 Info.Path"
                 )
-            if not Path(source_path).is_dir():
+            if not await ManagedServiceGateway.invoke(
+                Path(source_path).is_dir,
+                (),
+                {},
+                "校验 MaaFW/M9A 项目目录",
+            ):
                 raise ManagedServiceError(
-                    f"普通 MaaFW 项目目录不存在或不可读：{source_path}"
+                    f"MaaFW/M9A 项目目录不存在或不可读：{source_path}"
                 )
 
             user_records = await Config.get_user_records(script_id)
             target_user_configs = _conversion_user_configs(
                 snapshot,
                 user_records,
+                source_type=source_type,
             )
 
         project_reservation = await try_reserve_project_path(source_path)
@@ -965,6 +1297,7 @@ class Plugin(ScriptAdapterPlugin):
                         script_id,
                         payload,
                         snapshot=snapshot,
+                        source_type=source_type,
                         source_config=source_config,
                         source_path=source_path,
                         target_user_configs=target_user_configs,
@@ -981,6 +1314,7 @@ class Plugin(ScriptAdapterPlugin):
         payload: Mapping[str, Any],
         *,
         snapshot: Mapping[str, Any],
+        source_type: str,
         source_config: Mapping[str, Any],
         source_path: str,
         target_user_configs: Mapping[str, Mapping[str, Any]],
@@ -1017,7 +1351,7 @@ class Plugin(ScriptAdapterPlugin):
         }
         await self._progress_stage(
             "project-import",
-            "正在导入不可变项目资源",
+            "正在导入受版本保护的项目资源",
             percent=35,
         )
         project = await gateway.import_project(import_payload)
@@ -1062,7 +1396,7 @@ class Plugin(ScriptAdapterPlugin):
             "kind": _CONVERSION_KIND,
             "operationId": operation_id,
             "scriptId": script_id,
-            "sourceType": _SOURCE_TYPE,
+            "sourceType": source_type,
             "targetType": _TARGET_TYPE,
             "sourceFingerprint": source_fingerprint,
             "projectReference": reference,
@@ -1080,7 +1414,7 @@ class Plugin(ScriptAdapterPlugin):
             _project_form_update(
                 project,
                 import_payload,
-                status="普通 MaaFW 项目已原地转换为托管项目",
+                status="MaaFW/M9A 项目已原地转换为托管项目",
             ),
         )
         target_script_config.setdefault("Managed", {})[
@@ -1099,7 +1433,7 @@ class Plugin(ScriptAdapterPlugin):
             ):
                 host_result = converter(
                     script_id,
-                    source_type=_SOURCE_TYPE,
+                    source_type=source_type,
                     target_type=_TARGET_TYPE,
                     expected_snapshot=snapshot,
                     target_script_config=target_script_config,
@@ -1127,6 +1461,7 @@ class Plugin(ScriptAdapterPlugin):
                 script_id,
                 operation_id,
                 expected_snapshot=snapshot,
+                source_type=source_type,
                 snapshot_reader=snapshot_reader,
             )
             if commit_state == "committed":
@@ -1135,6 +1470,7 @@ class Plugin(ScriptAdapterPlugin):
                     project,
                     source_config,
                     target_user_configs,
+                    source_type=source_type,
                     host_result={
                         "converted": True,
                         "recovered": True,
@@ -1160,6 +1496,7 @@ class Plugin(ScriptAdapterPlugin):
             project,
             source_config,
             target_user_configs,
+            source_type=source_type,
             host_result=dict(host_result),
         )
 
@@ -1170,6 +1507,7 @@ class Plugin(ScriptAdapterPlugin):
         source_config: Mapping[str, Any],
         source_user_configs: Mapping[str, Mapping[str, Any]],
         *,
+        source_type: str,
         host_result: Mapping[str, Any],
     ) -> dict[str, Any]:
         await self._progress_stage(
@@ -1213,7 +1551,7 @@ class Plugin(ScriptAdapterPlugin):
             "idempotent": bool(host_result.get("idempotent", False)),
             "recovered": bool(host_result.get("recovered", False)),
             "scriptId": script_id,
-            "fromType": _SOURCE_TYPE,
+            "fromType": source_type,
             "toType": _TARGET_TYPE,
             "project": dict(project),
             "userIds": converted_user_ids,
@@ -1227,7 +1565,7 @@ class Plugin(ScriptAdapterPlugin):
         payload = _payload(request)
         return await self._respond_for_script(
             payload,
-            lambda script_id: self._run_upgrade_locked(
+            lambda script_id: self._run_remote_stage_locked(
                 script_id,
                 lambda: self._check_remote_project_locked(script_id, payload),
             ),
@@ -1240,7 +1578,15 @@ class Plugin(ScriptAdapterPlugin):
         script_id: str,
         payload: Mapping[str, Any],
     ) -> dict[str, Any]:
-        discovery = await self._discover_remote_project(script_id, payload)
+        # MirrorChyan exposes version metadata without a CDK.  Only the
+        # download/apply path must fail closed when the candidate needs a
+        # credential; letting discovery run here keeps the latest version
+        # visible and gives the UI the provider's real install requirement.
+        discovery = await self._discover_remote_project(
+            script_id,
+            payload,
+            allow_missing_cdk=True,
+        )
         public_discovery = _public_remote_discovery(discovery)
 
         async def persist() -> dict[str, Any]:
@@ -1264,7 +1610,7 @@ class Plugin(ScriptAdapterPlugin):
         payload = _payload(request)
         return await self._respond_for_script(
             payload,
-            lambda script_id: self._run_upgrade_locked(
+            lambda script_id: self._run_remote_stage_locked(
                 script_id,
                 lambda: self._download_and_import_remote(
                     script_id,
@@ -1283,7 +1629,7 @@ class Plugin(ScriptAdapterPlugin):
         payload = _payload(request)
         return await self._respond_for_script(
             payload,
-            lambda script_id: self._run_upgrade_locked(
+            lambda script_id: self._run_remote_stage_locked(
                 script_id,
                 lambda: self._download_and_import_remote(
                     script_id,
@@ -1316,6 +1662,19 @@ class Plugin(ScriptAdapterPlugin):
                 or "远程来源没有可下载候选"
             )
             raise ManagedServiceError(reason)
+
+        # Capture the authoritative binding after discovery has established a
+        # concrete candidate.  The commit phase re-reads it under the
+        # resource/config transaction and refuses to import a package produced
+        # for a stale script state.  Keeping this read after the cheap
+        # non-installable path also lets callers report discovery failures
+        # without requiring a live Managed script record.
+        snapshot_record = await _managed_script_record(script_id)
+        snapshot_config = _record_config(snapshot_record, f"脚本 {script_id}")
+        snapshot_managed = _mapping(snapshot_config.get("Managed"))
+        snapshot_project_id, snapshot_version = managed_project_identity(
+            snapshot_managed
+        )
 
         download_root = Path.cwd() / "data" / "maafw-managed" / "downloads"
         await self._progress_stage(
@@ -1353,13 +1712,43 @@ class Plugin(ScriptAdapterPlugin):
                 "sourcePath": "",
                 "sourceArchive": str(downloaded.get("path") or ""),
                 "version": str(candidate.get("version") or "").strip(),
+                "remoteSource": _mapping(discovery.get("_remoteAuthority")),
             }
         )
+        if not imported_payload["remoteSource"]:
+            raise ManagedServiceError("远程发现结果缺少不可变来源身份")
 
         async def persist() -> dict[str, Any]:
+            current_record = await _managed_script_record(script_id)
+            current_config = _record_config(
+                current_record,
+                f"脚本 {script_id}",
+            )
+            current_managed = _mapping(current_config.get("Managed"))
+            current_project_id, current_version = managed_project_identity(
+                current_managed
+            )
+            discovered_version = str(
+                discovery.get("currentVersion") or ""
+            ).strip()
+            if (current_project_id, current_version) != (
+                snapshot_project_id,
+                snapshot_version,
+            ):
+                raise ManagedServiceError(
+                    "远程资源下载期间脚本绑定已变化，已放弃导入；请重新检查更新"
+                )
+            if (
+                not initial
+                and discovered_version
+                and discovered_version != snapshot_version
+            ):
+                raise ManagedServiceError(
+                    "远程资源发现结果已过期，当前项目版本发生变化；请重新检查更新"
+                )
             await self._progress_stage(
                 "project-import",
-                "正在导入不可变项目资源",
+                "正在导入受版本保护的项目资源",
                 percent=70,
             )
             if initial:
@@ -1394,14 +1783,17 @@ class Plugin(ScriptAdapterPlugin):
         cancellation_requested = False
         committed = False
         try:
-            result = await self._run_config_transaction(
+            result = await self._run_upgrade_locked(
                 script_id,
-                (
-                    f"maafw-remote-import:{script_id}"
-                    if initial
-                    else f"maafw-remote-stage:{script_id}"
+                lambda: self._run_config_transaction(
+                    script_id,
+                    (
+                        f"maafw-remote-import:{script_id}"
+                        if initial
+                        else f"maafw-remote-stage:{script_id}"
+                    ),
+                    persist,
                 ),
-                persist,
             )
             committed = True
         finally:
@@ -1439,34 +1831,85 @@ class Plugin(ScriptAdapterPlugin):
         self,
         script_id: str,
         payload: Mapping[str, Any],
+        *,
+        allow_missing_cdk: bool = False,
     ) -> dict[str, Any]:
         record = await _managed_script_record(script_id)
         config = _record_config(record, "脚本")
         managed = _mapping(config.get("Managed"))
         project_id, version = managed_project_identity(managed)
         gateway = self._gateway()
+        source_payload = dict(payload)
+        configured_channel = str(
+            _mapping(config.get("ManagedRemote")).get("Channel") or ""
+        ).strip().casefold()
+        source_payload["channel"] = (
+            configured_channel
+            if configured_channel in {"stable", "beta"}
+            else "stable"
+        )
+        authoritative_interface: Any = None
+        authoritative_summary: Any = None
+        if bool(project_id) != bool(version):
+            raise ManagedServiceError(
+                "当前托管脚本的项目 ID 与版本绑定不完整；请先修复脚本配置"
+            )
         if project_id and version:
             project = await gateway.resolve_project(project_id, version)
+            authoritative_summary = project.get("summary")
             interface = await gateway.load_interface(_project_data_path(project))
+            interface = _merge_remote_interface_authority(
+                interface,
+                authoritative_summary,
+            )
+            authoritative_interface = interface
             current_version = str(project.get("version") or version)
             mode = "upgrade"
+            source_config = _remote_source_config(
+                source_payload,
+                interface=authoritative_interface,
+                summary=authoritative_summary,
+                require_cdk=not allow_missing_cdk,
+            )
         else:
-            requested_project_id = str(payload.get("projectId") or "").strip()
+            configured_project_id = str(
+                managed.get("ImportProjectId") or ""
+            ).strip()
+            payload_project_id = str(payload.get("projectId") or "").strip()
+            if (
+                payload_project_id
+                and configured_project_id
+                and payload_project_id != configured_project_id
+            ):
+                raise ManagedServiceError(
+                    "首次远程导入的项目 ID 与脚本中的 ImportProjectId 不一致"
+                )
+            requested_project_id = payload_project_id or configured_project_id
             if not requested_project_id:
                 raise ManagedServiceError(
                     "首次远程导入前请填写 ImportProjectId"
                 )
-            interface = _remote_probe_interface(payload, requested_project_id)
+            source_config = _remote_source_config(
+                source_payload,
+                require_cdk=not allow_missing_cdk,
+            )
+            interface = _remote_probe_interface(source_config, requested_project_id)
             current_version = "0.0.0"
             mode = "initial"
 
+        remote_authority = _remote_source_authority(
+            source_config,
+            interface,
+            authoritative_summary,
+        )
         discovery = await gateway.discover_remote_update(
             interface,
             current_version=current_version,
-            source_config=_remote_source_config(payload),
+            source_config=source_config,
         )
         if discovery is None:
             return {
+                "_remoteAuthority": remote_authority,
                 "mode": mode,
                 "currentVersion": current_version,
                 "latestVersion": current_version if mode == "upgrade" else "",
@@ -1496,6 +1939,7 @@ class Plugin(ScriptAdapterPlugin):
             or ""
         ).strip()
         return {
+            "_remoteAuthority": remote_authority,
             "mode": mode,
             "currentVersion": current_version,
             "latestVersion": latest_version,
@@ -1709,7 +2153,7 @@ class Plugin(ScriptAdapterPlugin):
         payload = _payload(request)
         return await self._respond_for_script(
             payload,
-            lambda script_id: self._run_upgrade_locked(
+            lambda script_id: self._run_upgrade_locked_then_collect(
                 script_id,
                 lambda: self._apply_pending_upgrade_transaction(
                     script_id,
@@ -1724,7 +2168,7 @@ class Plugin(ScriptAdapterPlugin):
         payload = _payload(request)
         return await self._respond_for_script(
             payload,
-            lambda script_id: self._run_upgrade_locked(
+            lambda script_id: self._run_upgrade_locked_then_collect(
                 script_id,
                 lambda: self._cancel_pending_upgrade_transaction(script_id),
             ),
@@ -1790,7 +2234,7 @@ class Plugin(ScriptAdapterPlugin):
         request["currentVersion"] = current_version
         await self._progress_stage(
             "project-import",
-            "正在导入不可变升级资源",
+            "正在导入受版本保护的升级资源",
             percent=40,
         )
         result = await self._gateway().upgrade_project(request)
@@ -1837,9 +2281,9 @@ class Plugin(ScriptAdapterPlugin):
             managed.get("ImportProjectId") or ""
         ).strip()
         requested_project_id = str(payload.get("projectId") or "").strip()
-        if not requested_project_id:
-            raise ManagedServiceError("请填写首次导入项目 ID")
         if (
+            requested_project_id
+            and
             configured_project_id
             and configured_project_id != requested_project_id
         ):
@@ -1847,9 +2291,14 @@ class Plugin(ScriptAdapterPlugin):
                 "首次导入的项目 ID 与脚本中的 ImportProjectId 不一致"
             )
         request = _with_project_reference(payload, script_id)
+        if configured_project_id and not requested_project_id:
+            # A legacy script may have stored ImportProjectId without putting
+            # it in the current form payload. Preserve that explicit binding;
+            # otherwise Project Store derives the ID from ProjectInterface.
+            request["projectId"] = configured_project_id
         await self._progress_stage(
             "project-import",
-            "正在导入不可变项目资源",
+            "正在导入受版本保护的项目资源",
             percent=40,
         )
         result = await self._gateway().import_project(request)
@@ -1992,28 +2441,6 @@ class Plugin(ScriptAdapterPlugin):
         if not project_id:
             raise ManagedServiceError("待升级资源缺少 projectId")
 
-        registry = self.ctx.get("maafw.registry.v1")
-        get_pack = getattr(registry, "get_project_pack", None)
-        if not callable(get_pack):
-            raise ManagedServiceError("maafw.registry.v1 未提供 project pack 查询")
-        definition = get_pack(project_id)
-        definition_data = _mapping(definition)
-        service_key = str(
-            definition_data.get("resource_service_key")
-            or definition_data.get("resourceServiceKey")
-            or ""
-        ).strip()
-        if not service_key:
-            raise ManagedServiceError(
-                f"项目 pack {project_id} 未声明 resource_service_key"
-            )
-        service = self.ctx.get(service_key)
-        planner = getattr(service, "plan_resource_upgrade", None)
-        if not callable(planner):
-            raise ManagedServiceError(
-                f"{service_key} 未实现 plan_resource_upgrade"
-            )
-
         records = await Config.get_script_records(script_id)
         if len(records) != 1:
             raise ManagedServiceError(
@@ -2025,6 +2452,76 @@ class Plugin(ScriptAdapterPlugin):
         to_version = str(project.get("version") or "").strip()
         if not from_version or not to_version:
             raise ManagedServiceError("升级项目缺少来源或目标版本")
+
+        registry = self.ctx.get("maafw.registry.v1")
+        get_pack = getattr(registry, "get_project_pack", None)
+        definition = get_pack(project_id) if callable(get_pack) else None
+        definition_data = _mapping(definition)
+        service_key = str(
+            definition_data.get("resource_service_key")
+            or definition_data.get("resourceServiceKey")
+            or ""
+        ).strip()
+        if service_key:
+            service = self.ctx.get(service_key)
+            planner = getattr(service, "plan_resource_upgrade", None)
+            if not callable(planner):
+                raise ManagedServiceError(
+                    f"{service_key} 未实现 plan_resource_upgrade"
+                )
+            mode = str(
+                definition_data.get("resource_upgrade_mode")
+                or definition_data.get("resourceUpgradeMode")
+                or "plan-only"
+            ).strip()
+        elif definition_data:
+            raise ManagedServiceError(
+                f"项目 pack {project_id} 未声明 resource_service_key"
+            )
+        else:
+            old_interface = await self._gateway().load_interface(old_path)
+            new_interface = await self._gateway().load_interface(new_path)
+            compatible = (
+                _interface_config_surface(old_interface)
+                == _interface_config_surface(new_interface)
+            )
+            service_key = "maafw.managed.compatibility.v1"
+            mode = "identity-if-interface-compatible"
+
+            async def planner(
+                _old_path: str,
+                _new_path: str,
+                config: Mapping[str, Any],
+            ) -> dict[str, Any]:
+                return {
+                    "schemaVersion": 1,
+                    "kind": "maafw.resource-upgrade-plan",
+                    "projectId": project_id,
+                    "fromVersion": from_version,
+                    "toVersion": to_version,
+                    "config": dict(config),
+                    "readyToApply": compatible,
+                    "lossless": True,
+                    "manualActions": (
+                        []
+                        if compatible
+                        else [
+                            {
+                                "kind": "review-interface-change",
+                                "message": (
+                                    "新旧 ProjectInterface 配置结构不同，"
+                                    "请在项目与依赖中确认配置迁移"
+                                ),
+                            }
+                        ]
+                    ),
+                    "warnings": (
+                        []
+                        if compatible
+                        else ["未自动切换存在配置结构变化的通用 MaaFW 项目"]
+                    ),
+                }
+
         scopes = [
             await self._plan_upgrade_record(
                 planner,
@@ -2079,11 +2576,6 @@ class Plugin(ScriptAdapterPlugin):
                 if isinstance(warning, str) and warning.strip():
                     warnings.append({**scope_data, "message": warning.strip()})
 
-        mode = str(
-            definition_data.get("resource_upgrade_mode")
-            or definition_data.get("resourceUpgradeMode")
-            or "plan-only"
-        ).strip()
         ready = (
             not errors
             and not manual_actions
@@ -2202,17 +2694,12 @@ class Plugin(ScriptAdapterPlugin):
         new_path: str,
         config: Mapping[str, Any],
     ) -> dict[str, Any]:
-        if inspect.iscoroutinefunction(planner):
-            plan = await planner(old_path, new_path, dict(config))
-        else:
-            plan = await asyncio.to_thread(
-                planner,
-                old_path,
-                new_path,
-                dict(config),
-            )
-            if inspect.isawaitable(plan):
-                plan = await plan
+        plan = await ManagedServiceGateway.invoke(
+            planner,
+            (old_path, new_path, dict(config)),
+            {},
+            f"{service_key}.plan_resource_upgrade",
+        )
         if not isinstance(plan, Mapping):
             raise ManagedServiceError(
                 f"{service_key}.plan_resource_upgrade 必须返回 JSON object"
@@ -2470,7 +2957,7 @@ class Plugin(ScriptAdapterPlugin):
                     **_cleared_pending_upgrade(),
                     "Status": (
                         f"已取消切换到 {pending_version}；"
-                        "导入的不可变版本仍保留，可稍后重新选择或删除"
+                        "导入的项目版本仍保留，可稍后重新选择或删除"
                     ),
                 }
             },
@@ -2916,27 +3403,40 @@ class Plugin(ScriptAdapterPlugin):
 
     async def _pin(self, request: PluginHttpRequest) -> dict[str, Any]:
         payload = _payload(request)
-        return await self._respond_for_script(
-            payload,
-            lambda _script_id: self._run_resource_locked(
-                lambda: self._gateway().pin(payload)
-            ),
-            after_success=lambda script_id, data: Config.update_script(
+        pinned = _as_bool(payload.get("pinned"), True)
+
+        async def persist(script_id: str, _data: Any) -> None:
+            await Config.update_script(
                 script_id,
                 {
                     "Managed": {
                         "Status": (
                             "项目与运行时已固定"
-                            if _as_bool(payload.get("pinned"), True)
+                            if pinned
                             else "项目与运行时已取消固定"
                         )
                     }
                 },
+            )
+            if pinned:
+                return
+            try:
+                await self._collect_all_unreferenced_resources()
+            except Exception as exc:
+                self.ctx.logger.warning(
+                    f"MaaFW 资源已取消固定，无引用资源回收暂未完成：{exc}"
+                )
+
+        return await self._respond_for_script(
+            payload,
+            lambda _script_id: self._run_resource_locked(
+                lambda: self._gateway().pin(payload)
             ),
+            after_success=persist,
             progress_operation="pin",
             progress_message=(
                 "正在固定资源"
-                if _as_bool(payload.get("pinned"), True)
+                if pinned
                 else "正在取消固定"
             ),
         )
@@ -2973,7 +3473,7 @@ class Plugin(ScriptAdapterPlugin):
                         "Status": (
                             "空间回收预览已完成"
                             if dry_run
-                            else "过期项目与运行时已回收"
+                            else "无引用项目与运行时已回收"
                         )
                     }
                 },
@@ -2982,7 +3482,7 @@ class Plugin(ScriptAdapterPlugin):
             progress_message=(
                 "正在预览空间回收"
                 if dry_run
-                else "正在回收过期资源"
+                else "正在回收无引用资源"
             ),
         )
 
@@ -3082,8 +3582,8 @@ class Plugin(ScriptAdapterPlugin):
                     )
                 return await gateway.collect_garbage(
                     dry_run=dry_run,
-                    grace_days=_as_int(payload.get("graceDays"), 30),
-                    keep_latest=_as_int(payload.get("keepLatest"), 2),
+                    grace_days=_as_int(payload.get("graceDays"), 0),
+                    keep_latest=_as_int(payload.get("keepLatest"), 0),
                     project_id=(
                         str(payload.get("projectId") or "").strip() or None
                     ),
@@ -3215,7 +3715,7 @@ class Plugin(ScriptAdapterPlugin):
         )
         await self._refresh_project_versions_and_references(
             script_id,
-            str(project.get("projectId") or payload.get("projectId") or ""),
+            str(update["Managed"]["ProjectId"]),
         )
 
     @staticmethod
@@ -3473,6 +3973,14 @@ def _managed_capabilities() -> dict[str, Any]:
         getattr(Config, "convert_plugin_script_type", None)
     )
     in_place_conversion = snapshot_available and conversion_available
+    remote_settings_available = all(
+        callable(getattr(Config, name, None))
+        for name in (
+            "get_script_records",
+            "script_config_transaction",
+            "update_script",
+        )
+    )
     return {
         "apiVersion": _CONVERSION_API_VERSION,
         "distributionVersion": _distribution_version(),
@@ -3483,6 +3991,7 @@ def _managed_capabilities() -> dict[str, Any]:
             "projectOverview": True,
             "localImport": True,
             "remoteImport": True,
+            "remoteSettings": remote_settings_available,
             "upgradePlans": True,
             "runtimeManagement": True,
             "pinning": True,
@@ -3496,6 +4005,7 @@ def _managed_capabilities() -> dict[str, Any]:
         "hostApis": {
             "conversionSnapshot": snapshot_available,
             "atomicTypeConversion": conversion_available,
+            "managedRemoteSettings": remote_settings_available,
         },
     }
 
@@ -3658,6 +4168,8 @@ def _conversion_form_config(
 def _conversion_user_configs(
     snapshot: Mapping[str, Any],
     records: list[Any],
+    *,
+    source_type: str,
 ) -> dict[str, dict[str, Any]]:
     user_order = [str(item) for item in snapshot.get("userOrder") or []]
     record_ids = [
@@ -3670,9 +4182,9 @@ def _conversion_user_configs(
         )
     result: dict[str, dict[str, Any]] = {}
     for record, user_id in zip(records, user_order, strict=True):
-        if str(_record_field(record, "type") or "").strip() != _SOURCE_TYPE:
+        if str(_record_field(record, "type") or "").strip() != source_type:
             raise ManagedServiceError(
-                f"用户 {user_id} 不是 MaaFW 配置，拒绝混合类型转换"
+                f"用户 {user_id} 不是 {source_type} 配置，拒绝混合类型转换"
             )
         result[user_id] = _conversion_form_config(
             _record_config(record, f"用户 {user_id}"),
@@ -3687,10 +4199,21 @@ def _conversion_project_id(
     interface: Mapping[str, Any],
     source_path: str,
 ) -> str:
-    project_id = str(
-        payload.get("projectId")
+    requested = str(payload.get("projectId") or "").strip()
+    declared = str(
+        interface.get("projectId")
+        or interface.get("project_id")
         or interface.get("name")
-        or source_info.get("ProjectLabel")
+        or ""
+    ).strip()
+    if declared and requested and declared != requested:
+        raise ManagedServiceError(
+            "请求中的项目 ID 与 ProjectInterface 声明的项目身份不一致"
+        )
+    project_id = (
+        declared
+        or requested
+        or str(source_info.get("ProjectLabel") or "").strip()
         or Path(source_path).name
         or ""
     ).strip()
@@ -3734,7 +4257,7 @@ def _assert_conversion_script_preserved(
             info.pop("ProjectLabel", None)
     if converted_base != source_base:
         raise ManagedServiceError(
-            "转换后普通 MaaFW 脚本配置发生了非资源身份变更"
+            "转换后 MaaFW/M9A 脚本配置发生了非资源身份变更"
         )
 
 
@@ -3754,13 +4277,18 @@ async def _committed_conversion_response(
         raise ManagedServiceError(
             f"scriptId {script_id} 已是 MaaFWManaged，且没有可验证的转换 marker"
         )
+    source_type = str(journal.get("sourceType") or "").strip()
+    if source_type not in _SOURCE_TYPES:
+        raise ManagedServiceError(
+            f"scriptId {script_id} 的转换 marker source type 不受支持"
+        )
     users = await Config.get_user_records(script_id)
     return {
         "converted": False,
         "idempotent": True,
         "recovered": False,
         "scriptId": script_id,
-        "fromType": _SOURCE_TYPE,
+        "fromType": source_type,
         "toType": _TARGET_TYPE,
         "project": {
             "projectId": str(managed.get("ProjectId") or ""),
@@ -3778,6 +4306,7 @@ async def _conversion_commit_state(
     operation_id: str,
     *,
     expected_snapshot: Mapping[str, Any],
+    source_type: str,
     snapshot_reader: Callable[..., Any],
 ) -> str:
     try:
@@ -3804,7 +4333,7 @@ async def _conversion_commit_state(
         ):
             return "committed"
         return "unknown"
-    if record_type != _SOURCE_TYPE:
+    if record_type != source_type:
         return "unknown"
     try:
         current = snapshot_reader(script_id)
@@ -3882,60 +4411,337 @@ def _sanitize_public_value(value: Any) -> Any:
     return value
 
 
-def _remote_source_config(payload: Mapping[str, Any]) -> dict[str, Any]:
-    source = str(payload.get("source") or "").strip().casefold()
+def _remote_object_mapping(value: Any) -> dict[str, Any]:
+    if isinstance(value, Mapping):
+        return dict(value)
+    serializer = getattr(value, "model_dump", None)
+    if not callable(serializer):
+        return {}
+    try:
+        dumped = serializer(mode="json", by_alias=True)
+    except TypeError:
+        try:
+            dumped = serializer()
+        except Exception:
+            return {}
+    except Exception:
+        return {}
+    return dict(dumped) if isinstance(dumped, Mapping) else {}
+
+
+def _remote_authority_sources(
+    interface: Any,
+    summary: Any,
+) -> tuple[dict[str, Any], ...]:
+    sources: list[dict[str, Any]] = []
+    nested_keys = (
+        "project",
+        "projectInterface",
+        "project_interface",
+        "remote",
+        "sourceConfig",
+        "source_config",
+        "update",
+    )
+    for value in (interface, summary):
+        source = _remote_object_mapping(value)
+        if not source:
+            continue
+        sources.append(source)
+        for key in nested_keys:
+            nested = _remote_object_mapping(source.get(key))
+            if nested:
+                sources.append(nested)
+    return tuple(sources)
+
+
+def _remote_authority_text(
+    interface: Any,
+    summary: Any,
+    keys: tuple[str, ...],
+) -> str:
+    for source in _remote_authority_sources(interface, summary):
+        for key in keys:
+            value = source.get(key)
+            if isinstance(value, str):
+                text = value.strip()
+            elif isinstance(value, (int, float)) and not isinstance(value, bool):
+                text = str(value).strip()
+            else:
+                text = ""
+            if text:
+                return text
+    return ""
+
+
+def _remote_authority_bool(
+    interface: Any,
+    summary: Any,
+    keys: tuple[str, ...],
+) -> bool | None:
+    for source in _remote_authority_sources(interface, summary):
+        for key in keys:
+            value = source.get(key)
+            if isinstance(value, bool):
+                return value
+    return None
+
+
+def _merge_remote_interface_authority(
+    interface: Any,
+    summary: Any,
+) -> dict[str, Any]:
+    result = _remote_object_mapping(interface)
+    if not result:
+        return result
+    for canonical, keys in (
+        (
+            "github",
+            ("github", "githubRepo", "github_repo", "GitHubRepo"),
+        ),
+        (
+            "mirrorchyan_rid",
+            (
+                "mirrorchyan_rid",
+                "mirrorChyanRid",
+                "mirrorchyanRid",
+                "MirrorChyanRID",
+            ),
+        ),
+    ):
+        if not _remote_authority_text(result, None, keys):
+            value = _remote_authority_text(interface, summary, keys)
+            if value:
+                result[canonical] = value
+    if _remote_authority_bool(result, None, ("mirrorchyan_multiplatform",)) is None:
+        value = _remote_authority_bool(
+            interface,
+            summary,
+            (
+                "mirrorchyan_multiplatform",
+                "mirrorChyanMultiplatform",
+                "mirrorchyanMultiplatform",
+            ),
+        )
+        if value is not None:
+            result["mirrorchyan_multiplatform"] = value
+    return result
+
+
+def _remote_source_config(
+    payload: Mapping[str, Any],
+    *,
+    interface: Any = None,
+    summary: Any = None,
+    require_cdk: bool = True,
+) -> dict[str, Any]:
+    try:
+        configured_source = str(
+            Config.get("Update", "Source") or ""
+        ).strip()
+    except Exception as exc:
+        raise ManagedServiceError(
+            "读取 AUTO-MAS 全局更新来源失败"
+        ) from exc
+    source = configured_source.casefold()
+    if source in {"autosite", "cnb"}:
+        raise ManagedServiceError(
+            f"AUTO-MAS 全局更新来源 {configured_source} 不支持 MaaFW 托管远程资源；"
+            "请在项目管理页顶部保存 MirrorChyan 或 GitHub"
+        )
+    if source not in {
+        "mirrorchyan",
+        "mirror_chyan",
+        "mirror酱",
+        "github",
+        "github_release",
+    }:
+        raise ManagedServiceError(
+            "AUTO-MAS 全局更新来源必须先保存为 MirrorChyan 或 GitHub"
+        )
+    channel = str(payload.get("channel") or "").strip().casefold()
+    if channel not in {"stable", "beta"}:
+        channel = "stable"
+    bound = interface is not None or summary is not None
     if source in {"github", "github_release"}:
-        return {
+        repo = _remote_authority_text(
+            interface,
+            summary,
+            ("github", "githubRepo", "github_repo", "GitHubRepo"),
+        )
+        if not bound:
+            repo = str(payload.get("githubRepo") or "").strip()
+        if not repo:
+            raise ManagedServiceError(
+                "当前不可变 ProjectInterface 未声明 GitHub 仓库"
+                if bound
+                else "首次 GitHub 导入需要 owner/repository"
+            )
+        result: dict[str, Any] = {
             "source": "github_release",
-            "repo": str(payload.get("githubRepo") or "").strip(),
-            "tag": str(payload.get("githubTag") or "").strip(),
-            "asset_pattern": str(
-                payload.get("githubAssetPattern") or r"\.zip$"
-            ).strip(),
-            "channel": str(payload.get("channel") or "stable").strip(),
+            "repo": repo,
+            "channel": channel,
         }
+        tag = _remote_authority_text(
+            interface,
+            summary,
+            ("github_tag", "githubTag", "GitHubTag"),
+        )
+        asset_pattern = _remote_authority_text(
+            interface,
+            summary,
+            (
+                "github_asset_pattern",
+                "githubAssetPattern",
+                "GitHubAssetPattern",
+                "asset_pattern",
+                "assetPattern",
+            ),
+        )
+        if not bound:
+            tag = str(payload.get("githubTag") or "").strip()
+            asset_pattern = str(payload.get("githubAssetPattern") or "").strip()
+        if tag:
+            result["tag"] = tag
+        if asset_pattern:
+            result["asset_pattern"] = asset_pattern
+        shell_hint = _remote_project_shell_hint(summary)
+        if shell_hint:
+            result["project_shell_hint"] = shell_hint
+        return result
     if source in {"mirrorchyan", "mirror_chyan", "mirror酱"}:
-        explicit_cdk = str(payload.get("mirrorChyanCDK") or "").strip()
-        inherited_cdk = ""
-        if not explicit_cdk:
-            try:
-                inherited_cdk = str(
-                    Config.get("Update", "MirrorChyanCDK") or ""
-                ).strip()
-            except Exception as exc:
-                raise ManagedServiceError(
-                    "读取 AUTO-MAS 全局 MirrorChyan CDK 失败"
-                ) from exc
-        return {
+        rid = _remote_authority_text(
+            interface,
+            summary,
+            (
+                "mirrorchyan_rid",
+                "mirrorChyanRid",
+                "mirrorchyanRid",
+                "MirrorChyanRID",
+            ),
+        )
+        if bound and not rid:
+            raise ManagedServiceError(
+                "当前不可变 ProjectInterface 未声明 MirrorChyan RID"
+            )
+        try:
+            global_cdk = str(
+                Config.get("Update", "MirrorChyanCDK") or ""
+            ).strip()
+        except Exception as exc:
+            raise ManagedServiceError(
+                "读取 AUTO-MAS 全局 MirrorChyan CDK 失败"
+            ) from exc
+        if require_cdk and not global_cdk:
+            raise ManagedServiceError(
+                "MirrorChyan 远程操作需要 AUTO-MAS 全局 CDK；"
+                "也可以改用 GitHub"
+            )
+        result = {
             "source": "mirrorchyan",
-            "cdk": explicit_cdk or inherited_cdk,
-            "channel": str(payload.get("channel") or "stable").strip(),
+            "cdk": global_cdk,
+            "channel": channel,
         }
-    raise ManagedServiceError("远程来源必须是 MirrorChyan 或 GitHub")
+        if not bound:
+            rid = str(payload.get("mirrorChyanRid") or "").strip()
+            if rid:
+                result["rid"] = rid
+        return result
+    raise AssertionError("unreachable managed update source")
+
+
+def _remote_project_shell_hint(summary: Any) -> str:
+    summary_value = _remote_object_mapping(summary)
+    shells = _remote_object_mapping(summary_value.get("shells"))
+    families = shells.get("families")
+    if not isinstance(families, Sequence) or isinstance(
+        families,
+        (str, bytes, bytearray),
+    ):
+        return ""
+    supported = {
+        str(item).strip()
+        for item in families
+        if str(item).strip().casefold() in {"mfaavalonia", "mxu", "cfa", "mfw"}
+    }
+    return next(iter(supported)) if len(supported) == 1 else ""
 
 
 def _remote_probe_interface(
-    payload: Mapping[str, Any],
+    source_config: Mapping[str, Any],
     project_id: str,
 ) -> dict[str, Any]:
-    source_config = _remote_source_config(payload)
     interface: dict[str, Any] = {
         "interface_version": 2,
         "name": project_id,
         "version": "0.0.0",
     }
     if source_config["source"] == "mirrorchyan":
-        rid = str(payload.get("mirrorChyanRid") or project_id).strip()
+        rid = str(source_config.get("rid") or project_id).strip()
         if not rid:
             raise ManagedServiceError("首次 MirrorChyan 导入需要 RID")
         interface["mirrorchyan_rid"] = rid
         interface["mirrorchyan_multiplatform"] = True
     else:
-        repo = str(payload.get("githubRepo") or "").strip()
+        repo = str(source_config.get("repo") or "").strip()
         if not repo:
             raise ManagedServiceError("首次 GitHub 导入需要 owner/repository")
         interface["github"] = repo
+        tag = str(source_config.get("tag") or "").strip()
+        asset_pattern = str(source_config.get("asset_pattern") or "").strip()
+        if tag:
+            interface["github_tag"] = tag
+        if asset_pattern:
+            interface["github_asset_pattern"] = asset_pattern
     return interface
+
+
+def _remote_source_authority(
+    source_config: Mapping[str, Any],
+    interface: Any,
+    summary: Any = None,
+) -> dict[str, Any]:
+    if source_config.get("source") == "github_release":
+        authority: dict[str, Any] = {
+            "source": "GitHub",
+            "github": str(source_config.get("repo") or "").strip(),
+        }
+        tag = str(source_config.get("tag") or "").strip()
+        asset_pattern = str(source_config.get("asset_pattern") or "").strip()
+        if tag:
+            authority["github_tag"] = tag
+        if asset_pattern:
+            authority["github_asset_pattern"] = asset_pattern
+        return authority
+
+    rid = _remote_authority_text(
+        interface,
+        summary,
+        (
+            "mirrorchyan_rid",
+            "mirrorChyanRid",
+            "mirrorchyanRid",
+            "MirrorChyanRID",
+        ),
+    )
+    if not rid:
+        raise ManagedServiceError("远程 MirrorChyan 来源身份缺少 RID")
+    multiplatform = _remote_authority_bool(
+        interface,
+        summary,
+        (
+            "mirrorchyan_multiplatform",
+            "mirrorChyanMultiplatform",
+            "mirrorchyanMultiplatform",
+        ),
+    )
+    return {
+        "source": "MirrorChyan",
+        "mirrorchyan_rid": rid,
+        "mirrorchyan_multiplatform": (
+            multiplatform if multiplatform is not None else True
+        ),
+    }
 
 
 def _public_remote_discovery(discovery: Mapping[str, Any]) -> dict[str, Any]:
@@ -3944,6 +4750,7 @@ def _public_remote_discovery(discovery: Mapping[str, Any]) -> dict[str, Any]:
     result = _json_clone(discovery)
     if not isinstance(result, dict):
         raise ManagedServiceError("远程发现结果必须是 JSON object")
+    result.pop("_remoteAuthority", None)
     candidate = _mapping(result.get("candidate"))
     if candidate:
         had_url = candidate.get("downloadAvailable") is True or bool(
@@ -4118,6 +4925,36 @@ def _json_clone(value: Any) -> Any:
         )
     except (TypeError, ValueError) as exc:
         raise ManagedServiceError("升级 journal 只接受 JSON 值") from exc
+
+
+def _interface_config_surface(interface: Any) -> dict[str, Any]:
+    """Return only ProjectInterface fields that shape persisted user config."""
+
+    if isinstance(interface, Mapping):
+        raw = dict(interface)
+    else:
+        serializer = getattr(interface, "model_dump", None)
+        if not callable(serializer):
+            raise ManagedServiceError("ProjectInterface 不支持 JSON 序列化")
+        raw = serializer(mode="json", by_alias=True)
+    if not isinstance(raw, Mapping):
+        raise ManagedServiceError("ProjectInterface 序列化结果不是 JSON object")
+    return _json_clone(
+        {
+            key: raw.get(key)
+            for key in (
+                "controller",
+                "resource",
+                "group",
+                "setting",
+                "pretask",
+                "task",
+                "option",
+                "global_option",
+                "preset",
+            )
+        }
+    )
 
 
 def _json_hash(value: Any) -> str:
@@ -4359,6 +5196,17 @@ def _required_plan_config(plan: Mapping[str, Any], label: str) -> dict[str, Any]
     return dict(config)
 
 
+def _required_text(
+    payload: Mapping[str, Any],
+    key: str,
+    label: str,
+) -> str:
+    value = payload.get(key)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    raise ManagedServiceError(f"{label}不能为空（字段 {key}）")
+
+
 def _cleared_pending_upgrade() -> dict[str, Any]:
     return {
         "ImportVersion": "",
@@ -4382,8 +5230,16 @@ def _project_form_update(
     *,
     status: str,
 ) -> dict[str, Any]:
-    project_id = str(project.get("projectId") or payload.get("projectId") or "").strip()
-    version = str(project.get("version") or payload.get("version") or "").strip()
+    project_id = _required_text(
+        project,
+        "projectId",
+        "Project Store 返回的项目 ID",
+    )
+    version = _required_text(
+        project,
+        "version",
+        "Project Store 返回的项目版本",
+    )
     project_path = ""
     for key in ("dataPath", "projectPath", "path"):
         value = str(project.get(key) or "").strip()

@@ -60,7 +60,7 @@ PROJECT_GROUP = PluginField.group(
             "已绑定项目 ID",
             "",
             readonly=True,
-            help="由不可变 Project Store manifest 写入，不能作为导入输入修改。",
+            help="由 Project Store 版本清单写入，不能作为导入输入修改。",
         ),
         PluginField.string(
             "StoreId",
@@ -82,7 +82,7 @@ PROJECT_GROUP = PluginField.group(
             "当前资源版本",
             "",
             readonly=True,
-            help="由当前脚本绑定的不可变 Project Store 版本写入。",
+            help="由当前脚本绑定的受保护 Project Store 版本写入。",
         ),
         PluginField.string(
             "ImportVersion",
@@ -223,7 +223,7 @@ PROJECT_GROUP = PluginField.group(
         ),
         PluginField.json(
             "ConversionJournal",
-            "普通 MaaFW 原地转换 marker",
+            "MaaFW/M9A 原地转换 marker",
             "{}",
             json_type="object",
             readonly=True,
@@ -435,25 +435,31 @@ RUNTIME_GROUP = PluginField.group(
         ),
         PluginField.boolean(
             "AutoGC",
-            "运行完成后自动回收过期资源",
-            False,
-            help="默认关闭。启用后仍受固定、引用、运行 lease、宽限期和保留数量保护。",
+            "自动回收无引用资源",
+            True,
+            readonly=True,
+            hidden=True,
+            help="无引用资源固定自动回收；需要保留时请显式固定资源。",
         ),
         PluginField.number(
             "GCGraceDays",
             "回收宽限期（天）",
-            30,
-            min=1,
+            0,
+            min=0,
             max=3650,
             step=1,
+            readonly=True,
+            hidden=True,
         ),
         PluginField.number(
             "KeepLatest",
-            "每个项目保留最新版本数",
-            2,
-            min=1,
+            "无引用时额外保留最新版本数",
+            0,
+            min=0,
             max=100,
             step=1,
+            readonly=True,
+            hidden=True,
         ),
         PluginField.string(
             "GCConfirmation",
@@ -726,24 +732,24 @@ ACTION_GROUP = PluginField.group(
                     "scriptId": "{{scriptId}}",
                     "projectId": "{{formModel.Managed.ProjectId}}",
                     "dryRun": True,
-                    "graceDays": "{{formModel.ManagedRuntime.GCGraceDays}}",
-                    "keepLatest": "{{formModel.ManagedRuntime.KeepLatest}}",
+                    "graceDays": 0,
+                    "keepLatest": 0,
                 },
             ),
         ),
         PluginField.button(
             "RunGC",
-            "立即回收过期资源",
+            "立即回收无引用资源",
             _action(
-                "立即回收过期资源",
+                "立即回收无引用资源",
                 "/plugin/maafw-managed/gc",
                 {
                     "scriptId": "{{scriptId}}",
                     "projectId": "{{formModel.Managed.ProjectId}}",
                     "dryRun": False,
                     "confirmation": "{{formModel.ManagedRuntime.GCConfirmation}}",
-                    "graceDays": "{{formModel.ManagedRuntime.GCGraceDays}}",
-                    "keepLatest": "{{formModel.ManagedRuntime.KeepLatest}}",
+                    "graceDays": 0,
+                    "keepLatest": 0,
                 },
             ),
         ),
@@ -762,18 +768,11 @@ def _managed_maafw_groups():
                     hidden=True,
                     readonly=True,
                     required=False,
-                    help="运行前由 maafw.project_store.v1 注入。",
+                    validator="script-root",
+                    help="由 MAS Project Store 的当前项目版本注入。",
                 )
             elif group.key == "Info" and field.name == "ProjectLabel":
                 field = replace(field, readonly=True)
-            elif group.key == "Update":
-                field = replace(
-                    field,
-                    default=False if field.name == "IfAutoUpdate" else field.default,
-                    hidden=True,
-                    readonly=True,
-                    help="托管项目使用不可变版本；更新由资源操作完成。",
-                )
             fields.append(field)
         groups.append(replace(group, fields=tuple(fields)))
     return tuple(groups)

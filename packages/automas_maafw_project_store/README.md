@@ -69,7 +69,8 @@ metadata. Legacy hash values are deliberately preserved so existing checkout
 identities and per-script writable state are not stranded; only newly imported
 versions use the collision-resistant framing.
 
-Project Store 0.2.2 also persists a hard `runtime.python` object containing the
+Starting with Project Store 0.2.2, the private manifest persists a hard
+`runtime.python` object containing the
 CPython implementation, version constraint and evidence sources. It uses an
 explicit ProjectInterface declaration when present; otherwise a unique
 `python3XY._pth` beside a stripped bundled interpreter, or one unambiguous
@@ -78,9 +79,23 @@ without executing project code. Conflicting declarations fail closed,
 and the Python metadata participates in the projected source identity so a
 CP312 and CP313 release cannot become the same immutable import accidentally.
 
+Project Store 0.2.3 allows `project_id` to be omitted for a local import. The immutable
+ID is resolved from the ProjectInterface's formal `projectId`/`project_id`, then an
+explicit caller ID as a compatibility alias, then `name`, and finally the source
+directory name. A caller alias that conflicts with a formal ProjectInterface ID is
+rejected.
+
+The same release accepts an optional, credential-free `remote_source` identity
+for Managed imports. GitHub repository/tag/asset selectors or MirrorChyan RID
+metadata are validated, merged with matching ProjectInterface declarations
+(the ProjectInterface wins and caller metadata only fills missing fields),
+stored in the immutable private manifest, and exposed through the compact summary. Re-importing the same project version with a
+different remote identity is rejected; credential-like or unknown fields are
+never accepted.
+
 Resolved records and list operations expose a compact `summary` containing
-ProjectInterface capabilities, agent routing, stripped shell families, source
-and projected sizes, ABI requirements and warning counts. If a bundled Python
+ProjectInterface capabilities, remote source identity, agent routing, stripped
+shell families, source and projected sizes, ABI requirements and warning counts. If a bundled Python
 interpreter is stripped, the projected ProjectInterface routes that agent
 through `python` and the manifest records the `managed-python` route instead of
 leaving a broken path to the removed executable.

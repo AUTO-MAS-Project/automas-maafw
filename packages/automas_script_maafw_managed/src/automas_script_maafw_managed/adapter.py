@@ -10,6 +10,7 @@ from automas_script_maafw.adapter import MaaFWAdapterHooks
 from automas_script_maafw.runtime_route import managed_execution_route
 from automas_script_maafw.runner_task import MaaFWPluginAutoProxyTask
 
+from .environment_service import MANAGED_ENVIRONMENT_SERVICE
 from .services import (
     PROJECT_STORE_SERVICE,
     RUNTIME_POOL_SERVICE,
@@ -24,6 +25,7 @@ _GATEWAY_KEY = "maafw_managed_gateway"
 _LEASE_KEY = "maafw_managed_runtime_lease"
 _PROJECT_LEASE_KEY = "maafw_managed_project_lease"
 _CHECKOUT_LEASE_KEY = "maafw_managed_checkout_lease"
+_PREWARM_PROJECT_LEASE_KEY = "maafw_managed_auto_update_prewarm_lease"
 _POLICY_KEY = "maafw_managed_gc_policy"
 _MINIMUM_LEASE_TTL_SECONDS = 24 * 60 * 60
 
@@ -44,6 +46,10 @@ class MaaFWManagedAdapterHooks(MaaFWAdapterHooks):
                 return await super().check(runtime)
 
     async def prepare(self, runtime: ScriptAdapterRuntime) -> None:
+        # Managed updates own their own resource/config transaction, so they
+        # must finish before execution locks and leases are acquired below.
+        await self._run_managed_auto_update(runtime)
+
         # 持住宿主写门直到基础 prepare 锁住脚本配置。升级事务只能完整发生在
         # 本批次之前，或等待到运行锁建立后明确失败，不能插入解析与绑定之间。
         async with self._gateway(runtime).resource_transaction():
@@ -75,10 +81,176 @@ class MaaFWManagedAdapterHooks(MaaFWAdapterHooks):
         runtime: ScriptAdapterRuntime,
         script_config: Any,
     ) -> None:
-        """Never let the legacy adapter mutate an immutable managed project."""
+        """The Managed update transaction already ran before execution locks."""
 
         del script_config
-        self._emit_log(runtime, "托管 MaaFW 项目只通过不可变版本动作更新")
+
+    async def _run_managed_auto_update(
+        self,
+        runtime: ScriptAdapterRuntime,
+    ) -> None:
+        script_data = await runtime.storage.read_script_data()
+        update = _mapping(script_data.get("Update"))
+        managed_remote = _mapping(script_data.get("ManagedRemote"))
+        if update.get("IfAutoUpdate", True) is not True:
+            self._emit_log(runtime, "MaaFW 托管项目运行前自动更新已关闭")
+            return
+
+        # The manager's global source/CDK are authoritative for bound Managed
+        # projects.  ManagedRemote retains legacy import metadata, but it is
+        # not a per-project provider override.  The project channel remains
+        # the one per-project remote setting.
+        config_get = getattr(Config, "get", None)
+        global_config_available = callable(config_get)
+        # Bound Managed projects use the manager's global provider.  The
+        # source/CDK fields retained in ManagedRemote are legacy import
+        # metadata, not per-project overrides; using them here would make a
+        # stale remote import silently undo the current global setting.
+        script_cdk = ""
+        if global_config_available:
+            try:
+                source = str(config_get("Update", "Source") or "").strip()
+            except Exception:
+                self._emit_log(
+                    runtime,
+                    "无法读取 AUTO-MAS 全局更新来源，跳过 MaaFW 托管项目运行前更新",
+                )
+                return
+            if source.casefold() not in {
+                "mirrorchyan",
+                "mirror_chyan",
+                "mirror酱",
+                "github",
+                "github_release",
+            }:
+                self._emit_log(
+                    runtime,
+                    "AUTO-MAS 全局更新来源不支持 MaaFW 托管远程资源，"
+                    "跳过运行前更新；请在项目管理页保存 MirrorChyan 或 GitHub",
+                )
+                return
+        else:
+            # Keep old host-test/legacy environments usable when the global
+            # Config API is absent.
+            source = str(update.get("Source") or "").strip()
+            if not source:
+                source = str(managed_remote.get("Source") or "").strip()
+            if source.casefold() not in {
+                "mirrorchyan",
+                "mirror_chyan",
+                "mirror酱",
+                "github",
+                "github_release",
+            }:
+                # MaaFW package metadata is keyed by the interface RID. Keep
+                # the historical default only when the old host has no global
+                # Config API at all.
+                source = "MirrorChyan"
+            script_cdk = str(
+                update.get("MirrorChyanCDK")
+                or managed_remote.get("MirrorChyanCDK")
+                or ""
+            ).strip()
+        global_cdk = ""
+        if (
+            global_config_available
+            and source.casefold() in {"mirrorchyan", "mirror_chyan", "mirror酱"}
+        ):
+            try:
+                global_cdk = str(
+                    config_get("Update", "MirrorChyanCDK") or ""
+                ).strip()
+            except Exception:
+                self._emit_log(
+                    runtime,
+                    "无法读取 AUTO-MAS 全局 MirrorChyan CDK，"
+                    "跳过 MaaFW 托管项目运行前更新",
+                )
+                return
+        channel = str(managed_remote.get("Channel") or "").strip().casefold()
+        if channel not in {"stable", "beta"}:
+            channel = "stable"
+        if source.casefold() in {"mirrorchyan", "mirror_chyan", "mirror酱"} and not (
+            script_cdk or global_cdk
+        ):
+            self._emit_log(
+                runtime,
+                "MaaFW 托管项目未配置 MirrorChyan CDK，跳过运行前更新；"
+                "可改用 GitHub 或配置 AUTO-MAS 全局 CDK",
+            )
+            return
+
+        managed = _mapping(script_data.get("Managed"))
+        project_id, _version = managed_project_identity(managed)
+        payload = {
+            "projectId": project_id,
+            "source": source,
+            "channel": channel,
+        }
+        update_applied = False
+        try:
+            service = runtime.get_service(MANAGED_ENVIRONMENT_SERVICE)
+            updater = getattr(service, "update_script_before_run", None)
+            if not callable(updater):
+                raise ManagedServiceError(
+                    "maafw.managed.environment.v1 未提供 update_script_before_run()"
+                )
+            result = await updater(
+                _script_id(runtime),
+                payload,
+                send_log=lambda message: self._emit_log(runtime, message),
+            )
+            if not isinstance(result, Mapping):
+                raise ManagedServiceError("运行前更新服务返回值不是 JSON object")
+            update_applied = result.get("updated") is True
+            if update_applied:
+                transition_lease = _mapping(result.get("_prewarmProjectLease"))
+                if transition_lease:
+                    runtime.extra[_PREWARM_PROJECT_LEASE_KEY] = dict(
+                        transition_lease
+                    )
+                try:
+                    prepare = getattr(service, "prepare_script_environment", None)
+                    if not callable(prepare):
+                        raise ManagedServiceError(
+                            "maafw.managed.environment.v1 未提供 prepare_script_environment()"
+                        )
+                    await prepare(
+                        _script_id(runtime),
+                        None,
+                        send_log=lambda message: self._emit_log(runtime, message),
+                    )
+                finally:
+                    await self._release_prewarm_project_lease(runtime)
+                collect = getattr(service, "collect_unreferenced_resources", None)
+                if callable(collect):
+                    try:
+                        await collect()
+                    except Exception as exc:
+                        self._emit_log(
+                            runtime,
+                            f"MaaFW 新版本已就绪，旧版本回收暂未完成：{exc}",
+                        )
+            runtime.extra.pop(_RESOLUTION_KEY, None)
+        except Exception as exc:
+            if update_applied:
+                # The binding has already switched at this point.  Starting
+                # anyway after prewarm failure would run an unverified project
+                # or runtime and could make the old transition lease eligible
+                # for GC.  Fail closed; the caller can retry preparation or
+                # explicitly recover the pending resource state.
+                message = (
+                    "MaaFW 托管项目已切换但新环境预热失败，"
+                    "已阻止本次运行；请重试准备环境或检查资源状态："
+                    f"{exc}"
+                )
+                self._emit_log(runtime, message)
+                raise ManagedServiceError(message) from exc
+            self._emit_log(
+                runtime,
+                "MaaFW 托管项目运行前更新或新版本预热未完整完成；"
+                f"继续按当前已绑定版本启动：{exc}",
+            )
 
     def run_auto_proxy(self, runtime: ScriptAdapterRuntime) -> MaaFWPluginAutoProxyTask:
         task = super().run_auto_proxy(runtime)
@@ -107,16 +279,19 @@ class MaaFWManagedAdapterHooks(MaaFWAdapterHooks):
             await super().finalize(runtime)
         finally:
             async with self._gateway(runtime).resource_transaction():
+                await self._release_prewarm_project_lease(runtime)
                 await self._release_checkout_lease(runtime)
                 await self._release_project_lease(runtime)
                 await self._release_runtime_lease(runtime)
-                await self._auto_collect_garbage(runtime)
+            await self._auto_collect_garbage(runtime)
 
     async def on_crash(self, runtime: ScriptAdapterRuntime, error: Exception) -> None:
         async with self._gateway(runtime).resource_transaction():
+            await self._release_prewarm_project_lease(runtime)
             await self._release_checkout_lease(runtime)
             await self._release_project_lease(runtime)
             await self._release_runtime_lease(runtime)
+        await self._auto_collect_garbage(runtime)
         await super().on_crash(runtime, error)
 
     async def _resolve_and_inject(
@@ -132,7 +307,6 @@ class MaaFWManagedAdapterHooks(MaaFWAdapterHooks):
                 f"资源升级事务处于 {upgrade_state}，"
                 "恢复完成前拒绝启动新任务"
             )
-        managed_runtime = _mapping(script_data.get("ManagedRuntime"))
         run_config = _mapping(script_data.get("Run"))
         project_id, version = managed_project_identity(managed)
         request = {
@@ -188,9 +362,6 @@ class MaaFWManagedAdapterHooks(MaaFWAdapterHooks):
         runtime.extra["maafw_managed_project"] = dict(project)
         runtime.extra["maafw_runtime_binding"] = dict(runtime_binding)
         runtime.extra[_POLICY_KEY] = {
-            "autoGC": bool(managed_runtime.get("AutoGC", False)),
-            "graceDays": _as_int(managed_runtime.get("GCGraceDays"), 30),
-            "keepLatest": _as_int(managed_runtime.get("KeepLatest"), 2),
             "projectId": project_id,
             "leaseTtlSeconds": _lease_ttl_seconds(run_config.get("RunTimeLimit")),
         }
@@ -408,6 +579,30 @@ class MaaFWManagedAdapterHooks(MaaFWAdapterHooks):
         if runtime.extra.get(_PROJECT_LEASE_KEY) is lease:
             runtime.extra.pop(_PROJECT_LEASE_KEY, None)
 
+    async def _release_prewarm_project_lease(
+        self,
+        runtime: ScriptAdapterRuntime,
+    ) -> None:
+        lease = runtime.extra.get(_PREWARM_PROJECT_LEASE_KEY)
+        if not isinstance(lease, Mapping):
+            return
+        project_id = str(lease.get("projectId") or "")
+        version = str(lease.get("version") or "") or None
+        lease_id = str(lease.get("leaseId") or "")
+        if not project_id or not lease_id:
+            return
+        try:
+            await self._gateway(runtime).release_project_lease(
+                project_id,
+                version,
+                lease_id,
+            )
+        except ManagedServiceError as exc:
+            self._emit_log(runtime, f"释放 MaaFW 自动更新过渡 lease 失败：{exc}")
+            return
+        if runtime.extra.get(_PREWARM_PROJECT_LEASE_KEY) is lease:
+            runtime.extra.pop(_PREWARM_PROJECT_LEASE_KEY, None)
+
     async def _release_runtime_lease(self, runtime: ScriptAdapterRuntime) -> None:
         lease = runtime.extra.get(_LEASE_KEY)
         if not isinstance(lease, Mapping):
@@ -425,9 +620,6 @@ class MaaFWManagedAdapterHooks(MaaFWAdapterHooks):
             runtime.extra.pop(_LEASE_KEY, None)
 
     async def _auto_collect_garbage(self, runtime: ScriptAdapterRuntime) -> None:
-        policy = runtime.extra.get(_POLICY_KEY)
-        if not isinstance(policy, Mapping) or not policy.get("autoGC"):
-            return
         try:
             gateway = self._gateway(runtime)
             async with gateway.resource_transaction():
@@ -435,14 +627,28 @@ class MaaFWManagedAdapterHooks(MaaFWAdapterHooks):
                     script_records = await _managed_script_record_dtos()
                     result = await gateway.collect_garbage(
                         dry_run=False,
-                        grace_days=_as_int(policy.get("graceDays"), 30),
-                        keep_latest=_as_int(policy.get("keepLatest"), 2),
-                        project_id=str(policy.get("projectId") or "") or None,
+                        grace_days=0,
+                        keep_latest=0,
+                        project_id=None,
                         script_records=script_records,
                     )
-            self._emit_log(runtime, f"MaaFW 过期资源回收完成：{result}")
-        except ManagedServiceError as exc:
-            self._emit_log(runtime, f"MaaFW 过期资源回收失败：{exc}")
+            project_store = _mapping(result.get("projectStore"))
+            checkout_gc = _mapping(
+                project_store.get("checkoutGarbageCollection")
+            )
+            runtime_pool = _mapping(result.get("runtimePool"))
+            project_count = _list_count(project_store.get("deleted"))
+            checkout_count = _list_count(checkout_gc.get("deleted"))
+            runtime_count = _list_count(runtime_pool.get("deleted"))
+            if project_count or checkout_count or runtime_count:
+                self._emit_log(
+                    runtime,
+                    "MaaFW 无引用资源回收完成："
+                    f"项目版本 {project_count}，运行副本 {checkout_count}，"
+                    f"共享运行时 {runtime_count}",
+                )
+        except Exception as exc:
+            self._emit_log(runtime, f"MaaFW 无引用资源回收失败：{exc}")
 
     @staticmethod
     async def _write_failure_status(
@@ -460,6 +666,10 @@ class MaaFWManagedAdapterHooks(MaaFWAdapterHooks):
 
 def _mapping(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _list_count(value: Any) -> int:
+    return len(value) if isinstance(value, list) else 0
 
 
 def _as_int(value: Any, default: int) -> int:

@@ -24,7 +24,7 @@ AUTO-MAS 的通用 MaaFW 插件工作区。仓库统一维护共享运行栈，�
 
 共享运行栈按“每个 Python ABI 解释器族 + 每个完整规范化依赖 selector 的隔离
 venv”组织：Runtime Pool 0.2.0 可路由 CP312/CP313，多个 selector 共用 pool 内 uv
-缓存与基础解释器，但不共用 `site-packages`。Project Store 0.2.2 把脱壳前的
+缓存与基础解释器，但不共用 `site-packages`。Project Store 0.2.3 把脱壳前的
 `runtime.python` 约束留在不可变 manifest；Runner 0.4.0 校验并复用该可信绑定，
 准备页与实际运行不会在宿主 CP312 下重新计算 CP313 runtime 身份。
 
@@ -35,9 +35,9 @@ M9A project pack 与 `automas-m9a` 聚合包位于独立的 `automas-m9a` 仓库
 `publish.yml` 每次只发布一个 distribution，不会自动处理包间顺序。当前版本应按
 以下层级发布；同层可并行，下一层须等待依赖版本已经可从 PyPI 安装：
 
-1. `automas-maafw-interface` 0.2.0、`automas-maafw-project-store` 0.2.2、
+1. `automas-maafw-interface` 0.2.0、`automas-maafw-project-store` 0.2.3、
    `automas-maafw-runtime-pool` 0.2.0。
-2. `automas-maafw-agent-env` 0.1.4、`automas-maafw-project-update` 0.2.2。
+2. `automas-maafw-agent-env` 0.1.4、`automas-maafw-project-update` 0.2.3。
 3. `automas-maafw-runner` 0.4.0。
 4. `automas-script-maafw` 0.1.11。
 5. `automas-script-maafw-managed` 0.3.0。
