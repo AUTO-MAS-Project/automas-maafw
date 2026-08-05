@@ -515,6 +515,7 @@ class MaaFWApiController:
         logs: list[str] = []
         current_version = ""
         terminal_published = False
+        deferred_provider_terminal: dict[str, Any] | None = None
         reservation_key: str | None = None
 
         def append_log(message: str) -> None:
@@ -523,8 +524,22 @@ class MaaFWApiController:
                 logs.append(f"[{timestamp}] {line}")
 
         def publish(progress: Mapping[str, Any]) -> None:
-            nonlocal terminal_published
-            if str(progress.get("stage") or "") in {"completed", "failed"}:
+            nonlocal deferred_provider_terminal, terminal_published
+            stage = str(progress.get("stage") or "")
+            # The project-update provider reports its own successful terminal
+            # event before the optional Runner prewarm starts. Defer that
+            # event until we know whether prewarm follows, then publish it as
+            # a non-terminal resource-applied milestone when needed. Failure
+            # events remain terminal immediately so cancellation/error paths
+            # still have exactly one terminal notification.
+            if (
+                payload.apply
+                and stage == "completed"
+                and bool(progress.get("final"))
+            ):
+                deferred_provider_terminal = dict(progress)
+                return
+            if stage == "failed" or bool(progress.get("final")):
                 terminal_published = True
             self._progress_callback(
                 PROJECT_UPDATE_PROGRESS,
@@ -712,6 +727,19 @@ class MaaFWApiController:
                     payload.scriptId,
                 )
                 append_log("[完成] MaaFW 项目资源已更新")
+                if deferred_provider_terminal is not None:
+                    applied_progress = dict(deferred_provider_terminal)
+                    applied_progress.update(
+                        {
+                            "phase": "resource_applied",
+                            "final": False,
+                        }
+                    )
+                    deferred_provider_terminal = None
+                    self._progress_callback(
+                        PROJECT_UPDATE_PROGRESS,
+                        payload.scriptId,
+                    )(applied_progress)
                 refreshed_interface = await _invoke_provider(
                     interface_service,
                     "load",
@@ -789,18 +817,32 @@ class MaaFWApiController:
 
             status = "warning" if environment_warning else "success"
             message = environment_warning or str(_value(update_result, "message", "") or "")
-            publish(
-                {
-                    "stage": "completed",
-                    "status": "updated_with_environment_warning" if environment_warning else (
-                        "updated" if bool(_value(update_result, "updated", False)) else "no_update"
-                    ),
-                    "message": message or "MaaFW project update completed",
-                    "percent": 100.0,
-                    "phase": "finalizing",
-                    "final": True,
-                }
-            )
+            if deferred_provider_terminal is not None:
+                # No Runner prewarm was needed (for example, no update). The
+                # provider's terminal event is the complete operation result.
+                terminal_progress = deferred_provider_terminal
+                deferred_provider_terminal = None
+                terminal_published = True
+                self._progress_callback(
+                    PROJECT_UPDATE_PROGRESS,
+                    payload.scriptId,
+                )(terminal_progress)
+            elif not terminal_published:
+                self._progress_callback(
+                    PROJECT_UPDATE_PROGRESS,
+                    payload.scriptId,
+                )(
+                    {
+                        "stage": "completed",
+                        "status": "updated_with_environment_warning" if environment_warning else (
+                            "updated" if bool(_value(update_result, "updated", False)) else "no_update"
+                        ),
+                        "message": message or "MaaFW project update completed",
+                        "percent": 100.0,
+                        "phase": "finalizing",
+                        "final": True,
+                    }
+                )
             return model_json(
                 MaaFWProjectUpdateOut(
                     status=status,
