@@ -103,7 +103,7 @@ def _is_cached_data_valid(data: Mapping[str, Any], project_path: Path) -> bool:
     agents = data.get("agents")
     if not isinstance(agents, list):
         return False
-    if not isinstance(data.get("agentCount"), int) or data["agentCount"] != len(agents):
+    if type(data.get("agentCount")) is not int or data["agentCount"] != len(agents):
         return False
     if not isinstance(data.get("logs"), list) or not all(
         isinstance(item, str) for item in data["logs"]
@@ -120,6 +120,8 @@ def _is_cached_data_valid(data: Mapping[str, Any], project_path: Path) -> bool:
             raw_path = agent.get(key)
             if not raw_path:
                 continue
+            if not isinstance(raw_path, str):
+                return False
             candidate = Path(str(raw_path))
             if candidate.is_absolute():
                 if key == "executable" and not candidate.is_file():
@@ -137,10 +139,10 @@ def _is_cached_data_valid(data: Mapping[str, Any], project_path: Path) -> bool:
         return False
     if not venv_path.is_absolute() or not venv_path.is_dir():
         return False
-    raw_data_path = str(data.get("path") or "").strip()
-    return bool(raw_data_path) and _normalise_path(raw_data_path) == _normalise_path(
-        project_path
-    )
+    raw_data_path = data.get("path")
+    if not isinstance(raw_data_path, str) or not raw_data_path.strip():
+        return False
+    return _normalise_path(raw_data_path) == _normalise_path(project_path)
 
 
 def load_maafw_agent_env_state(
