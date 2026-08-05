@@ -1584,7 +1584,7 @@ async def _apply_update_package(
         )
 
     try:
-        await asyncio.to_thread(
+        await _run_worker_to_completion(
             _apply_update_package_sync,
             project_path,
             package_path,

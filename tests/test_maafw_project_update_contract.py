@@ -1141,6 +1141,49 @@ class MaaFWProjectUpdateProviderContractTest(unittest.TestCase):
 
         self.assertLess(asyncio.run(exercise()), 0.5)
 
+    def test_cancelled_archive_apply_waits_for_worker_before_reraising(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+
+        def blocking_apply(*_args) -> None:
+            started.set()
+            release.wait(timeout=2)
+            finished.set()
+
+        async def exercise() -> tuple[bool, bool]:
+            with patch.object(
+                updater_module,
+                "_apply_update_package_sync",
+                side_effect=blocking_apply,
+            ):
+                task = asyncio.create_task(
+                    updater_module._apply_update_package(
+                        Path("C:/project"),
+                        Path("C:/project/update.zip"),
+                        lambda _message: None,
+                    )
+                )
+                timer = threading.Timer(1.0, release.set)
+                timer.start()
+                try:
+                    while not started.is_set():
+                        await asyncio.sleep(0)
+                    task.cancel()
+                    await asyncio.sleep(0)
+                    pending_after_cancel = not task.done()
+                    release.set()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await task
+                    return pending_after_cancel, finished.is_set()
+                finally:
+                    release.set()
+                    timer.cancel()
+
+        pending_after_cancel, worker_finished = asyncio.run(exercise())
+        self.assertTrue(pending_after_cancel)
+        self.assertTrue(worker_finished)
+
     def test_download_progress_reports_real_chunk_bytes(self) -> None:
         events: list[dict] = []
         with tempfile.TemporaryDirectory() as temporary_directory:
