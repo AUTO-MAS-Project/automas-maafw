@@ -588,7 +588,10 @@ class MaaFWApiController:
             if interface_service is None or update_service is None:
                 raise MaaFWApiError("MaaFW interface/project update 服务尚未加载")
             interface_model = await _invoke_provider(interface_service, "load", project_path)
-            current_version = str(getattr(interface_model, "version", "") or "")
+            # Interface providers may return either their native Pydantic
+            # model or the JSON-compatible mapping promised by the service
+            # contract.  Read through the same boundary helper in both cases.
+            current_version = str(_value(interface_model, "version", "") or "")
 
             local_cdk = str(update_group.get("MirrorChyanCDK") or "").strip()
             global_cdk = str(_global_config("MirrorChyanCDK") or "").strip()
