@@ -25,6 +25,42 @@ from .schema import build_source_config
 
 logger = get_logger("MaaFW 插件适配")
 _RUNTIME_POOL_ROUTE_KEY = "maafw_runtime_pool_route"
+_MISSING_PROJECT_PATH = object()
+
+
+def _load_project_interface(project_path: Path) -> Any:
+    if not project_path.exists():
+        return _MISSING_PROJECT_PATH
+    return MaaFWInterfaceService().load(project_path)
+
+
+async def _await_mutating_to_thread(
+    func: Any,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    """Finish a mutating worker before propagating task cancellation."""
+
+    worker = asyncio.create_task(asyncio.to_thread(func, *args, **kwargs))
+    cancellation_requested = False
+    while not worker.done():
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            cancellation_requested = True
+        except Exception:
+            # The terminal result is re-read below after the worker exits.
+            pass
+
+    if cancellation_requested:
+        try:
+            worker.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+        raise asyncio.CancelledError
+    return worker.result()
 
 
 class MaaFWAdapterHooks(ScriptAdapterHooks):
@@ -40,13 +76,15 @@ class MaaFWAdapterHooks(ScriptAdapterHooks):
             return "请设置 MaaFW 项目路径"
 
         project_path = Path(raw_project_path)
-        if not project_path.exists():
-            return "请设置 MaaFW 项目路径"
-
         try:
-            interface = MaaFWInterfaceService().load(project_path)
+            interface = await asyncio.to_thread(
+                _load_project_interface,
+                project_path,
+            )
         except MaaFWInterfaceLoadError as exc:
             return f"无法读取 MaaFW interface，请检查项目路径: {exc}"
+        if interface is _MISSING_PROJECT_PATH:
+            return "请设置 MaaFW 项目路径"
 
         if not interface.controller:
             return "MaaFW interface 未声明 controller，请检查项目目录"
@@ -62,7 +100,7 @@ class MaaFWAdapterHooks(ScriptAdapterHooks):
         return "Pass"
 
     async def prepare(self, runtime: ScriptAdapterRuntime) -> None:
-        self._runtime_pool_route(runtime)
+        await asyncio.to_thread(self._runtime_pool_route, runtime)
         await runtime.storage.lock()
 
         script_config = await runtime.build_script_model()
@@ -170,10 +208,33 @@ class MaaFWAdapterHooks(ScriptAdapterHooks):
 
             script_data = await runtime.storage.read_script_data()
             source_config = build_source_config(script_data)
-            mirror_cdk = (
-                script_config.get("Update", "MirrorChyanCDK")
-                or Config.get("Update", "MirrorChyanCDK")
-            )
+            effective_source_config = dict(source_config or {})
+            configured_source = str(
+                effective_source_config.get("source") or ""
+            ).strip().casefold()
+            if not configured_source:
+                global_source = str(
+                    Config.get("Update", "Source") or ""
+                ).strip().casefold()
+                if global_source in {
+                    "github",
+                    "github_release",
+                    "github release",
+                }:
+                    effective_source_config["source"] = "github_release"
+                elif global_source in {
+                    "mirrorchyan",
+                    "mirror_chyan",
+                    "mirror酱",
+                }:
+                    effective_source_config["source"] = "mirrorchyan"
+            local_mirror_cdk = str(
+                script_config.get("Update", "MirrorChyanCDK") or ""
+            ).strip()
+            global_mirror_cdk = str(
+                Config.get("Update", "MirrorChyanCDK") or ""
+            ).strip()
+            mirror_cdk = local_mirror_cdk or global_mirror_cdk
             channel = script_config.get("Update", "Channel") or Config.get(
                 "Update",
                 "Channel",
@@ -186,7 +247,7 @@ class MaaFWAdapterHooks(ScriptAdapterHooks):
                     channel=channel,
                     proxy=Config.proxy,
                     send_log=lambda message: self._emit_log(runtime, message),
-                    source_config=source_config,
+                    source_config=effective_source_config,
                 )
             except Exception as exc:
                 self._emit_log(
@@ -215,9 +276,12 @@ class MaaFWAdapterHooks(ScriptAdapterHooks):
                     "MaaFW project updated, preparing agent Python env",
                 )
                 agent_prepare_logs: list[str] = []
-                runtime_pool = self._runtime_pool_route(runtime)
+                runtime_pool = await asyncio.to_thread(
+                    self._runtime_pool_route,
+                    runtime,
+                )
                 try:
-                    await asyncio.to_thread(
+                    await _await_mutating_to_thread(
                         _prepare_maafw_agent_python_envs,
                         project_path,
                         refreshed_interface,

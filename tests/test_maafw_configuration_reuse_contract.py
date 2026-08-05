@@ -65,6 +65,34 @@ INTERFACE = {
 
 
 class MaaFWConfigurationReuseMappingTest(unittest.TestCase):
+    def test_direct_multi_config_file_expands_listed_configs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            config_root = Path(temporary_directory) / "config"
+            configs = config_root / "configs"
+            configs.mkdir(parents=True)
+            source = configs / "c_first.json"
+            source.write_text(
+                json.dumps(
+                    {
+                        "InstanceName": "配置一",
+                        "TaskItems": [],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            multi_config = config_root / "multi_config.json"
+            multi_config.write_text(
+                json.dumps({"config_list": ["first"]}),
+                encoding="utf-8",
+            )
+
+            sources = discover_configuration_sources(multi_config)
+
+            self.assertEqual(len(sources), 1)
+            self.assertEqual(sources[0]["label"], "配置一")
+            self.assertEqual(Path(sources[0]["path"]), source.resolve())
+
     def test_mfaa_v1_discovers_and_maps_script_and_first_user(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

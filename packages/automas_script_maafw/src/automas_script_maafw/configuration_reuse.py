@@ -26,7 +26,10 @@ def discover_configuration_sources(source_path: str | Path) -> list[dict[str, An
     if not path.exists():
         raise MaaFWConfigurationReuseError(f"配置来源不存在：{path}")
 
-    files = [path] if path.is_file() else _configuration_files(path)
+    if path.is_file() and path.name.casefold() == "multi_config.json":
+        files = _multi_config_files(path, path.parent)
+    else:
+        files = [path] if path.is_file() else _configuration_files(path)
     discovered: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
     for file_path in files:

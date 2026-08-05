@@ -212,7 +212,7 @@ class MaaFWRunnerStopContractTest(unittest.TestCase):
             script_project["project"]["dependencies"],
         )
         self.assertIn(
-            "automas-maafw-project-update>=0.2.1",
+            "automas-maafw-project-update>=0.2.3",
             script_project["project"]["dependencies"],
         )
         self.assertIn(

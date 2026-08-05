@@ -21,6 +21,7 @@ from packaging.version import InvalidVersion, Version
 from .cache import prune_uv_cache
 
 from .identity import (
+    IDENTITY_SCHEMA_VERSION,
     RUNTIME_ID_PREFIX,
     build_runtime_identity,
     find_maafw_requirement,
@@ -51,6 +52,10 @@ _POOL_LOCKS: dict[str, threading.RLock] = {}
 
 class MaaFWRuntimePoolError(RuntimeError):
     """Raised when a managed MaaFW runtime pool operation is unsafe or invalid."""
+
+
+class _MaaFWRuntimeEntryStaleError(MaaFWRuntimePoolError):
+    """Raised for a recoverable runtime entry that no longer resolves."""
 
 
 class MaaFWRuntimePool:
@@ -140,10 +145,13 @@ class MaaFWRuntimePool:
         with self._lock:
             self._initialize()
             runtime_dir = self._runtime_dir(runtime_id)
-            if not runtime_dir.is_dir():
+            if not runtime_dir.exists() and not runtime_dir.is_symlink():
                 return None
-            manifest = self._read_manifest(runtime_id, expected_identity=identity)
-            payload = self._augment_manifest(manifest, verify_python=True)
+            try:
+                manifest = self._read_manifest(runtime_id, expected_identity=identity)
+                payload = self._augment_manifest(manifest, verify_python=True)
+            except _MaaFWRuntimeEntryStaleError:
+                return None
             if touch:
                 manifest["lastUsedAt"] = _format_time(_utc_now())
                 self._write_manifest(runtime_id, manifest)
@@ -159,10 +167,13 @@ class MaaFWRuntimePool:
         with self._lock:
             self._initialize()
             runtime_dir = self._runtime_dir(runtime_id)
-            if not runtime_dir.is_dir():
+            if not runtime_dir.exists() and not runtime_dir.is_symlink():
                 return None
-            manifest = self._read_manifest(runtime_id)
-            payload = self._augment_manifest(manifest, verify_python=True)
+            try:
+                manifest = self._read_manifest(runtime_id)
+                payload = self._augment_manifest(manifest, verify_python=True)
+            except _MaaFWRuntimeEntryStaleError:
+                return None
             if touch:
                 manifest["lastUsedAt"] = _format_time(_utc_now())
                 self._write_manifest(runtime_id, manifest)
@@ -202,11 +213,16 @@ class MaaFWRuntimePool:
             if existing is not None:
                 return existing
 
+            recovery_metadata, quarantine_dir = self._quarantine_stale_runtime(
+                runtime_id
+            )
             stage_dir = self.staging_root / f"{runtime_id}-{uuid.uuid4().hex}"
-            self._validate_staging_path(stage_dir, runtime_id)
-            stage_dir.mkdir(parents=True, exist_ok=False)
             environment_path = stage_dir / "environment"
+            stage_created = False
             try:
+                self._validate_staging_path(stage_dir, runtime_id)
+                stage_dir.mkdir(parents=True, exist_ok=False)
+                stage_created = True
                 raw_install_result = install(
                     environment_path,
                     canonical_requirements,
@@ -218,12 +234,10 @@ class MaaFWRuntimePool:
                     environment_path,
                     install_result,
                 )
-                installed_python_identity = None
-                if python_identity is not None:
-                    installed_python_identity = _verify_installed_python_identity(
-                        stage_dir / python_relative,
-                        identity,
-                    )
+                installed_python_identity = _verify_installed_python_identity(
+                    stage_dir / python_relative,
+                    identity,
+                )
                 now = _format_time(_utc_now())
                 maafw_requirement = find_maafw_requirement(canonical_requirements)
                 maafw_version = _optional_string(
@@ -262,12 +276,16 @@ class MaaFWRuntimePool:
                     "pythonPatchVersion": python_patch_version,
                     "environmentRelativePath": "environment",
                     "pythonRelativePath": python_relative.as_posix(),
-                    "createdAt": now,
+                    "createdAt": recovery_metadata.get("createdAt", now),
                     "lastUsedAt": now,
-                    "pinned": False,
-                    "references": [],
-                    "leases": {},
-                    "metadata": _json_compatible(metadata or {}),
+                    "pinned": recovery_metadata.get("pinned", False),
+                    "references": list(recovery_metadata.get("references", [])),
+                    "leases": copy.deepcopy(recovery_metadata.get("leases", {})),
+                    "metadata": _json_compatible(
+                        metadata
+                        if metadata is not None
+                        else recovery_metadata.get("metadata", {})
+                    ),
                     "installerMetadata": _json_compatible(install_result),
                 }
                 _write_json_atomic(stage_dir / RUNTIME_MANIFEST_NAME, manifest)
@@ -289,9 +307,52 @@ class MaaFWRuntimePool:
                     self._read_manifest(runtime_id, expected_identity=identity),
                     verify_python=True,
                 )
-            except Exception:
-                if stage_dir.exists():
-                    self._remove_staging_dir(stage_dir, runtime_id)
+            except Exception as install_error:
+                cleanup_error: Exception | None = None
+                if stage_created and (
+                    stage_dir.exists() or stage_dir.is_symlink()
+                ):
+                    try:
+                        self._remove_staging_dir(stage_dir, runtime_id)
+                        if stage_dir.exists() or stage_dir.is_symlink():
+                            raise MaaFWRuntimePoolError(
+                                f"runtime staging directory could not be removed: "
+                                f"{stage_dir}"
+                            )
+                    except Exception as exc:
+                        cleanup_error = exc
+
+                recovery_error: Exception | None = None
+                quarantine_remains = False
+                if quarantine_dir is not None and (
+                    quarantine_dir.exists() or quarantine_dir.is_symlink()
+                ):
+                    runtime_dir = self._runtime_dir(runtime_id)
+                    if not runtime_dir.exists() and not runtime_dir.is_symlink():
+                        try:
+                            self._validate_staging_path(quarantine_dir, runtime_id)
+                            quarantine_dir.replace(runtime_dir)
+                        except Exception as exc:
+                            recovery_error = exc
+                    else:
+                        quarantine_remains = True
+
+                if recovery_error is not None:
+                    raise MaaFWRuntimePoolError(
+                        "runtime recovery failed; protected runtime remains "
+                        f"quarantined at {quarantine_dir}: {recovery_error}"
+                    ) from recovery_error
+                if quarantine_remains:
+                    raise MaaFWRuntimePoolError(
+                        "runtime publish or validation failed while the protected "
+                        "runtime remains quarantined; refusing fallback over the "
+                        f"existing runtime: {quarantine_dir}; {install_error}"
+                    ) from install_error
+                if cleanup_error is not None:
+                    raise MaaFWRuntimePoolError(
+                        "runtime staging cleanup failed after installation error: "
+                        f"{cleanup_error}; {install_error}"
+                    ) from cleanup_error
                 raise
 
     def resolve_python(
@@ -634,7 +695,9 @@ class MaaFWRuntimePool:
                             f"managed runtime path must be a directory: {path}"
                         )
                     manifest = self._read_manifest(path.name)
-                    items.append(self._augment_manifest(manifest))
+                    items.append(
+                        self._augment_manifest(manifest, verify_python=True)
+                    )
                 except Exception as exc:
                     errors.append(
                         {
@@ -668,53 +731,117 @@ class MaaFWRuntimePool:
         runtime_dir = self._runtime_dir(runtime_id)
         self._validate_managed_runtime_dir(runtime_dir, runtime_id, require_manifest=False)
         manifest_path = runtime_dir / RUNTIME_MANIFEST_NAME
+        _assert_not_reparse(manifest_path)
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except FileNotFoundError as exc:
-            raise MaaFWRuntimePoolError(f"runtime manifest not found: {runtime_id}") from exc
+            raise _MaaFWRuntimeEntryStaleError(
+                f"runtime manifest not found: {runtime_id}"
+            ) from exc
         except Exception as exc:
-            raise MaaFWRuntimePoolError(f"runtime manifest is invalid: {runtime_id}: {exc}") from exc
-        if not isinstance(manifest, dict):
-            raise MaaFWRuntimePoolError(f"runtime manifest must be an object: {runtime_id}")
-        if manifest.get("schemaVersion") != MANIFEST_SCHEMA_VERSION:
-            raise MaaFWRuntimePoolError(f"runtime manifest version is unsupported: {runtime_id}")
-        if manifest.get("kind") != "auto-mas-maafw-runtime":
-            raise MaaFWRuntimePoolError(f"runtime manifest kind is invalid: {runtime_id}")
-        if manifest.get("runtimeId") != runtime_id:
-            raise MaaFWRuntimePoolError(f"runtime manifest identity mismatch: {runtime_id}")
-        identity = manifest.get("identity")
-        if not isinstance(identity, dict) or runtime_id_for_identity(identity) != runtime_id:
             raise MaaFWRuntimePoolError(
-                f"runtime manifest selector identity is invalid: {runtime_id}"
+                f"runtime manifest is invalid: {runtime_id}: {exc}"
+            ) from exc
+        if isinstance(manifest, dict):
+            pinned = manifest.get("pinned", False)
+            if not isinstance(pinned, bool):
+                raise MaaFWRuntimePoolError(
+                    f"runtime manifest pin state is invalid: {runtime_id}"
+                )
+            _normalize_string_list(manifest.get("references", []), "references")
+            _validate_runtime_leases(manifest.get("leases", {}))
+        try:
+            if not isinstance(manifest, dict):
+                raise MaaFWRuntimePoolError(
+                    f"runtime manifest must be an object: {runtime_id}"
+                )
+            if manifest.get("schemaVersion") != MANIFEST_SCHEMA_VERSION:
+                raise MaaFWRuntimePoolError(
+                    f"runtime manifest version is unsupported: {runtime_id}"
+                )
+            if manifest.get("kind") != "auto-mas-maafw-runtime":
+                raise MaaFWRuntimePoolError(
+                    f"runtime manifest kind is invalid: {runtime_id}"
+                )
+            if manifest.get("runtimeId") != runtime_id:
+                raise MaaFWRuntimePoolError(
+                    f"runtime manifest identity mismatch: {runtime_id}"
+                )
+            identity = manifest.get("identity")
+            if (
+                not isinstance(identity, dict)
+                or runtime_id_for_identity(identity) != runtime_id
+            ):
+                raise MaaFWRuntimePoolError(
+                    f"runtime manifest selector identity is invalid: {runtime_id}"
+                )
+            if identity.get("schemaVersion") != IDENTITY_SCHEMA_VERSION:
+                raise MaaFWRuntimePoolError(
+                    f"runtime manifest selector schema is invalid: {runtime_id}"
+                )
+            for field_name in (
+                "pythonAbi",
+                "pythonVersion",
+                "platform",
+                "architecture",
+            ):
+                if not isinstance(identity.get(field_name), str) or not str(
+                    identity[field_name]
+                ).strip():
+                    raise MaaFWRuntimePoolError(
+                        f"runtime manifest selector identity is incomplete: {runtime_id}"
+                    )
+            if len(str(identity["pythonAbi"]).split(":", 2)) != 3:
+                raise MaaFWRuntimePoolError(
+                    f"runtime manifest selector ABI is invalid: {runtime_id}"
+                )
+            if any(
+                not part.strip()
+                for part in str(identity["pythonAbi"]).split(":", 2)
+            ):
+                raise MaaFWRuntimePoolError(
+                    f"runtime manifest selector ABI is incomplete: {runtime_id}"
+                )
+            try:
+                Version(str(identity["pythonVersion"]))
+            except InvalidVersion as exc:
+                raise MaaFWRuntimePoolError(
+                    f"runtime manifest selector Python version is invalid: {runtime_id}"
+                ) from exc
+            identity_requirements = _normalize_string_list(
+                identity.get("requirements"),
+                "identity.requirements",
             )
-        identity_requirements = _normalize_string_list(
-            identity.get("requirements"),
-            "identity.requirements",
-        )
-        selector_requirements = _normalize_string_list(
-            manifest.get("selectorRequirements", manifest.get("requirements")),
-            "selectorRequirements",
-        )
-        compatibility_requirements = _normalize_string_list(
-            manifest.get("requirements"),
-            "requirements",
-        )
-        if (
-            selector_requirements != identity_requirements
-            or compatibility_requirements != identity_requirements
-        ):
-            raise MaaFWRuntimePoolError(
-                f"runtime manifest selector requirements mismatch: {runtime_id}"
+            selector_requirements = _normalize_string_list(
+                manifest.get("selectorRequirements", manifest.get("requirements")),
+                "selectorRequirements",
             )
-        _normalize_string_list(
-            manifest.get("resolvedRequirements", []),
-            "resolvedRequirements",
-        )
-        _validate_runtime_leases(manifest.get("leases", {}))
-        if expected_identity is not None and manifest.get("identity") != expected_identity:
-            raise MaaFWRuntimePoolError(
-                f"runtime requirement selector mismatch: {runtime_id}"
+            compatibility_requirements = _normalize_string_list(
+                manifest.get("requirements"),
+                "requirements",
             )
+            if (
+                selector_requirements != identity_requirements
+                or compatibility_requirements != identity_requirements
+            ):
+                raise MaaFWRuntimePoolError(
+                    f"runtime manifest selector requirements mismatch: {runtime_id}"
+                )
+            _normalize_string_list(
+                manifest.get("resolvedRequirements", []),
+                "resolvedRequirements",
+            )
+            if (
+                expected_identity is not None
+                and manifest.get("identity") != expected_identity
+            ):
+                raise MaaFWRuntimePoolError(
+                    f"runtime requirement selector mismatch: {runtime_id}"
+                )
+        except Exception as exc:
+            raise _MaaFWRuntimeEntryStaleError(
+                f"runtime manifest selector is stale: {runtime_id}: {exc}"
+            ) from exc
         self._validate_managed_runtime_dir(runtime_dir, runtime_id, require_manifest=True)
         return manifest
 
@@ -730,27 +857,42 @@ class MaaFWRuntimePool:
         verify_python: bool = False,
     ) -> dict[str, Any]:
         payload = copy.deepcopy(manifest)
-        runtime_id = str(payload["runtimeId"])
-        runtime_dir = self._runtime_dir(runtime_id).resolve()
-        environment_relative = Path(str(payload["environmentRelativePath"]))
-        python_relative = Path(str(payload["pythonRelativePath"]))
-        environment_path = (runtime_dir / environment_relative).resolve()
-        python_executable = (runtime_dir / python_relative).resolve()
+        try:
+            runtime_id = str(payload["runtimeId"])
+            runtime_path = self._runtime_dir(runtime_id)
+            _assert_not_reparse(runtime_path)
+            runtime_dir = runtime_path.resolve()
+            environment_relative = Path(str(payload["environmentRelativePath"]))
+            python_relative = Path(str(payload["pythonRelativePath"]))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise _MaaFWRuntimeEntryStaleError(
+                "runtime manifest is missing required environment paths"
+            ) from exc
+        environment_candidate = runtime_dir / environment_relative
+        python_candidate = runtime_dir / python_relative
+        _assert_existing_chain_has_no_reparse(environment_candidate)
+        _assert_existing_chain_has_no_reparse(python_candidate)
+        environment_path = environment_candidate.resolve()
+        python_executable = python_candidate.resolve()
         if not _is_within(environment_path, runtime_dir) or not _is_within(
             python_executable,
             runtime_dir,
         ):
             raise MaaFWRuntimePoolError(f"runtime manifest contains unsafe paths: {runtime_id}")
         if not environment_path.is_dir() or not python_executable.is_file():
-            raise MaaFWRuntimePoolError(
+            raise _MaaFWRuntimeEntryStaleError(
                 f"runtime environment is incomplete: {runtime_id}"
             )
         identity = payload.get("identity")
-        if verify_python and _has_explicit_patch_identity(identity):
+        if verify_python:
             if not isinstance(identity, Mapping):  # pragma: no cover - manifest guard
                 raise MaaFWRuntimePoolError(
                     f"runtime manifest identity is invalid: {runtime_id}"
                 )
+            # A missing executable is recoverable above, but a present Python
+            # whose probed ABI disagrees with its selector is an identity
+            # violation. Keep that fail-closed contract instead of silently
+            # quarantining and rebuilding under an untrusted interpretation.
             _verify_installed_python_identity(python_executable, identity)
         now = _utc_now()
         payload["path"] = str(runtime_dir)
@@ -788,12 +930,75 @@ class MaaFWRuntimePool:
                 candidate = environment_path / candidate
         else:
             candidate = _venv_python(environment_path)
+        _assert_existing_chain_has_no_reparse(candidate)
         resolved = candidate.resolve()
         if not _is_within(resolved, stage_dir.resolve()) or not resolved.is_file():
             raise MaaFWRuntimePoolError(
                 f"runtime installer did not create a managed Python executable: {candidate}"
             )
         return resolved.relative_to(stage_dir.resolve())
+
+    def _quarantine_stale_runtime(
+        self,
+        runtime_id: str,
+    ) -> tuple[dict[str, Any], Path | None]:
+        runtime_dir = self._runtime_dir(runtime_id)
+        if not runtime_dir.exists() and not runtime_dir.is_symlink():
+            return {}, None
+        self._validate_managed_runtime_dir(
+            runtime_dir,
+            runtime_id,
+            require_manifest=False,
+        )
+        recovery_metadata = self._read_recovery_metadata(runtime_dir)
+        quarantine_dir = self.staging_root / (
+            f"{runtime_id}-quarantine-{uuid.uuid4().hex}"
+        )
+        self._validate_staging_path(quarantine_dir, runtime_id)
+        if quarantine_dir.exists() or quarantine_dir.is_symlink():
+            raise MaaFWRuntimePoolError(
+                f"runtime quarantine path already exists: {quarantine_dir}"
+            )
+        runtime_dir.replace(quarantine_dir)
+        return recovery_metadata, quarantine_dir
+
+    def _read_recovery_metadata(self, runtime_dir: Path) -> dict[str, Any]:
+        manifest_path = runtime_dir / RUNTIME_MANIFEST_NAME
+        _assert_not_reparse(manifest_path)
+        try:
+            value = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        except Exception as exc:
+            raise MaaFWRuntimePoolError(
+                f"runtime recovery metadata is invalid: {runtime_dir.name}: {exc}"
+            ) from exc
+        if not isinstance(value, Mapping):
+            return {}
+
+        pinned = value.get("pinned", False)
+        if not isinstance(pinned, bool):
+            raise MaaFWRuntimePoolError(
+                f"runtime recovery pin state is invalid: {runtime_dir.name}"
+            )
+        recovery: dict[str, Any] = {
+            "pinned": pinned,
+            "references": _normalize_string_list(
+                value.get("references", []),
+                "references",
+            ),
+        }
+        leases = value.get("leases", {})
+        _validate_runtime_leases(leases)
+        recovery["leases"] = copy.deepcopy(dict(leases))
+        metadata = value.get("metadata")
+        if isinstance(metadata, Mapping):
+            recovery["metadata"] = _json_compatible(metadata)
+        for field_name in ("createdAt",):
+            field_value = value.get(field_name)
+            if isinstance(field_value, str) and field_value.strip():
+                recovery[field_name] = field_value
+        return recovery
 
     def _deletion_blockers(
         self,
@@ -854,6 +1059,7 @@ class MaaFWRuntimePool:
 
     def _validate_staging_path(self, path: Path, runtime_id: str) -> None:
         _validate_runtime_id(runtime_id)
+        _assert_not_reparse(path)
         resolved = path.resolve()
         if resolved.parent != self.staging_root.resolve():
             raise MaaFWRuntimePoolError(f"staging path escapes runtime pool: {path}")
@@ -868,12 +1074,17 @@ class MaaFWRuntimePool:
         require_manifest: bool,
     ) -> None:
         _validate_runtime_id(runtime_id)
+        _assert_not_reparse(path)
+        if not path.is_dir():
+            raise MaaFWRuntimePoolError(
+                f"managed runtime must be a directory: {path}"
+            )
         resolved = path.resolve()
         if resolved.parent != self.runtime_root.resolve() or resolved.name != runtime_id:
             raise MaaFWRuntimePoolError(f"runtime path escapes managed pool: {path}")
-        if path.is_symlink():
-            raise MaaFWRuntimePoolError(f"managed runtime cannot be a symlink: {path}")
-        if require_manifest and not (resolved / RUNTIME_MANIFEST_NAME).is_file():
+        manifest_path = resolved / RUNTIME_MANIFEST_NAME
+        _assert_not_reparse(manifest_path)
+        if require_manifest and not manifest_path.is_file():
             raise MaaFWRuntimePoolError(f"managed runtime has no manifest: {runtime_id}")
 
 
@@ -1072,20 +1283,6 @@ def _verify_installed_python_identity(
             + "; ".join(mismatches)
         )
     return {str(key): str(value) for key, value in actual.items()}
-
-
-def _has_explicit_patch_identity(value: Any) -> bool:
-    if not isinstance(value, Mapping):
-        return False
-    python_version = str(value.get("pythonVersion") or "").strip()
-    if not python_version:
-        return False
-    try:
-        return len(Version(python_version).release) >= 3
-    except InvalidVersion as exc:
-        raise MaaFWRuntimePoolError(
-            "runtime manifest identity has an invalid pythonVersion"
-        ) from exc
 
 
 def _optional_string(value: Any) -> str | None:

@@ -313,6 +313,159 @@ class MaaFWRuntimePoolContractTest(unittest.TestCase):
             )
         self.assertTrue(Path(runtime["path"]).is_dir())
 
+    def test_corrupt_selector_manifest_is_stale_and_quarantined_on_ensure(
+        self,
+    ) -> None:
+        runtime = self.service.ensure_runtime("maafw==4.3.0")
+        runtime_id = runtime["runtimeId"]
+        runtime_dir = Path(runtime["path"])
+        sentinel = runtime_dir / "keep-during-recovery.txt"
+        sentinel.write_text("preserve", encoding="utf-8")
+        manifest_path = runtime_dir / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["pinned"] = True
+        manifest["references"] = ["project:protected"]
+        manifest["leases"] = {
+            "runner-1": {
+                "owner": "runner",
+                "acquiredAt": "2029-01-01T00:00:00Z",
+                "expiresAt": None,
+            }
+        }
+        manifest["selectorRequirements"] = ["maafw==9.9.9"]
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        self.assertIsNone(self.service.resolve_runtime({"runtimeId": runtime_id}))
+
+        restored = self.service.ensure_runtime(
+            {
+                "runtimeId": runtime_id,
+                "requirements": runtime["selectorRequirements"],
+            }
+        )
+
+        self.assertEqual(restored["runtimeId"], runtime_id)
+        self.assertEqual(len(self.install_calls), 2)
+        quarantine = list(
+            (self.pool_root / ".staging").glob(f"{runtime_id}-quarantine-*")
+        )
+        self.assertEqual(len(quarantine), 1)
+        self.assertEqual(
+            (quarantine[0] / "keep-during-recovery.txt").read_text(
+                encoding="utf-8"
+            ),
+            "preserve",
+        )
+        self.assertEqual(
+            json.loads((Path(restored["path"]) / "manifest.json").read_text())[
+                "pinned"
+            ],
+            True,
+        )
+        restored_manifest = json.loads(
+            (Path(restored["path"]) / "manifest.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(restored_manifest["references"], ["project:protected"])
+        self.assertEqual(restored_manifest["leases"]["runner-1"]["owner"], "runner")
+
+    def test_missing_python_is_stale_and_quarantined_on_ensure(self) -> None:
+        runtime = self.service.ensure_runtime("maafw==4.3.0")
+        runtime_id = runtime["runtimeId"]
+        runtime_dir = Path(runtime["path"])
+        python_executable = Path(runtime["pythonExecutable"])
+        detached_python = Path(self.temporary_directory.name) / "detached-python.exe"
+        python_executable.replace(detached_python)
+
+        self.assertIsNone(self.service.resolve_runtime({"runtimeId": runtime_id}))
+
+        restored = self.service.ensure_runtime(
+            {
+                "runtimeId": runtime_id,
+                "requirements": runtime["selectorRequirements"],
+            }
+        )
+
+        self.assertEqual(restored["runtimeId"], runtime_id)
+        self.assertTrue(Path(restored["pythonExecutable"]).is_file())
+        quarantine = list(
+            (self.pool_root / ".staging").glob(f"{runtime_id}-quarantine-*")
+        )
+        self.assertEqual(len(quarantine), 1)
+        relative_python = python_executable.relative_to(runtime_dir)
+        self.assertFalse((quarantine[0] / relative_python).exists())
+        self.assertTrue(detached_python.is_file())
+
+    def test_stale_recovery_is_serialized_for_one_runtime_id(self) -> None:
+        runtime = self.service.ensure_runtime("maafw==4.3.0")
+        runtime_id = runtime["runtimeId"]
+        manifest_path = Path(runtime["path"]) / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["selectorRequirements"] = ["maafw==9.9.9"]
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        request = {
+            "runtimeId": runtime_id,
+            "requirements": runtime["selectorRequirements"],
+        }
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [
+                executor.submit(self.service.ensure_runtime, request)
+                for _ in range(4)
+            ]
+            restored = [future.result(timeout=5) for future in futures]
+
+        self.assertEqual({item["runtimeId"] for item in restored}, {runtime_id})
+        self.assertEqual(len(self.install_calls), 2)
+        self.assertEqual(
+            len(
+                list(
+                    (self.pool_root / ".staging").glob(
+                        f"{runtime_id}-quarantine-*"
+                    )
+                )
+            ),
+            1,
+        )
+
+    def test_stale_recovery_refuses_malformed_protection_metadata(self) -> None:
+        runtime = self.service.ensure_runtime("maafw==4.3.0")
+        runtime_id = runtime["runtimeId"]
+        runtime_dir = Path(runtime["path"])
+        manifest_path = runtime_dir / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["selectorRequirements"] = ["maafw==9.9.9"]
+        manifest["leases"] = {"active": "malformed-but-protected"}
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        with self.assertRaisesRegex(
+            MaaFWRuntimePoolError,
+            "lease entry is invalid",
+        ):
+            self.service.ensure_runtime(
+                {
+                    "runtimeId": runtime_id,
+                    "requirements": runtime["selectorRequirements"],
+                }
+            )
+
+        self.assertTrue(runtime_dir.is_dir())
+        self.assertEqual(
+            list((self.pool_root / ".staging").glob(f"{runtime_id}-quarantine-*")),
+            [],
+        )
+
+    def test_stale_resolution_does_not_swallow_root_marker_errors(self) -> None:
+        runtime = self.service.ensure_runtime("maafw==4.3.0")
+        marker_path = self.pool_root / POOL_MARKER_NAME
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        marker["kind"] = "not-a-runtime-pool"
+        marker_path.write_text(json.dumps(marker), encoding="utf-8")
+
+        with self.assertRaisesRegex(MaaFWRuntimePoolError, "marker kind is invalid"):
+            self.service.resolve_runtime({"runtimeId": runtime["runtimeId"]})
+
     def test_gc_refuses_runtime_manifest_with_malformed_lease(self) -> None:
         runtime = self.service.ensure_runtime({"requirements": ["maafw==4.3.0"]})
         manifest_path = Path(runtime["path"]) / "manifest.json"

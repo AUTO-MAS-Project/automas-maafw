@@ -17,9 +17,16 @@ class MaaFWResolvedHotkey:
         values = {
             f"{{{field_name}}}": self.primary,
             f"{{{field_name}}}.primary": self.primary,
+            # MaaFW ProjectInterface examples use both placeholder styles:
+            # ``{Field}.primary`` (legacy) and ``{Field.primary}`` (current).
+            # Keep the legacy spelling while exposing the current spelling so
+            # project pipeline overrides are resolved before they reach the
+            # native parser.
+            f"{{{field_name}.primary}}": self.primary,
         }
         for index, modifier in enumerate(self.modifiers, start=1):
             values[f"{{{field_name}}}.modifier{index}"] = modifier
+            values[f"{{{field_name}.modifier{index}}}"] = modifier
         return values
 
 

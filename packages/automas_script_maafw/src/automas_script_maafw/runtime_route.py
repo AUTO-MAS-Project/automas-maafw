@@ -41,21 +41,44 @@ def runtime_pool_route_from_service(service: Any) -> MaaFWRuntimePoolRoute:
     if not isinstance(payload, Mapping):
         raise MaaFWRuntimeRouteError("MaaFW Runtime Pool storage_info 必须返回对象")
 
-    raw_root = str(payload.get("root") or "").strip()
-    pool_id = str(payload.get("poolId") or "").strip()
+    raw_root = _required_runtime_pool_text(payload, "root", "root")
+    pool_id = _required_runtime_pool_text(payload, "poolId", "poolId")
     if not raw_root or not pool_id:
         raise MaaFWRuntimeRouteError(
             "MaaFW Runtime Pool storage_info 缺少 root 或 poolId"
         )
 
-    root_identity = payload.get("rootIdentity")
-    if isinstance(root_identity, Mapping):
-        identity_pool_id = str(root_identity.get("poolId") or "").strip()
-        if identity_pool_id and identity_pool_id != pool_id:
+    if "rootIdentity" in payload:
+        root_identity = payload["rootIdentity"]
+        if not isinstance(root_identity, Mapping):
+            raise MaaFWRuntimeRouteError(
+                "MaaFW Runtime Pool storage_info 的 rootIdentity 必须是对象"
+            )
+        if "poolId" in root_identity:
+            identity_pool_id = root_identity["poolId"]
+            if not isinstance(identity_pool_id, str):
+                raise MaaFWRuntimeRouteError(
+                    "MaaFW Runtime Pool rootIdentity.poolId 必须是字符串"
+                )
+            identity_pool_id = identity_pool_id.strip()
+        else:
+            raise MaaFWRuntimeRouteError(
+                "MaaFW Runtime Pool rootIdentity 缺少 poolId"
+            )
+        if not identity_pool_id:
+            raise MaaFWRuntimeRouteError(
+                "MaaFW Runtime Pool rootIdentity.poolId 不能为空"
+            )
+        if identity_pool_id != pool_id:
             raise MaaFWRuntimeRouteError(
                 "MaaFW Runtime Pool storage_info 的 poolId 与 rootIdentity 不一致"
             )
-    return MaaFWRuntimePoolRoute(root=Path(raw_root).resolve(), pool_id=pool_id)
+    root_path = Path(raw_root)
+    if not root_path.is_absolute():
+        raise MaaFWRuntimeRouteError(
+            "MaaFW Runtime Pool storage_info 的 root 必须是绝对路径"
+        )
+    return MaaFWRuntimePoolRoute(root=root_path.resolve(), pool_id=pool_id)
 
 
 def managed_execution_route(
@@ -82,7 +105,13 @@ def managed_execution_route(
         "MaaFW requirement",
     )
     binding_pool_id = _required_text(runtime_binding, "poolId", "Runtime Pool ID")
-    normalized_expected_pool_id = str(expected_pool_id or "").strip()
+    if expected_pool_id is not None and not isinstance(expected_pool_id, str):
+        raise MaaFWRuntimeRouteError(
+            "MaaFW Managed 宿主 Runtime Pool ID 必须是字符串"
+        )
+    normalized_expected_pool_id = (
+        expected_pool_id.strip() if isinstance(expected_pool_id, str) else ""
+    )
     if not normalized_expected_pool_id:
         raise MaaFWRuntimeRouteError("MaaFW Managed 执行缺少宿主 Runtime Pool ID")
     if binding_pool_id != normalized_expected_pool_id:
@@ -187,9 +216,30 @@ def managed_execution_route(
 
 
 def _required_text(value: Mapping[str, Any], key: str, label: str) -> str:
-    normalized = str(value.get(key) or "").strip()
+    raw = value.get(key)
+    if raw is not None and not isinstance(raw, str):
+        raise MaaFWRuntimeRouteError(f"MaaFW Managed {label}必须是字符串")
+    normalized = raw.strip() if isinstance(raw, str) else ""
     if not normalized:
         raise MaaFWRuntimeRouteError(f"MaaFW Managed 执行缺少{label}")
+    return normalized
+
+
+def _required_runtime_pool_text(
+    value: Mapping[str, Any],
+    key: str,
+    label: str,
+) -> str:
+    raw = value.get(key)
+    if raw is not None and not isinstance(raw, str):
+        raise MaaFWRuntimeRouteError(
+            f"MaaFW Runtime Pool {label}必须是字符串"
+        )
+    normalized = raw.strip() if isinstance(raw, str) else ""
+    if not normalized:
+        raise MaaFWRuntimeRouteError(
+            f"MaaFW Runtime Pool storage_info 缺少{label}"
+        )
     return normalized
 
 

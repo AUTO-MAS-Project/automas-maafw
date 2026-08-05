@@ -276,6 +276,9 @@ class MaaFWPipelineOverrideBuilder:
                 f"{{{hotkey_item.name}}}.primary",
                 f"{{{hotkey_item.name}}}.modifier1",
                 f"{{{hotkey_item.name}}}.modifier2",
+                f"{{{hotkey_item.name}.primary}}",
+                f"{{{hotkey_item.name}.modifier1}}",
+                f"{{{hotkey_item.name}.modifier2}}",
             }
             referenced_values = {
                 value

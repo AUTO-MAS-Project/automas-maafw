@@ -110,6 +110,7 @@ def build_maafw_run_plan(
         controller_names=controller_names,
         resource_name=resource.name,
     )
+    i18n_mapping = _load_i18n_mapping(resolved_base_dir, interface)
 
     runnable_tasks: list[MaaFWTaskRunPlan] = []
     skipped_tasks: list[MaaFWSkippedTaskPlan] = []
@@ -128,7 +129,7 @@ def build_maafw_run_plan(
             skipped_tasks.append(
                 MaaFWSkippedTaskPlan(
                     name=task.name,
-                    label=task.label,
+                    label=_resolve_i18n_label(task.label, task.name, i18n_mapping),
                     entry=task.entry,
                     reason=reason,
                 )
@@ -143,7 +144,7 @@ def build_maafw_run_plan(
         runnable_tasks.append(
             MaaFWTaskRunPlan(
                 name=task.name,
-                label=task.label,
+                label=_resolve_i18n_label(task.label, task.name, i18n_mapping),
                 entry=task.entry,
                 options=options,
                 pipelineOverride=pipeline_override,
@@ -346,6 +347,7 @@ def _build_pretask_plans(
     task_options: MaaFWTaskOptionsByTask,
 ) -> list[MaaFWPretaskRunPlan]:
     plans: list[MaaFWPretaskRunPlan] = []
+    i18n_mapping = _load_i18n_mapping(base_dir, interface_model)
     for task_name in selected_names:
         pretask = find_pretask_by_task_name(interface_model, task_name)
         if pretask is None:
@@ -374,7 +376,11 @@ def _build_pretask_plans(
         plans.append(
             MaaFWPretaskRunPlan(
                 name=task_name,
-                label=pretask.label,
+                label=_resolve_i18n_label(
+                    pretask.label,
+                    pretask.name or pretask.exec,
+                    i18n_mapping,
+                ),
                 executable=_resolve_pretask_executable(base_dir, pretask.exec),
                 args=args,
                 options=serialized_options,
@@ -665,6 +671,36 @@ def _resolve_i18n_value(value: Any, mapping: dict[str, Any]) -> Any:
         if translated is not None:
             return translated
     return value
+
+
+def _resolve_i18n_label(
+    value: Any,
+    fallback: str,
+    mapping: dict[str, Any],
+) -> str:
+    resolved = _resolve_i18n_value(value, mapping)
+    if (
+        isinstance(resolved, str)
+        and resolved.strip()
+        and not resolved.lstrip().startswith("$")
+    ):
+        return resolved
+
+    # MaaFW projects commonly keep task labels in a flat locale map while
+    # leaving ``interface.json`` task.label unset (for example,
+    # ``task.VisitFriends.label``).  Resolve that conventional key before
+    # falling back to the machine-facing task id, so overview/run logs do not
+    # expose raw IDs when a project already ships i18n data.
+    normalized_fallback = str(fallback or "").strip()
+    if normalized_fallback:
+        for prefix in ("task", "pretask"):
+            translated = _lookup_i18n_text(
+                f"{prefix}.{normalized_fallback}.label",
+                mapping,
+            )
+            if isinstance(translated, str) and translated.strip():
+                return translated
+    return fallback
 
 
 def _lookup_i18n_text(key: str, mapping: dict[str, Any]) -> str | None:

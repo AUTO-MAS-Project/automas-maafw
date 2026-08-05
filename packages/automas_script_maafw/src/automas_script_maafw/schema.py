@@ -233,9 +233,8 @@ def build_source_config(script_data: dict[str, Any]) -> dict[str, Any] | None:
             result["cdk"] = cdk
         return result
     if not source:
-        # Automatic provider selection still needs the package-selection
-        # details used by a same-version GitHub fallback.  Omitting ``source``
-        # keeps MirrorChyan metadata authoritative when the PI declares a RID.
+        # Preserve a blank provider so the host can apply its global
+        # MirrorChyan/GitHub selection at check or run time.
         result = {}
         for config_key, update_key in (
             ("cdk", "MirrorChyanCDK"),

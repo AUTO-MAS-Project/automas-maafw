@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -29,6 +30,41 @@ from .worker_registry import (
 
 
 ProjectEnvironmentProgressCallback = Callable[[dict[str, Any]], None]
+_PROJECT_ENVIRONMENT_INPUTS = (
+    "interface.json",
+    "interface.jsonc",
+    ".auto_mas_maafw_project.json",
+    "requirements.txt",
+    "pyproject.toml",
+    "uv.lock",
+)
+
+
+def project_environment_fingerprint(project_path: str | Path) -> str | None:
+    """Hash the project inputs that determine the prepared Runner route."""
+
+    root = Path(project_path).expanduser().resolve(strict=False)
+    if not root.is_dir():
+        return None
+
+    digest = hashlib.sha256()
+    found_interface = False
+    for relative_name in _PROJECT_ENVIRONMENT_INPUTS:
+        candidate = root / relative_name
+        if not candidate.is_file():
+            digest.update(f"missing:{relative_name}\0".encode("utf-8"))
+            continue
+        if relative_name in {"interface.json", "interface.jsonc"}:
+            found_interface = True
+        try:
+            content = candidate.read_bytes()
+        except OSError:
+            return None
+        digest.update(relative_name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    return digest.hexdigest() if found_interface else None
 
 
 def _report_project_progress(
@@ -192,6 +228,7 @@ class MaaFWRunnerService:
 
         environment: MaaFWRunnerEnvironment | None = None
         try:
+            input_fingerprint = project_environment_fingerprint(project_path)
             environment = self.prepare_environment(
                 project_path,
                 runtime_pool_root=runtime_pool_root,
@@ -272,6 +309,12 @@ class MaaFWRunnerService:
                 install_dependencies=install_agent_dependencies,
                 progress=report_agent_progress,
             )
+            if input_fingerprint is not None and (
+                project_environment_fingerprint(project_path) != input_fingerprint
+            ):
+                raise RuntimeError(
+                    "MaaFW 项目环境输入在准备期间发生变化；拒绝缓存旧运行环境"
+                )
             result = {
                 "status": "ready",
                 "runtime": {
@@ -285,6 +328,8 @@ class MaaFWRunnerService:
                 },
                 "agents": agent_result.model_dump(mode="json"),
             }
+            if input_fingerprint is not None:
+                result["projectFingerprint"] = input_fingerprint
             _report_project_progress(
                 progress,
                 "completed",
