@@ -34,7 +34,7 @@ Managed 服务、类型和后端契约保留，待资源管理器重新设计完
 | `automas-maafw-project-update` 0.2.3 | `automas_maafw_project_update.plugin:Plugin` | `maafw.project_update.v1` | MirrorChyan/GitHub 版本发现、受限下载、校验和进度 |
 | `automas-maafw-runtime-pool` 0.2.0 | `automas_maafw_runtime_pool.plugin:Plugin` | `maafw.runtime_pool.v1` | 按完整依赖 selector 与 Python ABI 隔离/复用运行环境 |
 | `automas-maafw-runner` 0.4.0 | `automas_maafw_runner.plugin:Plugin` | `maafw.runner.v1` | 可信 runtime 路由、预热、worker 生命周期与结果模型 |
-| `automas-script-maafw` 0.1.12 | `automas_script_maafw.plugin:Plugin` | `maafw.registry.v1`、`maafw.configuration_reuse.v1`、`maafw.api.v1` | 注册普通 MaaFW 适配器、配置导入/复制、项目更新/环境预热 transport、运行绑定 |
+| `automas-script-maafw` 0.1.13 | `automas_script_maafw.plugin:Plugin` | `maafw.registry.v1`、`maafw.configuration_reuse.v1`、`maafw.api.v1` | 注册普通 MaaFW 适配器、配置导入/复制、项目更新/环境预热 transport、运行绑定 |
 | `automas-script-maafw-managed` 0.3.2 | `automas_script_maafw_managed.plugin:Plugin` | `maafw.managed.environment.v1` | 内部 Managed 转换、资源升级/切换、运行绑定、进度与回收动作 |
 
 M9A 的 project pack 和聚合包位于独立仓库；通用 MaaFW 包不得反向依赖 M9A、MaaEnd
@@ -95,7 +95,7 @@ ProjectInterface
 
 ## 5. 事务与宿主最低能力
 
-发布或启用普通脚本 0.1.12 / Managed 0.3.2 前，宿主必须提供：
+发布或启用普通脚本 0.1.13 / Managed 0.3.2 前，宿主必须提供：
 
 ```text
 Config.script_config_transaction()
@@ -131,7 +131,7 @@ Managed 的远程更新源由宿主全局配置统一决定，其请求字段仅
 1. Interface 0.2.0、Project Store 0.2.3、Runtime Pool 0.2.0。
 2. Agent Env 0.1.4、Project Update 0.2.3。
 3. Runner 0.4.0。
-4. Script MaaFW 0.1.12。
+4. Script MaaFW 0.1.13。
 5. Script MaaFW Managed 0.3.2。
 6. 独立 M9A 仓库的 pack，再发布聚合包。
 

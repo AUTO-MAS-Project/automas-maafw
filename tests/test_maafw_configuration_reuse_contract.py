@@ -631,6 +631,13 @@ class MaaFWConfigurationReuseControllerTest(unittest.TestCase):
         self.assertEqual(set(self.config.users), {self.source_user_id})
         self.assertEqual(self.config.events[-1][0], "del_user")
 
+    def test_configuration_boundary_rejects_truthy_script_updated(self) -> None:
+        with self.assertRaisesRegex(
+            MaaFWConfigurationReuseError,
+            "scriptUpdated.*boolean",
+        ):
+            self.controller_module._strict_bool("true", "scriptUpdated")
+
     def _fake_config(self):
         script_id = self.script_id
         source_user_id = self.source_user_id

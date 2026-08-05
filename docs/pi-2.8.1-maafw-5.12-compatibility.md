@@ -62,7 +62,7 @@ Project Store 0.2.2 会在移除发行包内置解释器前，从显式 ProjectI
 Runner 0.4.0 对完整 selector、`poolId`、`runtimeId` 和 Python 约束做一致性校验，
 再复用 Store/Pool 的可信 binding；准备和真实运行使用相同 identity，不能以宿主
 CP312 重算 CP313 runtime。M9A 集成包的发布下限必须同步为
-`automas-maafw-runner>=0.4.0` 与 `automas-script-maafw>=0.1.11`。
+`automas-maafw-runner>=0.4.0` 与 `automas-script-maafw>=0.1.13`。
 
 ## Reference 样本结果
 

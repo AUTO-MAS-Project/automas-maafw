@@ -3,7 +3,7 @@
 ## Unreleased
 
 - 将通用 MaaFW 插件从 AUTO-MAS 主仓迁移到独立工作区仓库。
-- Script MaaFW 0.1.12 将普通项目更新、Agent 环境预热、进度 WebSocket 与配置
+- Script MaaFW 0.1.13 将普通项目更新、Agent 环境预热、进度 WebSocket 与配置
   复用 transport 收敛到插件通用 gateway，并用 Runtime Pool 身份绑定的 sidecar
   复用已验证环境；宿主只保留通用桥接。
 - Runtime Pool 0.2.0 接收宿主通过 `AUTO_MAS_UV_INDEX_URL` 提供的首选镜像，
@@ -85,5 +85,5 @@
 - `automas-maafw-project-store`: 0.2.3
 - `automas-maafw-runtime-pool`: 0.2.0
 - `automas-maafw-runner`: 0.4.0
-- `automas-script-maafw`: 0.1.12
+- `automas-script-maafw`: 0.1.13
 - `automas-script-maafw-managed`: 0.3.2

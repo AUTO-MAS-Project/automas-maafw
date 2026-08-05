@@ -4,6 +4,7 @@ import asyncio
 import copy
 import inspect
 import json
+import os
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime
@@ -42,6 +43,26 @@ API_SERVICE = "maafw.api.v1"
 
 PROJECT_UPDATE_PROGRESS = "maafw.project-update.progress"
 ENV_PREPARE_PROGRESS = "maafw.env-prepare.progress"
+
+_MISSING = object()
+_SENSITIVE_PROGRESS_KEY_PARTS = (
+    "authorization",
+    "credential",
+    "password",
+    "secret",
+    "token",
+)
+_SENSITIVE_PROGRESS_KEYS = {
+    "cdk",
+    "headers",
+    "mirror_cdk",
+    "proxy",
+    # ``_progress_callback`` accepts this internal correlation aid for
+    # provider-side diagnostics, but it must never cross the generic gateway
+    # WebSocket boundary as an absolute local filesystem path.
+    "project_path",
+    "source_config",
+}
 
 class MaaFWApiError(RuntimeError):
     """A user-facing failure at the ordinary MaaFW API boundary."""
@@ -204,6 +225,41 @@ def _record_type(record: Mapping[str, Any]) -> str:
     return outer
 
 
+def _registered_script_framework(type_key: str) -> str:
+    """Resolve a script provider's declared framework, if registered."""
+
+    normalized = str(type_key or "").strip()
+    if not normalized:
+        return ""
+    try:
+        from app.core.script_types import script_type_registry
+
+        provider = script_type_registry.get(normalized)
+    except Exception:
+        return ""
+    metadata = getattr(provider, "metadata", None)
+    if not isinstance(metadata, Mapping):
+        return ""
+    return str(metadata.get("framework") or "").strip()
+
+
+def _is_maafw_record(record: Mapping[str, Any]) -> bool:
+    """Accept any registered/declared MaaFW framework script type.
+
+    The ordinary transport is shared by the base MaaFW adapter and project
+    packs that intentionally use their own ``type_key``.  Eligibility must
+    therefore follow the host provider's stable ``framework=maafw``
+    declaration, not a concrete type-key spelling such as ``MaaFW`` or
+    ``M9A``.  Record JSON is untrusted and is intentionally not consulted for
+    this decision.
+    """
+
+    type_key = _record_type(record)
+    if type_key.casefold() == "maafw":
+        return True
+    return _registered_script_framework(type_key).casefold() == "maafw"
+
+
 def _record_config(record: Mapping[str, Any]) -> dict[str, Any]:
     config = record.get("config")
     if not isinstance(config, Mapping):
@@ -217,6 +273,56 @@ def _value(value: Any, key: str, default: Any = None) -> Any:
     if isinstance(value, Mapping):
         return value.get(key, default)
     return getattr(value, key, default)
+
+
+def _strict_bool(value: Any, label: str, *, default: bool = False) -> bool:
+    """Read a boolean crossing the plugin boundary without truthy coercion."""
+
+    if value is _MISSING or value is None:
+        return default
+    if type(value) is not bool:
+        raise ValueError(f"{label} 必须是 boolean")
+    return value
+
+
+def _absolute_project_path(value: Any, *, field: str) -> Path:
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValueError(f"{field} 不能为空")
+    path = Path(raw)
+    if not path.is_absolute():
+        raise ValueError(f"{field} 必须是绝对路径")
+    return path.resolve()
+
+
+def _same_project_path(left: Path, right: Path) -> bool:
+    return os.path.normcase(str(left.resolve())) == os.path.normcase(str(right.resolve()))
+
+
+def _public_progress_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _public_progress_value(item)
+            for key, item in value.items()
+            if _is_public_progress_key(key)
+        }
+    if isinstance(value, list):
+        return [_public_progress_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [_public_progress_value(item) for item in value]
+    return value
+
+
+def _is_public_progress_key(key: Any) -> bool:
+    normalized = str(key).strip().casefold()
+    if (
+        normalized in _SENSITIVE_PROGRESS_KEYS
+        or normalized.startswith("proxy")
+        or "sourceconfig" in normalized
+        or normalized.endswith("cdk")
+    ):
+        return False
+    return not any(part in normalized for part in _SENSITIVE_PROGRESS_KEY_PARTS)
 
 
 def _script_id_from_request(request: PluginHttpRequest) -> str:
@@ -284,7 +390,12 @@ def _is_managed_record(record: Mapping[str, Any]) -> bool:
         if resource_model in {"project-store", "project_store"}:
             return True
     except Exception:
-        pass
+        # ``_is_maafw_record`` has already established the framework.  If a
+        # non-native type cannot be resolved on this second lookup, reject the
+        # ordinary transport conservatively instead of treating an unknown
+        # plugin as a plain directory project.  The native MaaFW type has no
+        # registry entry in older hosts, so retain its ordinary behavior.
+        return _record_type(record).casefold() != "maafw"
     return False
 
 
@@ -430,16 +541,47 @@ class MaaFWApiController:
     async def close(self) -> None:
         self._draining = True
         current = asyncio.current_task()
-        operations = tuple(task for task in self._operations if task is not current)
-        if operations:
-            await asyncio.gather(*operations, return_exceptions=True)
-        pending = tuple(self._progress_tasks)
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
+        # Providers can schedule progress work while an operation is winding
+        # down.  Drain until both registries stay empty instead of taking one
+        # snapshot and dropping tasks that were queued during that await.
+        while True:
+            operations = tuple(
+                task
+                for task in self._operations
+                if task is not current and not task.done()
+            )
+            pending = tuple(task for task in self._progress_tasks if not task.done())
+            if not operations and not pending:
+                # Let callbacks that were queued by a worker thread run once
+                # before declaring the drain complete.
+                await asyncio.sleep(0)
+                if not any(
+                    task is not current and not task.done()
+                    for task in self._operations
+                ) and not any(not task.done() for task in self._progress_tasks):
+                    break
+                continue
+            await asyncio.gather(*operations, *pending, return_exceptions=True)
         self._progress_tasks.clear()
+        sessions = tuple(self._sessions)
         self._sessions.clear()
+        for session in sessions:
+            try:
+                await session.close(code=1001, reason="MaaFW 插件正在停止")
+            except Exception:
+                # A peer may already have gone away.  Removing it above keeps
+                # shutdown reliable even when its close handshake fails.
+                continue
 
     async def _on_progress_connect(self, session: PluginWebSocketSession) -> None:
+        if self._draining:
+            try:
+                await session.close(code=1001, reason="MaaFW 插件正在停止")
+            except Exception:
+                # The peer may have gone away while the shutdown handshake was
+                # being attempted; it was never added to the live-session set.
+                pass
+            return
         self._sessions.add(session)
 
     async def _on_progress_disconnect(self, session: PluginWebSocketSession) -> None:
@@ -472,10 +614,13 @@ class MaaFWApiController:
         loop = self._loop or asyncio.get_running_loop()
 
         def publish(progress: Mapping[str, Any]) -> None:
-            data = {"scriptId": script_id}
+            data = dict(progress)
+            # Provider payloads are untrusted at this boundary: never let a
+            # provider overwrite the correlation ID or project path selected
+            # by the controller.
+            data["scriptId"] = script_id
             if project_path is not None:
                 data["project_path"] = project_path
-            data.update(dict(progress))
 
             def schedule() -> None:
                 task = asyncio.create_task(self._broadcast(event_type, script_id, data))
@@ -492,7 +637,12 @@ class MaaFWApiController:
         script_id: str,
         data: Mapping[str, Any],
     ) -> None:
-        message = {"id": script_id, "type": event_type, "data": dict(data)}
+        # The generic host WebSocket has no subscription primitive.  Keep the
+        # existing server-push contract, but strip credentials and transport
+        # configuration before sending progress to every connected client.
+        public_data = _public_progress_value(data)
+        public_data["scriptId"] = script_id
+        message = {"id": script_id, "type": event_type, "data": public_data}
         stale: list[PluginWebSocketSession] = []
         for session in tuple(self._sessions):
             try:
@@ -505,9 +655,23 @@ class MaaFWApiController:
     @_track_http_operation
     async def project_update(self, request: PluginHttpRequest) -> dict[str, Any]:
         self._set_loop()
+        raw_payload = _payload(request)
+        raw_script_id = str(raw_payload.get("scriptId") or "").strip()
         try:
-            payload = MaaFWProjectUpdateIn.model_validate(_payload(request))
+            payload = MaaFWProjectUpdateIn.model_validate(raw_payload)
         except Exception as exc:
+            if raw_script_id:
+                self._progress_callback(
+                    PROJECT_UPDATE_PROGRESS,
+                    raw_script_id,
+                )(
+                    {
+                        "stage": "failed",
+                        "status": "invalid_request",
+                        "message": f"请求参数无效: {exc}",
+                        "final": True,
+                    }
+                )
             return model_json(
                 MaaFWProjectUpdateOut(
                     code=400,
@@ -528,8 +692,19 @@ class MaaFWApiController:
             for line in str(message).splitlines() or [""]:
                 logs.append(f"[{timestamp}] {line}")
 
-        def publish(progress: Mapping[str, Any]) -> None:
+        def emit_terminal(progress: Mapping[str, Any]) -> None:
             nonlocal deferred_provider_terminal, terminal_published
+            if terminal_published:
+                return
+            deferred_provider_terminal = None
+            terminal_published = True
+            self._progress_callback(
+                PROJECT_UPDATE_PROGRESS,
+                payload.scriptId,
+            )(progress)
+
+        def publish(progress: Mapping[str, Any]) -> None:
+            nonlocal deferred_provider_terminal
             stage = str(progress.get("stage") or "")
             # The project-update provider reports its own successful terminal
             # event before the optional Runner prewarm starts. Defer that
@@ -540,12 +715,14 @@ class MaaFWApiController:
             if (
                 payload.apply
                 and stage == "completed"
-                and bool(progress.get("final"))
+                and progress.get("final") is True
             ):
-                deferred_provider_terminal = dict(progress)
+                if not terminal_published:
+                    deferred_provider_terminal = dict(progress)
                 return
-            if stage == "failed" or bool(progress.get("final")):
-                terminal_published = True
+            if stage == "failed" or progress.get("final") is True:
+                emit_terminal(progress)
+                return
             self._progress_callback(
                 PROJECT_UPDATE_PROGRESS,
                 payload.scriptId,
@@ -554,21 +731,39 @@ class MaaFWApiController:
         try:
             uuid.UUID(payload.scriptId)
             record = await _script_record(payload.scriptId)
-            if _record_type(record).casefold() != "maafw":
+            if not _is_maafw_record(record):
+                message = "指定脚本不是 MaaFW 项目"
+                emit_terminal(
+                    {
+                        "stage": "failed",
+                        "status": "not_maafw",
+                        "message": message,
+                        "final": True,
+                    }
+                )
                 return model_json(
                     MaaFWProjectUpdateOut(
                         code=400,
                         status="error",
-                        message="指定脚本不是 MaaFW 项目",
+                        message=message,
                         data=MaaFWProjectUpdateData(logs=logs),
                     )
                 )
             if _is_managed_record(record):
+                message = "该项目使用插件管理的版本化资源，不能通过普通目录更新接口修改"
+                emit_terminal(
+                    {
+                        "stage": "failed",
+                        "status": "managed",
+                        "message": message,
+                        "final": True,
+                    }
+                )
                 return model_json(
                     MaaFWProjectUpdateOut(
                         code=409,
                         status="error",
-                        message="该项目使用插件管理的版本化资源，不能通过普通目录更新接口修改",
+                        message=message,
                         data=MaaFWProjectUpdateData(logs=logs),
                     )
                 )
@@ -577,21 +772,38 @@ class MaaFWApiController:
             update_group = _mapping(script_form.get("Update"))
             project_path_raw = str(info_group.get("Path") or "").strip()
             if not project_path_raw:
-                append_log("请先配置 MaaFW 项目目录")
+                message = "请先配置 MaaFW 项目目录"
+                append_log(message)
+                emit_terminal(
+                    {
+                        "stage": "failed",
+                        "status": "missing_path",
+                        "message": message,
+                        "final": True,
+                    }
+                )
                 return model_json(
                     MaaFWProjectUpdateOut(
                         code=400,
                         status="error",
-                        message="请先配置 MaaFW 项目目录",
+                        message=message,
                         data=MaaFWProjectUpdateData(logs=logs),
                     )
                 )
 
-            project_path = Path(project_path_raw).resolve()
+            project_path = _absolute_project_path(project_path_raw, field="Info.Path")
             reservation_key = await try_reserve_project_path(project_path)
             if reservation_key is None:
                 message = "MaaFW 项目正在运行或更新，请稍后重试"
                 append_log(message)
+                emit_terminal(
+                    {
+                        "stage": "failed",
+                        "status": "busy",
+                        "message": message,
+                        "final": True,
+                    }
+                )
                 return model_json(
                     MaaFWProjectUpdateOut(
                         code=409,
@@ -678,7 +890,10 @@ class MaaFWApiController:
                             ),
                         )
                     )
-                installable = bool(_value(discovery, "installable", False))
+                installable = _strict_bool(
+                    _value(discovery, "installable", _MISSING),
+                    "discover_update.installable",
+                )
                 version = str(_value(discovery, "version", "") or "")
                 message = f"发现 MaaFW 项目更新 {current_version} -> {version}"
                 if installable:
@@ -726,7 +941,11 @@ class MaaFWApiController:
                 progress=publish,
             )
             environment_warning = ""
-            if bool(_value(update_result, "updated", False)):
+            updated = _strict_bool(
+                _value(update_result, "updated", _MISSING),
+                "update_if_needed.updated",
+            )
+            if updated:
                 await _run_to_thread_with_cancellation_drain(
                     invalidate_maafw_agent_env_state,
                     payload.scriptId,
@@ -827,20 +1046,13 @@ class MaaFWApiController:
                 # provider's terminal event is the complete operation result.
                 terminal_progress = deferred_provider_terminal
                 deferred_provider_terminal = None
-                terminal_published = True
-                self._progress_callback(
-                    PROJECT_UPDATE_PROGRESS,
-                    payload.scriptId,
-                )(terminal_progress)
+                emit_terminal(terminal_progress)
             elif not terminal_published:
-                self._progress_callback(
-                    PROJECT_UPDATE_PROGRESS,
-                    payload.scriptId,
-                )(
+                emit_terminal(
                     {
                         "stage": "completed",
                         "status": "updated_with_environment_warning" if environment_warning else (
-                            "updated" if bool(_value(update_result, "updated", False)) else "no_update"
+                            "updated" if updated else "no_update"
                         ),
                         "message": message or "MaaFW project update completed",
                         "percent": 100.0,
@@ -853,10 +1065,19 @@ class MaaFWApiController:
                     status=status,
                     message=message,
                     data=MaaFWProjectUpdateData(
-                        checked=bool(_value(update_result, "checked", False)),
-                        updated=bool(_value(update_result, "updated", False)),
-                        updateAvailable=bool(_value(update_result, "update_available", False)),
-                        installable=bool(_value(update_result, "installable", False)),
+                        checked=_strict_bool(
+                            _value(update_result, "checked", _MISSING),
+                            "update_if_needed.checked",
+                        ),
+                        updated=updated,
+                        updateAvailable=_strict_bool(
+                            _value(update_result, "update_available", _MISSING),
+                            "update_if_needed.update_available",
+                        ),
+                        installable=_strict_bool(
+                            _value(update_result, "installable", _MISSING),
+                            "update_if_needed.installable",
+                        ),
                         currentVersion=current_version
                         or str(_value(update_result, "current_version", "") or ""),
                         latestVersion=_value(update_result, "latest_version"),
@@ -865,17 +1086,27 @@ class MaaFWApiController:
                     ),
                 )
             )
+        except asyncio.CancelledError:
+            append_log("MaaFW 项目更新已取消")
+            emit_terminal(
+                {
+                    "stage": "failed",
+                    "status": "cancelled",
+                    "message": "MaaFW 项目更新已取消",
+                    "final": True,
+                }
+            )
+            raise
         except KeyError:
             append_log("脚本不存在或已被删除")
-            if not terminal_published:
-                publish(
-                    {
-                        "stage": "failed",
-                        "status": "not_found",
-                        "message": logs[-1],
-                        "final": True,
-                    }
-                )
+            emit_terminal(
+                {
+                    "stage": "failed",
+                    "status": "not_found",
+                    "message": logs[-1],
+                    "final": True,
+                }
+            )
             return model_json(
                 MaaFWProjectUpdateOut(
                     code=404,
@@ -886,8 +1117,9 @@ class MaaFWApiController:
             )
         except ValueError as exc:
             append_log(f"MaaFW 项目更新失败: {exc}")
-            if not terminal_published:
-                publish({"stage": "failed", "status": "failed", "message": str(exc), "final": True})
+            emit_terminal(
+                {"stage": "failed", "status": "failed", "message": str(exc), "final": True}
+            )
             return model_json(
                 MaaFWProjectUpdateOut(
                     code=400,
@@ -898,15 +1130,14 @@ class MaaFWApiController:
             )
         except Exception as exc:
             append_log(f"MaaFW 项目更新失败: {type(exc).__name__}: {exc}")
-            if not terminal_published:
-                publish(
-                    {
-                        "stage": "failed",
-                        "status": "failed",
-                        "message": str(exc),
-                        "final": True,
-                    }
-                )
+            emit_terminal(
+                {
+                    "stage": "failed",
+                    "status": "failed",
+                    "message": str(exc),
+                    "final": True,
+                }
+            )
             provider_error_code = getattr(exc, "provider_error_code", None)
             return model_json(
                 MaaFWProjectUpdateOut(
@@ -927,9 +1158,25 @@ class MaaFWApiController:
     async def prepare_agent_env(self, request: PluginHttpRequest) -> dict[str, Any]:
         self._set_loop()
         raw_payload = _payload(request)
+        raw_body_script_id = str(raw_payload.get("scriptId") or "").strip()
+        raw_header_progress_id = _header(request, "X-MaaFW-Progress-Id")
+        raw_script_id = raw_body_script_id or raw_header_progress_id
         try:
             payload = MaaFWAgentEnvPrepareIn.model_validate(raw_payload)
         except Exception as exc:
+            if raw_script_id:
+                self._progress_callback(
+                    ENV_PREPARE_PROGRESS,
+                    raw_script_id,
+                    project_path=str(raw_payload.get("path") or ""),
+                )(
+                    {
+                        "stage": "failed",
+                        "status": "invalid_request",
+                        "message": f"请求参数无效: {exc}",
+                        "final": True,
+                    }
+                )
             return model_json(
                 MaaFWAgentEnvPrepareOut(
                     code=400,
@@ -943,8 +1190,21 @@ class MaaFWApiController:
         root_path: Path | None = None
         reservation_key: str | None = None
         body_script_id = str(payload.scriptId or "").strip()
-        header_progress_id = _header(request, "X-MaaFW-Progress-Id")
+        header_progress_id = raw_header_progress_id
         if len(body_script_id) > 128 or len(header_progress_id) > 128:
+            if body_script_id or header_progress_id:
+                self._progress_callback(
+                    ENV_PREPARE_PROGRESS,
+                    body_script_id or header_progress_id,
+                    project_path=str(payload.path),
+                )(
+                    {
+                        "stage": "failed",
+                        "status": "invalid_request",
+                        "message": "MaaFW scriptId/progressId 长度不能超过 128 个字符",
+                        "final": True,
+                    }
+                )
             return model_json(
                 MaaFWAgentEnvPrepareOut(
                     code=400,
@@ -954,6 +1214,18 @@ class MaaFWApiController:
                 )
             )
         if body_script_id and header_progress_id and body_script_id != header_progress_id:
+            self._progress_callback(
+                ENV_PREPARE_PROGRESS,
+                body_script_id,
+                project_path=str(payload.path),
+            )(
+                {
+                    "stage": "failed",
+                    "status": "invalid_request",
+                    "message": "请求体 scriptId 与 X-MaaFW-Progress-Id 不一致",
+                    "final": True,
+                }
+            )
             return model_json(
                 MaaFWAgentEnvPrepareOut(
                     code=400,
@@ -970,10 +1242,23 @@ class MaaFWApiController:
             for line in str(message).splitlines() or [""]:
                 logs.append(f"[{timestamp}] {line}")
 
-        def publish(progress: Mapping[str, Any]) -> None:
+        def emit_terminal(progress: Mapping[str, Any]) -> None:
             nonlocal terminal_published
-            if str(progress.get("stage") or "") in {"completed", "failed"}:
-                terminal_published = True
+            if terminal_published:
+                return
+            terminal_published = True
+            if script_id:
+                self._progress_callback(
+                    ENV_PREPARE_PROGRESS,
+                    script_id,
+                    project_path=str(root_path or payload.path),
+                )(progress)
+
+        def publish(progress: Mapping[str, Any]) -> None:
+            stage = str(progress.get("stage") or "")
+            if stage in {"completed", "failed"} or progress.get("final") is True:
+                emit_terminal(progress)
+                return
             if script_id:
                 self._progress_callback(
                     ENV_PREPARE_PROGRESS,
@@ -982,56 +1267,154 @@ class MaaFWApiController:
                 )(progress)
 
         try:
-            runtime_pool = self.ctx.get(RUNTIME_POOL_SERVICE)
-            if script_id and runtime_pool is not None:
-                cached_data = await _run_to_thread_with_cancellation_drain(
-                    load_maafw_agent_env_state,
-                    script_id,
-                    payload.path,
-                )
-                if cached_data is not None and await _run_to_thread_with_cancellation_drain(
-                    _cached_runtime_is_current,
-                    cached_data,
-                    runtime_pool,
-                ):
-                    root_path = Path(str(cached_data["path"])).resolve()
-                    data = MaaFWAgentEnvPrepareData.model_validate(cached_data)
-                    publish(
+            # Resolve and validate the requested directory before touching the
+            # cache.  A request tied to a script ID must refer to that script's
+            # own Info.Path, otherwise a cached runtime could be replayed for
+            # an unrelated directory.
+            root_path = _absolute_project_path(payload.path, field="path")
+            if script_id:
+                record = await _script_record(script_id)
+                if not _is_maafw_record(record):
+                    message = "指定脚本不是 MaaFW 项目"
+                    emit_terminal(
                         {
-                            "stage": "completed",
-                            "status": "ready",
-                            "message": "复用已准备的 MaaFW 运行环境",
-                            "percent": 100.0,
+                            "stage": "failed",
+                            "status": "not_maafw",
+                            "message": message,
                             "final": True,
                         }
                     )
                     return model_json(
                         MaaFWAgentEnvPrepareOut(
-                            message="复用已准备的 MaaFW 运行环境",
-                            data=data,
+                            code=400,
+                            status="error",
+                            message=message,
+                            data=MaaFWAgentEnvPrepareData(path=str(root_path)),
                         )
                     )
-            if _header(request, "X-MaaFW-Cache-Only") == "1":
-                return model_json(
-                    MaaFWAgentEnvPrepareOut(
-                        code=404,
-                        status="not_ready",
-                        message="MaaFW 运行环境尚未准备",
-                        data=None,
+                if _is_managed_record(record):
+                    message = "该项目使用插件管理的版本化资源，不能通过普通目录准备运行环境"
+                    emit_terminal(
+                        {
+                            "stage": "failed",
+                            "status": "managed",
+                            "message": message,
+                            "final": True,
+                        }
                     )
-                )
+                    return model_json(
+                        MaaFWAgentEnvPrepareOut(
+                            code=409,
+                            status="error",
+                            message=message,
+                            data=MaaFWAgentEnvPrepareData(path=str(root_path)),
+                        )
+                    )
+                script_form = _resolve_script_form(record)
+                info_group = _mapping(script_form.get("Info"))
+                record_path_raw = str(info_group.get("Path") or "").strip()
+                if not record_path_raw:
+                    message = "指定脚本未配置 MaaFW 项目目录"
+                    emit_terminal(
+                        {
+                            "stage": "failed",
+                            "status": "missing_path",
+                            "message": message,
+                            "final": True,
+                        }
+                    )
+                    return model_json(
+                        MaaFWAgentEnvPrepareOut(
+                            code=400,
+                            status="error",
+                            message=message,
+                            data=MaaFWAgentEnvPrepareData(path=str(root_path)),
+                        )
+                    )
+                record_path = _absolute_project_path(record_path_raw, field="Info.Path")
+                if not _same_project_path(root_path, record_path):
+                    message = "请求 path 必须与脚本 Info.Path 一致"
+                    emit_terminal(
+                        {
+                            "stage": "failed",
+                            "status": "path_mismatch",
+                            "message": message,
+                            "final": True,
+                        }
+                    )
+                    return model_json(
+                        MaaFWAgentEnvPrepareOut(
+                            code=400,
+                            status="error",
+                            message=message,
+                            data=MaaFWAgentEnvPrepareData(path=str(root_path)),
+                        )
+                    )
 
-            root_path = Path(payload.path).resolve()
+            runtime_pool = self.ctx.get(RUNTIME_POOL_SERVICE)
+            # Reserve before looking at the cache.  A concurrent update must
+            # not be able to mutate the directory while a cache hit is being
+            # returned to the caller.
             reservation_key = await try_reserve_project_path(root_path)
             if reservation_key is None:
                 message = "MaaFW 项目正在运行、更新或准备环境，请稍后重试"
-                publish({"stage": "failed", "status": "busy", "message": message, "final": True})
+                emit_terminal(
+                    {"stage": "failed", "status": "busy", "message": message, "final": True}
+                )
                 return model_json(
                     MaaFWAgentEnvPrepareOut(
                         code=409,
                         status="error",
                         message=message,
                         data=MaaFWAgentEnvPrepareData(path=str(root_path)),
+                    )
+                )
+
+            if script_id and runtime_pool is not None:
+                cached_data = await _run_to_thread_with_cancellation_drain(
+                    load_maafw_agent_env_state,
+                    script_id,
+                    root_path,
+                )
+                if cached_data is not None and await _run_to_thread_with_cancellation_drain(
+                    _cached_runtime_is_current,
+                    cached_data,
+                    runtime_pool,
+                ):
+                    cached_path = _absolute_project_path(
+                        cached_data.get("path"),
+                        field="缓存 path",
+                    )
+                    if not _same_project_path(root_path, cached_path):
+                        cached_data = None
+                    else:
+                        data = MaaFWAgentEnvPrepareData.model_validate(cached_data)
+                        emit_terminal(
+                            {
+                                "stage": "completed",
+                                "status": "ready",
+                                "message": "复用已准备的 MaaFW 运行环境",
+                                "percent": 100.0,
+                                "final": True,
+                            }
+                        )
+                        return model_json(
+                            MaaFWAgentEnvPrepareOut(
+                                message="复用已准备的 MaaFW 运行环境",
+                                data=data,
+                            )
+                        )
+            if _header(request, "X-MaaFW-Cache-Only") == "1":
+                message = "MaaFW 运行环境尚未准备"
+                emit_terminal(
+                    {"stage": "failed", "status": "not_ready", "message": message, "final": True}
+                )
+                return model_json(
+                    MaaFWAgentEnvPrepareOut(
+                        code=404,
+                        status="not_ready",
+                        message=message,
+                        data=None,
                     )
                 )
 
@@ -1105,9 +1488,44 @@ class MaaFWApiController:
                     data=data,
                 )
             )
+        except asyncio.CancelledError:
+            message = "MaaFW 运行环境准备已取消"
+            append_log(message)
+            emit_terminal(
+                {
+                    "stage": "failed",
+                    "status": "cancelled",
+                    "message": message,
+                    "final": True,
+                }
+            )
+            raise
+        except KeyError:
+            message = "脚本不存在或已被删除"
+            append_log(message)
+            emit_terminal(
+                {
+                    "stage": "failed",
+                    "status": "not_found",
+                    "message": message,
+                    "final": True,
+                }
+            )
+            return model_json(
+                MaaFWAgentEnvPrepareOut(
+                    code=404,
+                    status="error",
+                    message=message,
+                    data=MaaFWAgentEnvPrepareData(
+                        path=str(root_path or Path(payload.path)),
+                        logs=logs,
+                    ),
+                )
+            )
         except ValueError as exc:
-            if not terminal_published:
-                publish({"stage": "failed", "status": "failed", "message": str(exc), "final": True})
+            emit_terminal(
+                {"stage": "failed", "status": "failed", "message": str(exc), "final": True}
+            )
             return model_json(
                 MaaFWAgentEnvPrepareOut(
                     code=400,
@@ -1120,15 +1538,14 @@ class MaaFWApiController:
                 )
             )
         except Exception as exc:
-            if not terminal_published:
-                publish(
-                    {
-                        "stage": "failed",
-                        "status": "failed",
-                        "message": f"{type(exc).__name__}: {exc}",
-                        "final": True,
-                    }
-                )
+            emit_terminal(
+                {
+                    "stage": "failed",
+                    "status": "failed",
+                    "message": f"{type(exc).__name__}: {exc}",
+                    "final": True,
+                }
+            )
             return model_json(
                 MaaFWAgentEnvPrepareOut(
                     code=500,

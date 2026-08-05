@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
 
 
 class _ApiModel(BaseModel):
@@ -11,7 +11,10 @@ class _ApiModel(BaseModel):
 
 class MaaFWProjectUpdateIn(_ApiModel):
     scriptId: str
-    apply: bool = False
+    # Do not let Pydantic coerce strings such as ``"false"`` or ``"0"``.
+    # This payload crosses the host/plugin boundary and truthy coercion would
+    # turn a dry-run request into a mutating update.
+    apply: StrictBool = False
 
     @field_validator("scriptId")
     @classmethod
@@ -23,10 +26,10 @@ class MaaFWProjectUpdateIn(_ApiModel):
 
 
 class MaaFWProjectUpdateData(_ApiModel):
-    checked: bool = False
-    updated: bool = False
-    updateAvailable: bool = False
-    installable: bool = False
+    checked: StrictBool = False
+    updated: StrictBool = False
+    updateAvailable: StrictBool = False
+    installable: StrictBool = False
     currentVersion: str = ""
     latestVersion: str | None = None
     source: str | None = None

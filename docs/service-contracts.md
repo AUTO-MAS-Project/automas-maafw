@@ -61,10 +61,10 @@ class Plugin:
 | `automas-maafw-project-store` | 0.2.3 | `maafw.project_store.v1` | 本地目录/ZIP 资源导入、不可变版本、Python 约束、隔离 checkout、全局盘点、引用和 GC |
 | `automas-maafw-runtime-pool` | 0.2.0 | `maafw.runtime_pool.v1` | 可配置根目录、CP312/CP313 解释器、按完整 requirement selector 隔离 venv 并复用 uv cache |
 | `automas-maafw-runner` | 0.4.0 | `maafw.runner.v1` | 运行计划、worker job、可信 runtime 路由、环境预热和结果模型 |
-| `automas-script-maafw` | 0.1.12 | `maafw.registry.v1`、`maafw.configuration_reuse.v1`、`maafw.api.v1` | MaaFW 脚本适配、能力注册、原生配置导入、项目更新/环境预热 transport、用户复制和 Pool 路由 |
+| `automas-script-maafw` | 0.1.13 | `maafw.registry.v1`、`maafw.configuration_reuse.v1`、`maafw.api.v1` | MaaFW 脚本适配、能力注册、原生配置导入、项目更新/环境预热 transport、用户复制和 Pool 路由 |
 | `automas-script-maafw-managed` | 0.3.2 | `maafw.managed.environment.v1` | 单一 MaaFW 入口的原地托管转换、全局资源盘点、本地/远程资源管理、环境准备、运行绑定与 pack 升级计划 |
-| `automas-script-maafw-pack-m9a` | 0.1.5 | `maafw.pack.m9a.v1` | M9A 默认约定、资源 profile/升级规划和通知翻译 |
-| `automas-m9a` | 0.1.5 | 无 | 聚合安装上述 MaaFW/M9A 插件 |
+| `automas-script-maafw-pack-m9a` | 0.1.6 | `maafw.pack.m9a.v1` | M9A 默认约定、资源 profile/升级规划和通知翻译 |
+| `automas-m9a` | 0.1.6 | 无 | 聚合安装上述 MaaFW/M9A 插件 |
 
 ### 3.1 发布依赖顺序
 
@@ -75,10 +75,10 @@ class Plugin:
    `automas-maafw-runtime-pool` 0.2.0。
 2. `automas-maafw-agent-env` 0.1.4、`automas-maafw-project-update` 0.2.3。
 3. `automas-maafw-runner` 0.4.0。
-4. `automas-script-maafw` 0.1.12。
+4. `automas-script-maafw` 0.1.13。
 5. `automas-script-maafw-managed` 0.3.2。
-6. 在独立 M9A 仓库发布 `automas-script-maafw-pack-m9a` 0.1.5，随后发布
-   聚合包 `automas-m9a` 0.1.5；二者不得早于前五层依赖在 PyPI 可安装。
+6. 在独立 M9A 仓库发布 `automas-script-maafw-pack-m9a` 0.1.6，随后发布
+   聚合包 `automas-m9a` 0.1.6；二者不得早于前五层依赖在 PyPI 可安装。
 
 首次发布 Project Store、Runtime Pool 和 Managed 前，仍须创建
 `pypi-project-store`、`pypi-runtime-pool`、`pypi-script-maafw-managed` GitHub
@@ -1280,7 +1280,7 @@ python -m pip install automas-m9a
 ```text
 automas-maafw-interface >= 0.2.0
 automas-maafw-runner >= 0.4.0
-automas-script-maafw >= 0.1.12
+automas-script-maafw >= 0.1.13
 ```
 
 ## 14. 完整调用示例
@@ -1777,8 +1777,8 @@ ProjectInterface 或 Project Store 的不可变 `summary.remote`。GitHub 路径
 进度、日志及持久化 DTO 中统一脱敏；全局没有 CDK 时仍可发现 MirrorChyan 版本元数据，
 但没有可安装 URL 就不能执行导入或升级。
 
-普通脚本 0.1.12 的配置复用同样依赖上述宿主事务 API。M9A 集成下限必须为
-`automas-maafw-runner>=0.4.0` 与 `automas-script-maafw>=0.1.12`。
+普通脚本 0.1.13 的配置复用同样依赖上述宿主事务 API。M9A 集成下限必须为
+`automas-maafw-runner>=0.4.0` 与 `automas-script-maafw>=0.1.13`。
 
 ## 18. 变更规则
 

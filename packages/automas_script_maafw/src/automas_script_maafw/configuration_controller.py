@@ -29,6 +29,16 @@ PLAN_TTL_SECONDS = 30 * 60
 MAX_PENDING_PLANS = 128
 
 
+def _strict_bool(value: Any, label: str, *, default: bool = False) -> bool:
+    """Reject truthy strings at the plugin/host configuration boundary."""
+
+    if value is None:
+        return default
+    if type(value) is not bool:
+        raise MaaFWConfigurationReuseError(f"{label} 必须是 boolean")
+    return value
+
+
 class MaaFWConfigurationReuseController:
     """Plugin HTTP boundary for previewed, CAS-guarded configuration reuse."""
 
@@ -206,7 +216,7 @@ class MaaFWConfigurationReuseController:
             owner = f"maafw-config-reuse:{script_id}:{plan_id}"
             async with Config.script_config_transaction(script_id, owner=owner):
                 result = await self._apply_in_transaction(script_id, plan)
-        if bool(result.get("scriptUpdated")):
+        if _strict_bool(result.get("scriptUpdated"), "scriptUpdated"):
             # Script-level changes can move the project path or alter update
             # inputs.  Never let a configuration import resurrect an old
             # ordinary-directory environment cache.

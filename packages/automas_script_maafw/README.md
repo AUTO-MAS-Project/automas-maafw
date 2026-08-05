@@ -3,9 +3,9 @@
 MaaFW script adapter plugin for AUTO-MAS.
 
 It registers `ScriptType=MaaFW` through the script adapter registry and stores
-new MaaFW scripts in `PluginScriptConfig`. M9A is provided by the
-`automas-script-maafw-pack-m9a` project pack, and that pack registers the
-user-visible `ScriptType=M9A` entry while reusing this adapter's runtime hooks.
+new MaaFW scripts in `PluginScriptConfig`. The independently released M9A
+plugin owns its user-visible `ScriptType=M9A` entry and project pack while
+reusing this adapter's shared editor and runtime hooks.
 
 Ordinary external project directories use one process-wide reservation shared
 by run-before-update and worker execution. A second script pointing at the same
@@ -23,7 +23,7 @@ fingerprinted and CAS-checked before the host creates the first/new user;
 internal user copies exclude runtime state and resource journals. Project packs
 may override source discovery and plan generation through JSON-only methods.
 
-Script MaaFW 0.1.12 exposes ordinary project update, environment preparation,
+Script MaaFW 0.1.13 exposes ordinary project update, environment preparation,
 progress, and configuration-reuse transport through the generic plugin gateway.
 It requires the active `maafw.runtime_pool.v1` service and
 routes its resolved `Root`/`poolId` into both environment preparation and the
