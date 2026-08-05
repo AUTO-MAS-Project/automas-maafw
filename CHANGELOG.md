@@ -3,6 +3,11 @@
 ## Unreleased
 
 - 将通用 MaaFW 插件从 AUTO-MAS 主仓迁移到独立工作区仓库。
+- Runtime Pool 0.2.0 接收宿主通过 `AUTO_MAS_UV_INDEX_URL` 提供的首选镜像，
+  同时保留用户显式设置的 `UV_INDEX_URL`/`UV_DEFAULT_INDEX`；并统一规范化
+  pool 内 Python 与 uv cache 路径，拒绝越出所属 pool 的路径。
+- Project Update 0.2.3 在取消归档应用时等待后台工作线程结束后再传播取消，
+  避免请求结束后仍有后台写入跨越项目更新生命周期。
 - Project Store 0.2.2 在脱壳时从 ProjectInterface 或唯一的
   `python3XY._pth` 记录 `runtime.python` 硬约束，并把该元数据纳入不可变来源
   身份；显式约束与打包解释器冲突时失败关闭。
@@ -73,9 +78,9 @@
 - `automas-maafw-agent-env`: 0.1.4
 - `automas-maafw-controller-adb`: 0.1.1
 - `automas-maafw-controller-win32`: 0.1.2
-- `automas-maafw-project-update`: 0.2.2
-- `automas-maafw-project-store`: 0.2.2
+- `automas-maafw-project-update`: 0.2.3
+- `automas-maafw-project-store`: 0.2.3
 - `automas-maafw-runtime-pool`: 0.2.0
 - `automas-maafw-runner`: 0.4.0
-- `automas-script-maafw`: 0.1.11
-- `automas-script-maafw-managed`: 0.3.0
+- `automas-script-maafw`: 0.1.12
+- `automas-script-maafw-managed`: 0.3.2
