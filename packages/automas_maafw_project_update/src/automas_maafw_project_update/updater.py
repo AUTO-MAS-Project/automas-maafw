@@ -122,6 +122,10 @@ class MaaFWProjectUpdateResult:
 class MaaFWProjectUpdateError(RuntimeError):
     """Raised when a MaaFW project package cannot be checked or applied."""
 
+    def __init__(self, message: str, *, provider_error_code: int | None = None) -> None:
+        super().__init__(message)
+        self.provider_error_code = provider_error_code
+
 
 class _MaaFWProjectDownloadError(MaaFWProjectUpdateError):
     """Carry a stable outer-workflow progress status without emitting a terminal."""
@@ -260,9 +264,13 @@ async def update_maafw_project_if_needed(
         # cannot express this because the schema deliberately serializes an
         # empty local value.
         merged_source_config["mirror_cdk"] = inherited_cdk
-    merged_source_config.setdefault("channel", update_channel)
+    if not str(merged_source_config.get("channel") or "").strip():
+        merged_source_config["channel"] = update_channel
     if not str(merged_source_config.get("project_shell_hint") or "").strip():
-        project_shell_hint = _detect_project_shell_hint(project_path)
+        project_shell_hint = await asyncio.to_thread(
+            detect_maafw_project_shell_hint,
+            project_path,
+        )
         if project_shell_hint:
             merged_source_config["project_shell_hint"] = project_shell_hint
     _report_progress(progress, "checking", message="checking for project updates")
@@ -423,104 +431,29 @@ async def discover_maafw_project_update(
     send_update_log = send_log or (lambda _: None)
 
     if not provider:
-        # Automatic mode keeps MirrorChyan as the version-metadata authority.
-        # A CDK-less Mirror response may still discover a newer version; only
-        # the package acquisition falls back to a same-version GitHub asset.
-        if interface_model.mirrorchyan_rid:
-            mirror_cdk = str(
-                config.get("mirror_cdk") or config.get("cdk") or ""
-            ).strip()
-            send_update_log(f"MirrorChyan RID: {interface_model.mirrorchyan_rid}")
-            if interface_model.mirrorchyan_multiplatform:
-                send_update_log("MirrorChyan platform: win/x64")
-            mirror_discovery = await _check_mirrorchyan_update(
-                interface_model,
-                current_version=current,
-                mirror_cdk=mirror_cdk,
-                channel=str(config.get("channel") or "stable"),
-                proxy=proxy,
-            )
-            if mirror_discovery is None:
-                return None
-            send_update_log(
-                "version metadata source: MirrorChyan; "
-                f"latest={mirror_discovery.version}"
-            )
-            if mirror_discovery.installable or mirror_cdk:
-                if mirror_discovery.installable:
-                    send_update_log(
-                        "install package source: MirrorChyan; "
-                        f"version={mirror_discovery.version}"
-                    )
-                return mirror_discovery
-
-            send_update_log(
-                "MirrorChyan discovered a newer version without a download URL; "
-                "checking GitHub for an unambiguous package of the same version"
-            )
-            github_discovery = await _check_github_release_update(
-                interface_model,
-                current_version=current,
-                source_config=config,
-                proxy=proxy,
-                target_version=mirror_discovery.version,
-            )
-            if (
-                github_discovery is not None
-                and _normalize_version(github_discovery.version)
-                == _normalize_version(mirror_discovery.version)
-                and github_discovery.installable
-                and github_discovery.candidate is not None
-            ):
-                send_update_log(
-                    "install package source: GitHub Release; "
-                    f"version={github_discovery.version}"
-                )
-                return MaaFWProjectUpdateDiscovery(
-                    source="mirrorchyan",
-                    version=mirror_discovery.version,
-                    candidate=MaaFWProjectUpdateCandidate(
-                        source=github_discovery.candidate.source,
-                        version=mirror_discovery.version,
-                        download_url=github_discovery.candidate.download_url,
-                        sha256=github_discovery.candidate.sha256,
-                    ),
-                )
-
-            reason = "GitHub did not provide an unambiguous asset for the MirrorChyan version"
-            if github_discovery is not None:
-                if (
-                    _normalize_version(github_discovery.version)
-                    != _normalize_version(mirror_discovery.version)
-                ):
-                    reason = (
-                        "GitHub latest version does not match MirrorChyan metadata: "
-                        f"github={github_discovery.version}, "
-                        f"mirrorchyan={mirror_discovery.version}"
-                    )
-                elif github_discovery.unavailable_reason:
-                    reason = github_discovery.unavailable_reason
-            return MaaFWProjectUpdateDiscovery(
-                source="mirrorchyan",
-                version=mirror_discovery.version,
-                unavailable_reason=(
-                    f"{mirror_discovery.unavailable_reason}; GitHub fallback blocked: {reason}"
-                ),
-            )
-
-        provider = "github_release"
+        # MirrorChyan is the stable version authority whenever the project
+        # declares a resource id.  Its latest endpoint intentionally supports
+        # no-CDK metadata checks; a missing CDK only means that a newer result
+        # may have no download URL.  Do not silently fall back to GitHub (and
+        # its rate-limited API) for the common automatic-check path.
+        provider = "mirrorchyan" if interface_model.mirrorchyan_rid else "github_release"
 
     if provider == "mirrorchyan":
+        mirror_cdk = str(config.get("mirror_cdk") or config.get("cdk") or "").strip()
         if not interface_model.mirrorchyan_rid:
             send_update_log("MirrorChyan RID is not configured, skip update")
             return None
         send_update_log(f"MirrorChyan RID: {interface_model.mirrorchyan_rid}")
         if interface_model.mirrorchyan_multiplatform:
             send_update_log("MirrorChyan platform: win/x64")
+        if not mirror_cdk:
+            send_update_log(
+                "MirrorChyan CDK 未配置，仅检查版本；安装更新需要项目或全局 CDK"
+            )
         discovery = await _check_mirrorchyan_update(
             interface_model,
             current_version=current,
-            mirror_cdk=str(config.get("mirror_cdk") or config.get("cdk") or ""),
+            mirror_cdk=mirror_cdk,
             channel=str(config.get("channel") or "stable"),
             proxy=proxy,
         )
@@ -529,6 +462,18 @@ async def discover_maafw_project_update(
                 "version metadata source: MirrorChyan; "
                 f"latest={discovery.version}"
             )
+            if not mirror_cdk and discovery.installable:
+                # A provider response must never turn a metadata-only check
+                # into an unauthenticated install.  Keep the discovered
+                # version visible, but require a project or host CDK before
+                # exposing an installable candidate.
+                discovery = MaaFWProjectUpdateDiscovery(
+                    source=discovery.source,
+                    version=discovery.version,
+                    unavailable_reason=(
+                        "MirrorChyan CDK is required to install this update"
+                    ),
+                )
             if discovery.installable:
                 send_update_log(
                     "install package source: MirrorChyan; "
@@ -769,10 +714,21 @@ async def _check_mirrorchyan_update(
         ) from None
 
     result = _load_response_json(response)
-    if response.status_code != 200 or result.get("code", 0) != 0:
-        error_code = result.get("code")
-        if error_code in MIRROR_ERROR_INFO:
-            raise MaaFWProjectUpdateError(MIRROR_ERROR_INFO[error_code])
+    raw_error_code = result.get("code", 0)
+    try:
+        error_code = int(raw_error_code)
+    except (TypeError, ValueError):
+        error_code = None
+    if response.status_code != 200 or error_code != 0:
+        if error_code not in (None, 0):
+            error_message = MIRROR_ERROR_INFO.get(
+                error_code,
+                "MirrorChyan returned an unknown error",
+            )
+            raise MaaFWProjectUpdateError(
+                f"MirrorChyan [{error_code}]: {error_message}",
+                provider_error_code=error_code,
+            )
         raise MaaFWProjectUpdateError(f"MirrorChyan returned HTTP {response.status_code}")
 
     data = result.get("data")
@@ -1143,11 +1099,14 @@ async def _stream_update_package(
                     continue
 
                 if response.status_code not in (200, 206):
-                    error_hint = await _read_download_error_hint(response)
+                    error_hint, provider_error_code = await _read_download_error_hint(
+                        response
+                    )
                     if error_hint:
                         raise MaaFWProjectUpdateError(
                             "download update package failed: "
-                            f"HTTP {response.status_code}, {error_hint}"
+                            f"HTTP {response.status_code}, {error_hint}",
+                            provider_error_code=provider_error_code,
                         )
                     raise MaaFWProjectUpdateError(
                         "download update package failed: "
@@ -1224,7 +1183,9 @@ def _content_length(response: httpx.Response) -> int | None:
     return value if value >= 0 else None
 
 
-async def _read_download_error_hint(response: httpx.Response) -> str:
+async def _read_download_error_hint(
+    response: httpx.Response,
+) -> tuple[str, int | None]:
     try:
         content = bytearray()
         async for chunk in response.aiter_bytes(
@@ -1237,8 +1198,8 @@ async def _read_download_error_hint(response: httpx.Response) -> str:
             if len(content) >= DOWNLOAD_ERROR_HINT_BYTES:
                 break
     except Exception:
-        return ""
-    return _build_download_error_hint(bytes(content))
+        return "", None
+    return _build_download_error_details(bytes(content))
 
 
 def _ensure_downloaded_zip(package_path: Path) -> None:
@@ -1247,9 +1208,12 @@ def _ensure_downloaded_zip(package_path: Path) -> None:
     if zipfile.is_zipfile(package_path):
         return
 
-    error_hint = _read_local_download_error_hint(package_path)
+    error_hint, provider_error_code = _read_local_download_error_details(package_path)
     if error_hint:
-        raise MaaFWProjectUpdateError(f"download update package failed: {error_hint}")
+        raise MaaFWProjectUpdateError(
+            f"download update package failed: {error_hint}",
+            provider_error_code=provider_error_code,
+        )
     raise MaaFWProjectUpdateError("update source did not return a valid zip file")
 
 
@@ -1540,39 +1504,57 @@ async def _run_cleanup_to_completion(
 
 
 def _read_local_download_error_hint(path: Path) -> str:
+    hint, _ = _read_local_download_error_details(path)
+    return hint
+
+
+def _read_local_download_error_details(path: Path) -> tuple[str, int | None]:
     try:
-        content = path.read_bytes()[:4096]
+        content = path.read_bytes()[:DOWNLOAD_ERROR_HINT_BYTES]
     except Exception:
-        return ""
-    return _build_download_error_hint(content)
+        return "", None
+    return _build_download_error_details(content)
 
 
 def _build_download_error_hint(content: bytes) -> str:
+    hint, _ = _build_download_error_details(content)
+    return hint
+
+
+def _build_download_error_details(content: bytes) -> tuple[str, int | None]:
     if not content:
-        return "update source returned empty response"
+        return "update source returned empty response", None
 
     text = _decode_download_error_text(content)
     if not text:
-        return ""
+        return "", None
 
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
         if text.lstrip().startswith("<"):
-            return "update source returned an HTML page instead of zip"
-        return ""
+            return "update source returned an HTML page instead of zip", None
+        return "", None
 
     if not isinstance(data, dict):
-        return ""
+        return "", None
 
-    error_code = data.get("code")
-    if error_code in MIRROR_ERROR_INFO:
-        return MIRROR_ERROR_INFO[error_code]
+    raw_error_code = data.get("code")
+    try:
+        error_code = int(raw_error_code)
+    except (TypeError, ValueError):
+        error_code = None
+    if error_code is not None and error_code != 0:
+        error_message = MIRROR_ERROR_INFO.get(
+            error_code,
+            "MirrorChyan returned an unknown error",
+        )
+        return f"MirrorChyan [{error_code}]: {error_message}", error_code
 
     message = str(data.get("msg") or data.get("message") or "").strip()
     if not message:
-        return ""
-    return f"update source returned error: {_sanitize_log_message(message)}"
+        return "", None
+    return f"update source returned error: {_sanitize_log_message(message)}", None
 
 
 def _decode_download_error_text(content: bytes) -> str:
@@ -2055,7 +2037,7 @@ def _select_github_release_asset(
     return None, f"GitHub release package selection is ambiguous: {names}"
 
 
-def _detect_project_shell_hint(project_path: Path) -> str:
+def detect_maafw_project_shell_hint(project_path: Path) -> str:
     """Identify a local UI shell only from strong root-level file markers."""
 
     try:

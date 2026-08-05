@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,7 @@ from .updater import (
     MaaFWUpdateProviderInfo,
     apply_maafw_project_update,
     check_maafw_project_update,
+    detect_maafw_project_shell_hint,
     discover_maafw_project_update,
     download_maafw_project_package,
     list_update_providers,
@@ -36,14 +38,25 @@ class MaaFWProjectUpdateService:
         interface: MaaFWInterface | dict[str, Any],
         *,
         current_version: str | None = None,
+        project_path: str | Path | None = None,
         source_config: dict[str, Any] | None = None,
         proxy: httpx.Proxy | None = None,
         send_log: Any = None,
     ) -> MaaFWProjectUpdateDiscovery | None:
+        effective_source_config = dict(source_config or {})
+        if project_path is not None and not str(
+            effective_source_config.get("project_shell_hint") or ""
+        ).strip():
+            shell_hint = await asyncio.to_thread(
+                detect_maafw_project_shell_hint,
+                Path(project_path).resolve(),
+            )
+            if shell_hint:
+                effective_source_config["project_shell_hint"] = shell_hint
         return await discover_maafw_project_update(
             self._coerce_interface(interface),
             current_version=current_version,
-            source_config=source_config,
+            source_config=effective_source_config,
             proxy=proxy,
             send_log=send_log,
         )

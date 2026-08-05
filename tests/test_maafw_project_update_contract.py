@@ -116,7 +116,7 @@ class MaaFWProjectUpdateProviderContractTest(unittest.TestCase):
                 / "pyproject.toml"
             ).read_text(encoding="utf-8")
         )
-        self.assertEqual(project["project"]["version"], "0.2.2")
+        self.assertEqual(project["project"]["version"], "0.2.3")
 
     def test_result_positional_contract_keeps_existing_field_order(self) -> None:
         result = MaaFWProjectUpdateResult(
@@ -150,7 +150,7 @@ class MaaFWProjectUpdateProviderContractTest(unittest.TestCase):
                 discover_maafw_project_update(
                     interface,
                     current_version="1.0.0",
-                    source_config={"source": "mirrorchyan"},
+                    source_config={"source": "mirrorchyan", "cdk": "test-cdk"},
                 )
             )
 
@@ -174,7 +174,7 @@ class MaaFWProjectUpdateProviderContractTest(unittest.TestCase):
                     check_maafw_project_update(
                         interface,
                         current_version="1.0.0",
-                        source_config={"source": "mirrorchyan"},
+                        source_config={"source": "mirrorchyan", "cdk": "test-cdk"},
                     )
                 )
 
@@ -202,7 +202,7 @@ class MaaFWProjectUpdateProviderContractTest(unittest.TestCase):
                 update_maafw_project_if_needed(
                     Path("C:/project"),
                     self._interface(mirrorchyan_rid="demo"),
-                    source_config={"source": "mirrorchyan"},
+                    source_config={"source": "mirrorchyan", "cdk": "test-cdk"},
                     send_log=logs.append,
                     progress=events.append,
                 )
@@ -243,7 +243,7 @@ class MaaFWProjectUpdateProviderContractTest(unittest.TestCase):
                 discover_maafw_project_update(
                     self._interface(mirrorchyan_rid="demo"),
                     current_version="1.0.0",
-                    source_config={"source": "mirrorchyan"},
+                    source_config={"source": "mirrorchyan", "cdk": "test-cdk"},
                 )
             )
 
@@ -291,11 +291,48 @@ class MaaFWProjectUpdateProviderContractTest(unittest.TestCase):
         self.assertTrue(result.updated)
         self.assertEqual(client.requests[0][1]["params"]["cdk"], "host-cdk")
 
-    def test_automatic_source_without_cdk_discovers_mirror_then_uses_github_asset(self) -> None:
-        mirror_response = httpx.Response(
+    def test_blank_script_channel_inherits_non_empty_host_channel(self) -> None:
+        response = httpx.Response(
             200,
-            json={"code": 0, "data": {"version_name": "2.0.0"}},
+            json={
+                "code": 0,
+                "data": {
+                    "version_name": "2.0.0-beta.1",
+                    "url": "https://example.invalid/project.zip",
+                },
+            },
         )
+        client = _FakeAsyncClient(response)
+        with (
+            patch.object(
+                updater_module.httpx,
+                "AsyncClient",
+                return_value=client,
+            ),
+            patch.object(
+                updater_module,
+                "apply_maafw_project_update",
+                new=AsyncMock(),
+            ),
+        ):
+            result = asyncio.run(
+                update_maafw_project_if_needed(
+                    Path("C:/project"),
+                    self._interface(mirrorchyan_rid="demo"),
+                    mirror_cdk="host-cdk",
+                    channel="beta",
+                    source_config={
+                        "source": "mirrorchyan",
+                        "cdk": "",
+                        "channel": "",
+                    },
+                )
+            )
+
+        self.assertTrue(result.updated)
+        self.assertEqual(client.requests[0][1]["params"]["channel"], "beta")
+
+    def test_explicit_github_source_without_cdk_uses_github_directly(self) -> None:
         github_response = httpx.Response(
             200,
             json={
@@ -316,13 +353,8 @@ class MaaFWProjectUpdateProviderContractTest(unittest.TestCase):
                 ],
             },
         )
-        mirror_client = _FakeAsyncClient(mirror_response)
         github_client = _FakeAsyncClient(github_response)
-        with patch.object(
-            updater_module.httpx,
-            "AsyncClient",
-            side_effect=[mirror_client, github_client],
-        ):
+        with patch.object(updater_module.httpx, "AsyncClient", return_value=github_client):
             discovery = asyncio.run(
                 discover_maafw_project_update(
                     self._interface(
@@ -332,53 +364,40 @@ class MaaFWProjectUpdateProviderContractTest(unittest.TestCase):
                         github="https://github.com/owner/project",
                     ),
                     current_version="1.0.0",
-                    source_config={},
+                    source_config={"source": "github_release"},
                 )
             )
 
         self.assertIsNotNone(discovery)
         assert discovery is not None and discovery.candidate is not None
-        self.assertEqual(discovery.source, "mirrorchyan")
+        self.assertEqual(discovery.source, "github_release")
         self.assertEqual(discovery.candidate.source, "github_release")
         self.assertEqual(
             discovery.candidate.download_url,
             "https://example.invalid/m9a-win.zip",
         )
         self.assertEqual(
-            mirror_client.requests[0][0],
-            "https://mirrorchyan.com/api/resources/demo/latest",
-        )
-        self.assertEqual(
             github_client.requests[0][0],
-            "https://api.github.com/repos/owner/project/releases/tags/2.0.0",
+            "https://api.github.com/repos/owner/project/releases/latest",
         )
 
-    def test_automatic_fallback_resolves_prerelease_from_mirror_channel(self) -> None:
+    def test_automatic_source_with_cdk_uses_mirror_channel(self) -> None:
         mirror_client = _FakeAsyncClient(
             httpx.Response(
                 200,
-                json={"code": 0, "data": {"version_name": "2.1.0-beta.1"}},
-            )
-        )
-        github_client = _FakeAsyncClient(
-            httpx.Response(
-                200,
                 json={
-                    "tag_name": "v2.1.0-beta.1",
-                    "prerelease": True,
-                    "assets": [
-                        {
-                            "name": "project-win-x64-v2.1.0-beta.1.zip",
-                            "browser_download_url": "https://example.invalid/beta.zip",
-                        }
-                    ],
+                    "code": 0,
+                    "data": {
+                        "version_name": "2.1.0-beta.1",
+                        "url": "https://example.invalid/beta.zip",
+                    },
                 },
             )
         )
         with patch.object(
             updater_module.httpx,
             "AsyncClient",
-            side_effect=[mirror_client, github_client],
+            return_value=mirror_client,
         ):
             discovery = asyncio.run(
                 discover_maafw_project_update(
@@ -389,7 +408,7 @@ class MaaFWProjectUpdateProviderContractTest(unittest.TestCase):
                         github="https://github.com/owner/project",
                     ),
                     current_version="2.0.0",
-                    source_config={"channel": "beta"},
+                    source_config={"channel": "beta", "cdk": "test-cdk"},
                 )
             )
 
@@ -401,15 +420,8 @@ class MaaFWProjectUpdateProviderContractTest(unittest.TestCase):
             "https://example.invalid/beta.zip",
         )
         self.assertEqual(mirror_client.requests[0][1]["params"]["channel"], "beta")
-        self.assertEqual(
-            github_client.requests[0][0],
-            "https://api.github.com/repos/owner/project/releases/tags/2.1.0-beta.1",
-        )
 
-    def test_automatic_fallback_retries_conventional_v_tag_only(self) -> None:
-        mirror_client = _FakeAsyncClient(
-            httpx.Response(200, json={"code": 0, "data": {"version_name": "2.0.0"}})
-        )
+    def test_github_candidate_retries_conventional_v_tag_only(self) -> None:
         github_client = _FakeSequentialAsyncClient(
             [
                 httpx.Response(404, json={"message": "Not Found"}),
@@ -430,17 +442,18 @@ class MaaFWProjectUpdateProviderContractTest(unittest.TestCase):
         with patch.object(
             updater_module.httpx,
             "AsyncClient",
-            side_effect=[mirror_client, github_client],
+            return_value=github_client,
         ):
             discovery = asyncio.run(
-                discover_maafw_project_update(
+                updater_module._check_github_release_update(
                     self._interface(
                         name="project",
-                        mirrorchyan_rid="demo",
                         github="https://github.com/owner/project",
                     ),
                     current_version="1.0.0",
                     source_config={},
+                    proxy=None,
+                    target_version="2.0.0",
                 )
             )
 
@@ -482,7 +495,7 @@ class MaaFWProjectUpdateProviderContractTest(unittest.TestCase):
                         github="https://github.com/owner/project",
                     ),
                     current_version="1.0.0",
-                    source_config={},
+                    source_config={"cdk": "test-cdk"},
                     proxy=None,
                     target_version="2.0.0",
                 )
@@ -533,12 +546,6 @@ class MaaFWProjectUpdateProviderContractTest(unittest.TestCase):
         )
 
     def test_m9a_shell_marker_selects_mfavalonia_asset_over_mxu(self) -> None:
-        mirror_client = _FakeAsyncClient(
-            httpx.Response(
-                200,
-                json={"code": 0, "data": {"version_name": "4.5.4"}},
-            )
-        )
         github_client = _FakeAsyncClient(
             httpx.Response(
                 200,
@@ -565,7 +572,7 @@ class MaaFWProjectUpdateProviderContractTest(unittest.TestCase):
                 patch.object(
                     updater_module.httpx,
                     "AsyncClient",
-                    side_effect=[mirror_client, github_client],
+                    return_value=github_client,
                 ),
                 patch.object(
                     updater_module,
@@ -583,6 +590,7 @@ class MaaFWProjectUpdateProviderContractTest(unittest.TestCase):
                             mirrorchyan_multiplatform=True,
                             github="https://github.com/MAA1999/M9A",
                         ),
+                        source_config={"source": "github_release"},
                     )
                 )
 
@@ -590,35 +598,17 @@ class MaaFWProjectUpdateProviderContractTest(unittest.TestCase):
         candidate = apply_update.await_args.args[1]
         self.assertEqual(candidate.download_url, "https://example.invalid/mfaa.zip")
 
-    def test_automatic_github_fallback_refuses_ambiguous_project_assets(self) -> None:
+    def test_automatic_mirror_without_package_stays_non_installable(self) -> None:
         mirror_client = _FakeAsyncClient(
             httpx.Response(
                 200,
                 json={"code": 0, "data": {"version_name": "2.0.0"}},
             )
         )
-        github_client = _FakeAsyncClient(
-            httpx.Response(
-                200,
-                json={
-                    "tag_name": "2.0.0",
-                    "assets": [
-                        {
-                            "name": "M9A-win-x86_64-v2.0.0.zip",
-                            "browser_download_url": "https://example.invalid/a.zip",
-                        },
-                        {
-                            "name": "M9A-win-x86_64-portable-v2.0.0.zip",
-                            "browser_download_url": "https://example.invalid/b.zip",
-                        },
-                    ],
-                },
-            )
-        )
         with patch.object(
             updater_module.httpx,
             "AsyncClient",
-            side_effect=[mirror_client, github_client],
+            return_value=mirror_client,
         ):
             discovery = asyncio.run(
                 discover_maafw_project_update(
@@ -629,14 +619,14 @@ class MaaFWProjectUpdateProviderContractTest(unittest.TestCase):
                         github="https://github.com/owner/project",
                     ),
                     current_version="1.0.0",
-                    source_config={},
+                    source_config={"cdk": "test-cdk"},
                 )
             )
 
         self.assertIsNotNone(discovery)
         assert discovery is not None
         self.assertFalse(discovery.installable)
-        self.assertIn("ambiguous", discovery.unavailable_reason)
+        self.assertIn("without a download URL", discovery.unavailable_reason)
 
     def test_github_release_without_asset_or_zipball_is_not_installable(self) -> None:
         response = httpx.Response(

@@ -6,10 +6,11 @@ It provides `maafw.project_update.v1` and supports `mirrorchyan` and
 `github_release` providers without depending on MaaFW runner or agent runtime.
 
 With no explicit provider, MirrorChyan remains the version-metadata authority
-when the ProjectInterface declares a RID. A CDK-less discovery may use an
-unambiguous same-version GitHub Release asset as the package source; explicit
-providers never cross-fallback. GitHub source archives and ambiguous asset
-sets are not treated as installable releases.
+when the ProjectInterface declares a RID. A CDK-less discovery can report a
+newer version, but it never exposes an installable candidate; the caller must
+provide a project or host CDK. Automatic checks do not cross-fallback to
+GitHub. Explicit providers never cross-fallback, and GitHub source archives or
+ambiguous asset sets are not treated as installable releases.
 
 `download_package()` downloads an installable candidate into a caller-owned
 managed directory without changing an existing project tree. It accepts only
