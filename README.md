@@ -30,6 +30,10 @@ venv”组织：Runtime Pool 0.2.0 可路由 CP312/CP313，多个 selector 共�
 
 M9A project pack 与 `automas-m9a` 聚合包位于独立的 `automas-m9a` 仓库。
 
+宿主接入、插件矩阵、普通 MaaFW/Managed 边界和当前 UI 暂停策略见
+[`docs/plugin-integration.md`](docs/plugin-integration.md)；完整服务方法与稳定 DTO
+见 [`docs/service-contracts.md`](docs/service-contracts.md)。
+
 ## Release
 
 `publish.yml` 每次只发布一个 distribution，不会自动处理包间顺序。当前版本应按
@@ -39,8 +43,8 @@ M9A project pack 与 `automas-m9a` 聚合包位于独立的 `automas-m9a` 仓库
    `automas-maafw-runtime-pool` 0.2.0。
 2. `automas-maafw-agent-env` 0.1.4、`automas-maafw-project-update` 0.2.3。
 3. `automas-maafw-runner` 0.4.0。
-4. `automas-script-maafw` 0.1.11。
-5. `automas-script-maafw-managed` 0.3.0。
+4. `automas-script-maafw` 0.1.12。
+5. `automas-script-maafw-managed` 0.3.1。
 6. 在独立 M9A 仓库依次发布 `automas-script-maafw-pack-m9a` 0.1.5 与
    `automas-m9a` 0.1.5。
 
@@ -50,7 +54,7 @@ Runtime Pool 和 Managed 前，必须创建 `pypi-project-store`、
 PyPI 为相同包名配置与 repo、`publish.yml` 和 environment 精确匹配的 pending
 trusted publisher。
 
-普通 MaaFW 脚本 0.1.11 的配置导入/用户复制与 Managed 0.3.0 都要求目标
+普通 MaaFW 脚本 0.1.12 的配置导入/用户复制与 Managed 0.3.1 都要求目标
 AUTO-MAS `dev_v2` 已提供
 `Config.script_config_transaction()`、`Config.script_config_write_scope()` 和
 ScriptConfigStore 的 `write_transaction()`。Managed 原地转换还要求宿主提供
