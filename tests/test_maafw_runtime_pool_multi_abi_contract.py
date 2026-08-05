@@ -524,7 +524,78 @@ class MaaFWRuntimePoolMultiAbiContractTest(unittest.TestCase):
         self.assertEqual(resolved, managed.resolve())
         self.assertIn("--managed-python", command)
         self.assertIn("--no-python-downloads", command)
-        self.assertEqual(environment["UV_PYTHON_INSTALL_DIR"], str(python_root))
+        self.assertEqual(
+            environment["UV_PYTHON_INSTALL_DIR"],
+            str(python_root.resolve()),
+        )
+
+    def test_uv_lookup_canonicalizes_pool_paths_before_boundary_check(
+        self,
+    ) -> None:
+        python_root = self.pool_root / "python"
+        cache_dir = self.pool_root / "cache" / "uv"
+        managed = python_root / "cpython-3.13" / "python.exe"
+        managed.parent.mkdir(parents=True)
+        managed.write_text("fake", encoding="utf-8")
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=f"{managed}\n",
+            stderr="",
+        )
+
+        with mock.patch.object(
+            runtime_installer.subprocess,
+            "run",
+            return_value=completed,
+        ) as run:
+            resolved = runtime_installer._find_pool_managed_python(
+                "C:/tools/uv.exe",
+                "3.13",
+                pool_root=self.pool_root / "nested" / "..",
+                python_root=python_root / "nested" / "..",
+                cache_dir=cache_dir / "nested" / "..",
+            )
+
+        self.assertEqual(resolved, managed.resolve())
+        kwargs = run.call_args.kwargs
+        self.assertEqual(kwargs["cwd"], self.pool_root.resolve())
+        self.assertEqual(
+            kwargs["env"]["UV_PYTHON_INSTALL_DIR"],
+            str(python_root.resolve()),
+        )
+        command = run.call_args.args[0]
+        self.assertEqual(
+            command[command.index("--cache-dir") + 1],
+            str(cache_dir.resolve()),
+        )
+
+    def test_uv_lookup_rejects_a_result_outside_the_pool_python_root(self) -> None:
+        python_root = self.pool_root / "python"
+        cache_dir = self.pool_root / "cache" / "uv"
+        outside = self.pool_root.parent / "outside-python.exe"
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=f"{outside}\n",
+            stderr="",
+        )
+
+        with (
+            mock.patch.object(
+                runtime_installer.subprocess,
+                "run",
+                return_value=completed,
+            ),
+            self.assertRaisesRegex(RuntimeError, "outside the runtime pool"),
+        ):
+            runtime_installer._find_pool_managed_python(
+                "C:/tools/uv.exe",
+                "3.13",
+                pool_root=self.pool_root,
+                python_root=python_root,
+                cache_dir=cache_dir,
+            )
 
     def test_uv_install_targets_pool_private_python_directory(self) -> None:
         python_root = self.pool_root / "python"
@@ -551,7 +622,7 @@ class MaaFWRuntimePoolMultiAbiContractTest(unittest.TestCase):
         ])
         self.assertEqual(
             commands[0][commands[0].index("--install-dir") + 1],
-            str(python_root),
+            str(python_root.resolve()),
         )
         self.assertIn("--no-bin", commands[0])
         self.assertIn("--no-registry", commands[0])

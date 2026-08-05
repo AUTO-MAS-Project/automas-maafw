@@ -24,6 +24,7 @@ UV_PYTHON_INSTALL_TIMEOUT_SECONDS = 300
 UV_CACHE_RELATIVE_PATH = Path("cache") / "uv"
 UV_PYTHON_RELATIVE_PATH = Path("python")
 UV_LINK_MODE = "hardlink"
+AUTO_MAS_UV_INDEX_URL_ENV = "AUTO_MAS_UV_INDEX_URL"
 RUNTIME_POOL_STAGING_DIRECTORY_NAME = ".staging"
 SUPPORTED_CPYTHON_MINORS = ((3, 12), (3, 13))
 
@@ -110,8 +111,11 @@ def resolve_python_interpreter(
         }
 
     root = Path(pool_root).resolve()
-    python_root = (root / UV_PYTHON_RELATIVE_PATH).resolve()
-    cache_dir = (root / UV_CACHE_RELATIVE_PATH).resolve()
+    root, python_root, cache_dir = _canonicalize_pool_paths(
+        root,
+        root / UV_PYTHON_RELATIVE_PATH,
+        root / UV_CACHE_RELATIVE_PATH,
+    )
     uv_executable = _find_uv_executable(sys.executable)
     if uv_executable is None:
         if allow_install:
@@ -545,6 +549,11 @@ def _find_pool_managed_python(
     python_root: Path,
     cache_dir: Path,
 ) -> Path | None:
+    pool_root, python_root, cache_dir = _canonicalize_pool_paths(
+        pool_root,
+        python_root,
+        cache_dir,
+    )
     try:
         result = subprocess.run(
             [
@@ -601,6 +610,11 @@ def _install_pool_managed_python(
     python_root: Path,
     cache_dir: Path,
 ) -> None:
+    pool_root, python_root, cache_dir = _canonicalize_pool_paths(
+        pool_root,
+        python_root,
+        cache_dir,
+    )
     _run(
         [
             uv_executable,
@@ -632,6 +646,12 @@ def _select_uv_python_version(
     only_installed: bool,
 ) -> str | None:
     """Select the newest real uv catalog version satisfying a patch range."""
+
+    pool_root, python_root, cache_dir = _canonicalize_pool_paths(
+        pool_root,
+        python_root,
+        cache_dir,
+    )
 
     scope_flag = "--only-installed" if only_installed else "--only-downloads"
     try:
@@ -716,6 +736,44 @@ def _select_uv_python_version(
     return str(max(candidates))
 
 
+def _canonicalize_pool_paths(
+    pool_root: Path,
+    python_root: Path,
+    cache_dir: Path,
+) -> tuple[Path, Path, Path]:
+    """Normalize uv-managed paths before applying the pool boundary checks.
+
+    uv may return paths using a different spelling (for example a ``..``
+    segment or a case variant on Windows).  Canonicalizing every path before
+    comparing them prevents both false rejects and boundary-check bypasses.
+    The interpreter and cache directories are required to remain inside the
+    owning pool; callers cannot redirect uv to an unrelated writable tree.
+    """
+
+    resolved_pool = Path(pool_root).resolve()
+    resolved_python = Path(python_root).resolve()
+    resolved_cache = Path(cache_dir).resolve()
+    for label, candidate in (
+        ("python", resolved_python),
+        ("cache", resolved_cache),
+    ):
+        if not _path_is_within(candidate, resolved_pool):
+            raise RuntimeError(
+                f"runtime pool {label} path escapes the pool: {candidate}"
+            )
+    return resolved_pool, resolved_python, resolved_cache
+
+
+def _path_is_within(path: Path, base: Path) -> bool:
+    try:
+        common = os.path.commonpath(
+            [os.path.normcase(str(path)), os.path.normcase(str(base))]
+        )
+    except ValueError:
+        return False
+    return common == os.path.normcase(str(base))
+
+
 def _python_supports_venv(python: str) -> bool:
     """探测解释器是否带 venv/ensurepip 标准库。"""
 
@@ -778,6 +836,14 @@ def _install_requirements_with_uv(
     link_mode: str,
     cwd: Path,
 ) -> None:
+    index_args: list[str] = []
+    if not any(
+        str(os.environ.get(name) or "").strip()
+        for name in ("UV_INDEX_URL", "UV_DEFAULT_INDEX")
+    ):
+        index_url = str(os.environ.get(AUTO_MAS_UV_INDEX_URL_ENV) or "").strip()
+        if index_url:
+            index_args = ["--index-url", index_url]
     _run(
         [
             uv_executable,
@@ -791,6 +857,7 @@ def _install_requirements_with_uv(
             link_mode,
             "--upgrade",
             "--quiet",
+            *index_args,
             *requirements,
         ],
         cwd=cwd,

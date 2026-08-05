@@ -162,6 +162,53 @@ class MaaFWRuntimePoolContractTest(unittest.TestCase):
 
         self.assertEqual(resolved, str(configured_uv.resolve()))
 
+    def test_runtime_install_honors_host_configured_index(self) -> None:
+        index_url = "https://mirrors.aliyun.com/pypi/simple/"
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "AUTO_MAS_UV_INDEX_URL": index_url,
+                    "UV_INDEX_URL": "",
+                    "UV_DEFAULT_INDEX": "",
+                },
+            ),
+            mock.patch.object(runtime_installer, "_run") as run,
+        ):
+            runtime_installer._install_requirements_with_uv(
+                "C:/tools/uv.exe",
+                self.pool_root / "environment" / "Scripts" / "python.exe",
+                ["maafw==5.12.2"],
+                cache_dir=self.pool_root / "cache" / "uv",
+                link_mode="hardlink",
+                cwd=self.pool_root,
+            )
+
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("--index-url") + 1], index_url)
+
+    def test_runtime_install_preserves_direct_uv_index_configuration(self) -> None:
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "AUTO_MAS_UV_INDEX_URL": "https://host.invalid/simple/",
+                    "UV_INDEX_URL": "https://user.invalid/simple/",
+                },
+            ),
+            mock.patch.object(runtime_installer, "_run") as run,
+        ):
+            runtime_installer._install_requirements_with_uv(
+                "C:/tools/uv.exe",
+                self.pool_root / "environment" / "Scripts" / "python.exe",
+                ["maafw==5.12.2"],
+                cache_dir=self.pool_root / "cache" / "uv",
+                link_mode="hardlink",
+                cwd=self.pool_root,
+            )
+
+        self.assertNotIn("--index-url", run.call_args.args[0])
+
     def test_root_marker_identity_is_stable_and_json_friendly(self) -> None:
         first = self.service.storage_info()
         marker = json.loads(

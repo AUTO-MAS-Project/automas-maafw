@@ -68,7 +68,10 @@ class MaaFWRuntimeCachePruneContractTest(unittest.TestCase):
         def emulate_uv(command: list[str], **kwargs: Any) -> SimpleNamespace:
             self.assertEqual(command[:3], ["C:/portable/uv.exe", "cache", "prune"])
             self.assertEqual(kwargs["cwd"], self.pool_root.resolve())
-            self.assertEqual(kwargs["env"]["UV_CACHE_DIR"], str(self.cache_path))
+            self.assertEqual(
+                kwargs["env"]["UV_CACHE_DIR"],
+                str(self.cache_path.resolve()),
+            )
             self.cached_file.unlink()
             return SimpleNamespace(
                 returncode=0,
