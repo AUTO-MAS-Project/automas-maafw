@@ -9,7 +9,7 @@ import sys
 import threading
 import uuid
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Mapping
 
 from .models import MaaFWAgentCommandPlan, MaaFWAgentEnvPrepareResult
 from .planner import MaaFWAgentEnvError, venv_python_exe
@@ -18,6 +18,8 @@ from .planner import MaaFWAgentEnvError, venv_python_exe
 AGENT_BOOTSTRAP_PACKAGE = "json-with-comments"
 AGENT_ENV_MANIFEST_NAME = ".auto_mas_agent_env.json"
 AGENT_COMPAT_SHIM_DIR_NAME = ".auto_mas_shims"
+AUTO_MAS_UV_INDEX_URL_ENV = "AUTO_MAS_UV_INDEX_URL"
+OFFICIAL_PYPI_INDEX_URL = "https://pypi.org/simple"
 PIP_HEALTH_CHECK_TIMEOUT = 15
 PROJECT_PYTHON_HEALTH_TIMEOUT = 15
 PIP_INSTALL_TIMEOUT = 120
@@ -434,6 +436,22 @@ def _is_isolated_venv_manifest_current(venv_path: Path, project_path: Path) -> b
     )
 
 
+def is_isolated_venv_ready(
+    venv_path: str | Path,
+    project_path: str | Path,
+) -> bool:
+    """Return whether an isolated Agent venv has a current success marker."""
+
+    resolved_venv = Path(venv_path).expanduser().resolve(strict=False)
+    resolved_project = Path(project_path).expanduser().resolve(strict=False)
+    try:
+        return _is_valid_venv_path(
+            resolved_venv
+        ) and _is_isolated_venv_manifest_current(resolved_venv, resolved_project)
+    except (OSError, TypeError, ValueError):
+        return False
+
+
 def _write_isolated_venv_manifest(venv_path: Path, project_path: Path) -> None:
     manifest_path = venv_path / AGENT_ENV_MANIFEST_NAME
     manifest_path.write_text(
@@ -488,6 +506,57 @@ def _build_agent_env_for_pip(project_path: Path) -> dict[str, str]:
     env.pop("PIP_USER", None)
     env["PYTHONPATH"] = str(project_path)
     return env
+
+
+def build_pip_install_index_args(
+    env: Mapping[str, str] | None = None,
+) -> list[str]:
+    """Translate the host/uv preferred index into pip command arguments.
+
+    Runtime Pool and plugin bootstrap use uv, while isolated Agent venvs use
+    the venv's bundled pip. pip does not understand ``UV_INDEX_URL`` or the
+    host's ``AUTO_MAS_UV_INDEX_URL`` preference, so without this bridge it can
+    silently fall back to an unrelated user-level ``pip.ini`` mirror.
+
+    An explicit ``PIP_INDEX_URL`` remains authoritative because pip already
+    consumes it directly. Otherwise preserve uv's precedence and finally use
+    the host-provided preferred index.
+    """
+
+    source = env if env is not None else os.environ
+    if str(source.get("PIP_INDEX_URL") or "").strip():
+        return []
+
+    for name in ("UV_INDEX_URL", "UV_DEFAULT_INDEX", AUTO_MAS_UV_INDEX_URL_ENV):
+        index_url = str(source.get(name) or "").strip()
+        if index_url:
+            return ["--index-url", index_url]
+    return []
+
+
+def build_pip_install_index_attempts(
+    env: Mapping[str, str] | None = None,
+) -> list[list[str]]:
+    """Return the authoritative/preferred pip index attempts in order."""
+
+    source = env if env is not None else os.environ
+    primary = build_pip_install_index_args(source)
+    attempts = [primary]
+
+    # Explicit pip/uv settings are authoritative. AUTO_MAS_UV_INDEX_URL is a
+    # host preference, so it may safely fall back to the official index when a
+    # mirror has not synchronized a project yet. With no explicit preference,
+    # try the user's normal pip configuration first and official PyPI second.
+    if any(
+        str(source.get(name) or "").strip()
+        for name in ("PIP_INDEX_URL", "UV_INDEX_URL", "UV_DEFAULT_INDEX")
+    ):
+        return attempts
+
+    official = ["--index-url", OFFICIAL_PYPI_INDEX_URL]
+    if primary != official:
+        attempts.append(official)
+    return attempts
 
 
 def _check_pip_health(
@@ -632,26 +701,54 @@ def _pip_install(
     env: dict[str, str],
     log: Callable[[str], None],
 ) -> bool:
-    try:
-        result = subprocess.run(
-            [python_exe, "-m", "pip", "install", "--quiet", *packages],
-            capture_output=True,
-            timeout=PIP_INSTALL_TIMEOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            cwd=cwd,
-            env=env,
-        )
-        if result.returncode == 0:
-            log(f"[Python环境] pip install 完成: {', '.join(packages)}")
-            return True
-        detail = (result.stderr or result.stdout or "").strip()
-        log(f"[Python环境] pip install 未成功: {detail[:300]}")
-    except subprocess.TimeoutExpired:
-        log(f"[Python环境] pip install 超时 ({PIP_INSTALL_TIMEOUT}s)")
-    except Exception as exc:
-        log(f"[Python环境] pip install 异常: {exc}")
+    attempts = build_pip_install_index_attempts(env)
+    for attempt, index_args in enumerate(attempts, start=1):
+        if index_args:
+            source = "宿主首选 Python 索引" if attempt == 1 else "PyPI 官方索引"
+            log(f"[Python环境] pip install 使用{source}")
+        try:
+            result = subprocess.run(
+                [
+                    python_exe,
+                    "-m",
+                    "pip",
+                    "install",
+                    "--quiet",
+                    *index_args,
+                    *packages,
+                ],
+                capture_output=True,
+                timeout=PIP_INSTALL_TIMEOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                cwd=cwd,
+                env=env,
+            )
+            if result.returncode == 0:
+                log(f"[Python环境] pip install 完成: {', '.join(packages)}")
+                return True
+            detail = (result.stderr or result.stdout or "").strip()
+            if attempt < len(attempts):
+                log(
+                    "[Python环境] pip install 首选索引未成功，"
+                    f"尝试 PyPI 官方索引: {detail[:300]}"
+                )
+            else:
+                log(f"[Python环境] pip install 未成功: {detail[:300]}")
+        except subprocess.TimeoutExpired:
+            if attempt < len(attempts):
+                log(
+                    f"[Python环境] pip install 超时 ({PIP_INSTALL_TIMEOUT}s)，"
+                    "尝试 PyPI 官方索引"
+                )
+            else:
+                log(f"[Python环境] pip install 超时 ({PIP_INSTALL_TIMEOUT}s)")
+        except Exception as exc:
+            if attempt < len(attempts):
+                log(f"[Python环境] pip install 异常，尝试 PyPI 官方索引: {exc}")
+            else:
+                log(f"[Python环境] pip install 异常: {exc}")
     return False
 
 

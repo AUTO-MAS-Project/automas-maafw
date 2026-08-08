@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from automas_maafw_agent_env import is_isolated_venv_ready
+
 
 _STATE_VERSION = 1
 _STATE_FILE_NAME = "maafw_agent_env_state.json"
@@ -128,6 +130,12 @@ def _is_cached_data_valid(data: Mapping[str, Any], project_path: Path) -> bool:
                     return False
                 if key == "isolatedVenvPath" and not candidate.is_dir():
                     return False
+        if agent.get("runtimeKind") == "isolated_venv":
+            isolated_venv_path = agent.get("isolatedVenvPath")
+            if not isinstance(isolated_venv_path, str) or not isolated_venv_path:
+                return False
+            if not is_isolated_venv_ready(isolated_venv_path, project_path):
+                return False
 
     runtime_keys = ("runtimeId", "poolId", "pythonExecutable", "venvPath")
     runtime_values = tuple(data.get(key) for key in runtime_keys)

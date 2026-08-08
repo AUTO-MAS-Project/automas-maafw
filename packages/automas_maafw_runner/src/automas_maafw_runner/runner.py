@@ -35,7 +35,10 @@ from pathlib import Path
 from typing import Any, BinaryIO, Callable, Literal, TextIO
 
 import maa as maa_package
-from automas_maafw_agent_env import write_agent_compat_shims
+from automas_maafw_agent_env import (
+    build_pip_install_index_attempts,
+    write_agent_compat_shims,
+)
 from maa.agent_client import AgentClient
 from maa.controller import (
     AdbController,
@@ -2159,43 +2162,68 @@ class MaaFWRunner:
         env: dict[str, str] | None = None,
     ) -> bool:
         """执行 pip install（不带 --upgrade），返回是否成功。"""
-        try:
-            result = subprocess.run(
-                [
-                    python_exe,
-                    "-m",
-                    "pip",
-                    "install",
-                    "--quiet",
-                    *packages,
-                ],
-                capture_output=True,
-                timeout=PIP_INSTALL_TIMEOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                cwd=cwd,
-                env=env,
-            )
-            if result.returncode == 0:
-                self.send_log(
-                    f"[Python环境] pip install 完成: {', '.join(packages)}"
+        attempts = build_pip_install_index_attempts(env)
+        for attempt, index_args in enumerate(attempts, start=1):
+            if index_args:
+                source = (
+                    "宿主首选 Python 索引" if attempt == 1 else "PyPI 官方索引"
                 )
-                return True
-            detail = (result.stderr or result.stdout or "").strip()
-            self.send_log(
-                f"[Python环境] pip install 未成功（将由 agent 自举尝试）: "
-                f"{detail[:300]}"
-            )
-        except subprocess.TimeoutExpired:
-            self.send_log(
-                f"[Python环境] pip install 超时 ({PIP_INSTALL_TIMEOUT}s)，"
-                f"将由 agent 自举尝试"
-            )
-        except Exception as exc:
-            self.send_log(
-                f"[Python环境] pip install 异常: {exc}，将由 agent 自举尝试"
-            )
+                self.send_log(f"[Python环境] pip install 使用{source}")
+            try:
+                result = subprocess.run(
+                    [
+                        python_exe,
+                        "-m",
+                        "pip",
+                        "install",
+                        "--quiet",
+                        *index_args,
+                        *packages,
+                    ],
+                    capture_output=True,
+                    timeout=PIP_INSTALL_TIMEOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    cwd=cwd,
+                    env=env,
+                )
+                if result.returncode == 0:
+                    self.send_log(
+                        f"[Python环境] pip install 完成: {', '.join(packages)}"
+                    )
+                    return True
+                detail = (result.stderr or result.stdout or "").strip()
+                if attempt < len(attempts):
+                    self.send_log(
+                        "[Python环境] pip install 首选索引未成功，"
+                        f"尝试 PyPI 官方索引: {detail[:300]}"
+                    )
+                else:
+                    self.send_log(
+                        "[Python环境] pip install 未成功（将由 agent 自举尝试）: "
+                        f"{detail[:300]}"
+                    )
+            except subprocess.TimeoutExpired:
+                if attempt < len(attempts):
+                    self.send_log(
+                        f"[Python环境] pip install 超时 ({PIP_INSTALL_TIMEOUT}s)，"
+                        "尝试 PyPI 官方索引"
+                    )
+                else:
+                    self.send_log(
+                        f"[Python环境] pip install 超时 ({PIP_INSTALL_TIMEOUT}s)，"
+                        "将由 agent 自举尝试"
+                    )
+            except Exception as exc:
+                if attempt < len(attempts):
+                    self.send_log(
+                        f"[Python环境] pip install 异常，尝试 PyPI 官方索引: {exc}"
+                    )
+                else:
+                    self.send_log(
+                        f"[Python环境] pip install 异常: {exc}，将由 agent 自举尝试"
+                    )
         return False
 
     def _run_tasks(self) -> list[str]:
