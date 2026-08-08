@@ -68,22 +68,30 @@ class Plugin:
 
 ### 3.1 发布依赖顺序
 
-`publish.yml` 每次只发布一个 distribution。当前版本按以下层级发布；同层可并行，
-下一层必须等待依赖版本已经可从 PyPI 安装：
+`publish.yml` 每次只发布一个 distribution。当前工作流只允许普通 MaaFW 发布层；
+同层可并行，下一层必须等待依赖版本已经可从 PyPI 安装：
 
-1. `automas-maafw-interface` 0.2.0、`automas-maafw-project-store` 0.2.3、
-   `automas-maafw-runtime-pool` 0.2.0。
-2. `automas-maafw-agent-env` 0.1.4、`automas-maafw-project-update` 0.2.3。
+1. `automas-maafw-interface` 0.2.0、`automas-maafw-runtime-pool` 0.2.0。
+2. `automas-maafw-controller-adb` 0.1.1、`automas-maafw-controller-win32` 0.1.2、
+   `automas-maafw-agent-env` 0.1.4、`automas-maafw-project-update` 0.2.3。
 3. `automas-maafw-runner` 0.4.0。
 4. `automas-script-maafw` 0.1.13。
-5. `automas-script-maafw-managed` 0.3.2。
-6. 在独立 M9A 仓库发布 `automas-script-maafw-pack-m9a` 0.1.6，随后发布
-   聚合包 `automas-m9a` 0.1.6；二者不得早于前五层依赖在 PyPI 可安装。
+5. 普通层 1–4 完成后，在独立 M9A 仓库发布 `automas-script-maafw-pack-m9a` 0.1.6，
+   随后发布 `automas-m9a` 0.1.6；普通 M9A 不依赖被延后的 Project Store/Managed。
 
-首次发布 Project Store、Runtime Pool 和 Managed 前，仍须创建
-`pypi-project-store`、`pypi-runtime-pool`、`pypi-script-maafw-managed` GitHub
-Environments，并为三个包配置与仓库、workflow、environment 精确匹配的 PyPI
-pending trusted publishers；这些是外部发布前置，不由本地代码或构建代替。
+controller-adb 0.1.1 和 controller-win32 0.1.2 是当前待首次发布的版本；发布后
+不得用同版本重复上传。手动 workflow 必须提供目标 `ref` 和精确 `version`，并在
+发布前从该 ref 重新构建、运行仓库测试、校验产物版本和 `twine check`。发布动作
+只接收该次构建 artifact，不扫描仓库中可能残留的 `dist/`。
+
+`automas-maafw-project-store` 0.2.3 与 `automas-script-maafw-managed` 0.3.2
+暂缓发布：目标宿主尚未提供 `Config.get_plugin_script_type_conversion_snapshot()`
+和 `Config.convert_plugin_script_type()`，因此本轮工作流不含 Project Store、Managed。
+宿主 conversion 契约合入并完成新的发布门禁后，再恢复 Project Store/Managed 相应层级。
+
+发布当前普通层之前，仍须为每个包创建对应 `pypi-*` GitHub Environment，并在 PyPI
+为相同包名配置与仓库、workflow、environment 精确匹配的 pending trusted publisher；
+这些是外部发布前置，不由本地代码或构建代替。
 
 ## 4. `maafw.interface.v1`
 

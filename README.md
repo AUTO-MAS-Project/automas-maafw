@@ -36,31 +36,36 @@ M9A project pack 与 `automas-m9a` 聚合包位于独立的 `automas-m9a` 仓库
 
 ## Release
 
-`publish.yml` 每次只发布一个 distribution，不会自动处理包间顺序。当前版本应按
-以下层级发布；同层可并行，下一层须等待依赖版本已经可从 PyPI 安装：
+`publish.yml` 每次只发布一个 distribution，不会自动处理包间顺序。当前工作流只
+允许普通 MaaFW 发布层；同层可并行，下一层须等待依赖版本已经可从 PyPI 安装：
 
-1. `automas-maafw-interface` 0.2.0、`automas-maafw-project-store` 0.2.3、
-   `automas-maafw-runtime-pool` 0.2.0。
-2. `automas-maafw-agent-env` 0.1.4、`automas-maafw-project-update` 0.2.3。
+1. `automas-maafw-interface` 0.2.0、`automas-maafw-runtime-pool` 0.2.0。
+2. `automas-maafw-controller-adb` 0.1.1、`automas-maafw-controller-win32` 0.1.2、
+   `automas-maafw-agent-env` 0.1.4、`automas-maafw-project-update` 0.2.3。
 3. `automas-maafw-runner` 0.4.0。
 4. `automas-script-maafw` 0.1.13。
-5. `automas-script-maafw-managed` 0.3.2。
-6. 在独立 M9A 仓库依次发布 `automas-script-maafw-pack-m9a` 0.1.6 与
-   `automas-m9a` 0.1.6。
+5. 普通层 1–4 完成后，在独立 M9A 仓库发布 `automas-script-maafw-pack-m9a` 0.1.6，
+   随后发布 `automas-m9a` 0.1.6。
 
-不要以相同版本重新发布已经存在的 controller 包。首次发布 Project Store、
-Runtime Pool 和 Managed 前，必须创建 `pypi-project-store`、
-`pypi-runtime-pool`、`pypi-script-maafw-managed` GitHub Environments，并在
-PyPI 为相同包名配置与 repo、`publish.yml` 和 environment 精确匹配的 pending
-trusted publisher。
+`automas-maafw-controller-adb` 0.1.1 与 `automas-maafw-controller-win32` 0.1.2
+是当前待首次发布的 controller 版本；发布成功后不得以相同版本重复上传。每次
+手动发布都必须填写目标 `ref` 和 pyproject 中的精确 `version`，工作流会从该 ref
+重新构建、运行测试并只上传本次构建出的两个产物。
 
-普通 MaaFW 脚本 0.1.13 的配置导入/用户复制与 Managed 0.3.2 都要求目标
-AUTO-MAS `dev_v2` 已提供
+`automas-maafw-project-store` 0.2.3 与 `automas-script-maafw-managed` 0.3.2
+暂不属于当前发布层。目标宿主尚未提供原地换型所需的 conversion API，因此本轮不
+发布 Project Store、Managed；待宿主契约合入并完成单独门禁后再按新的发布顺序启用。
+第 5 步的普通 M9A 不依赖被延后的 Project Store/Managed。
+
+发布当前层之前，必须为对应包创建 `pypi-*` GitHub Environment，并在 PyPI 为相同
+包名配置与仓库、`publish.yml` 和 environment 精确匹配的 pending trusted publisher。
+
+普通 MaaFW 脚本 0.1.13 的配置导入/用户复制要求目标 AUTO-MAS `dev_v2` 已提供
 `Config.script_config_transaction()`、`Config.script_config_write_scope()` 和
 ScriptConfigStore 的 `write_transaction()`。Managed 原地转换还要求宿主提供
 `Config.get_plugin_script_type_conversion_snapshot()` 和
-`Config.convert_plugin_script_type()`；宿主事务与原子换型改动合入前不得发布或
-启用这两个版本的新事务能力。M9A 的最低依赖必须对齐
+`Config.convert_plugin_script_type()`；这些 conversion API 合入宿主前不得发布或
+启用 Managed/Project Store。后续 M9A 发布时，其最低依赖必须对齐
 `automas-maafw-runner>=0.4.0`、`automas-script-maafw>=0.1.13`，不要因本轮功能
 把普通脚本包错误提升到 0.2.0。
 

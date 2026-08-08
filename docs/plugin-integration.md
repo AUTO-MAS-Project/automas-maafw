@@ -95,7 +95,7 @@ ProjectInterface
 
 ## 5. 事务与宿主最低能力
 
-发布或启用普通脚本 0.1.13 / Managed 0.3.2 前，宿主必须提供：
+发布或启用普通脚本 0.1.13 前，宿主必须提供：
 
 ```text
 Config.script_config_transaction()
@@ -103,7 +103,7 @@ Config.script_config_write_scope()
 ScriptConfigStore.write_transaction()
 ```
 
-原地转换还必须提供：
+Managed/Project Store 原地转换还必须提供：
 
 ```text
 Config.get_plugin_script_type_conversion_snapshot()
@@ -126,17 +126,26 @@ Managed 的远程更新源由宿主全局配置统一决定，其请求字段仅
 的版本发现不是可安装候选，下载有 300 秒墙钟上限并报告真实进度；失败不得把当前
 版本写成目标版本。
 
-发行顺序（同层可并行，下一层等待 PyPI 可安装）为：
+当前普通 MaaFW 发行顺序（同层可并行，下一层等待 PyPI 可安装）为：
 
-1. Interface 0.2.0、Project Store 0.2.3、Runtime Pool 0.2.0。
-2. Agent Env 0.1.4、Project Update 0.2.3。
+1. Interface 0.2.0、Runtime Pool 0.2.0。
+2. Controller ADB 0.1.1、Controller Win32 0.1.2、Agent Env 0.1.4、Project Update
+   0.2.3。
 3. Runner 0.4.0。
 4. Script MaaFW 0.1.13。
-5. Script MaaFW Managed 0.3.2。
-6. 独立 M9A 仓库的 pack，再发布聚合包。
+5. 普通层 1–4 完成后，在独立 M9A 仓库发布 pack 0.1.6，随后发布聚合包 0.1.6。
 
-Project Store、Runtime Pool、Managed 的首次 PyPI 发布仍需要对应 GitHub Environment
-和 pending trusted publisher；本地文档或构建不会代替这些外部配置。
+Controller ADB/Win32 的上述版本是当前待首次发布版本；发布后不得重复上传相同
+版本。`publish.yml` 通过目标 `ref`、精确版本、全仓测试、隔离构建、产物元数据和
+`twine check` 门禁后，只上传本次构建 artifact，不使用仓库内已有 `dist/`。
+
+Project Store 0.2.3 和 Script MaaFW Managed 0.3.2 暂不在当前发布层。目标宿主
+缺少 conversion API，未满足 `MaaFWManaged` 原地转换的宿主契约前，本轮不发布或
+启用这两个包；待宿主接口合入并重新审核后再恢复其发布顺序。第 5 步的普通 M9A
+不依赖这两个延后包。
+
+当前层每个包首次发布仍需要对应 GitHub Environment 和 pending trusted publisher；
+本地文档或构建不会代替这些外部配置。
 
 ## 7. 明确不承诺的能力
 
