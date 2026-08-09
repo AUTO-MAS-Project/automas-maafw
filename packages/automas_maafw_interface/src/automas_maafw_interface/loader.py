@@ -45,12 +45,13 @@ IMPORTABLE_KEYS = (
     "global_option",
     "preset",
     "group",
+    "setting",
     "pretask",
     "import",
 )
 logger = logging.getLogger("automas.maafw.interface.loader")
 
-DISK_CACHE_VERSION = 2
+DISK_CACHE_VERSION = 3
 DISK_CACHE_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
 DISK_CACHE_CLEANUP_INTERVAL_SECONDS = 24 * 60 * 60
 _interface_cache: dict[Path, tuple[tuple, MaaFWInterface, set[Path], set[tuple[Path, str]]]] = {}
@@ -308,6 +309,19 @@ def _merge_groups(
         target["group"].append(copy.deepcopy(group))
 
 
+def _merge_settings(
+    target: dict[str, Any],
+    settings: Any,
+    source_path: Path,
+) -> None:
+    setting_items = _normalize_object_list(settings, source_path, "setting")
+    if not setting_items:
+        return
+
+    target.setdefault("setting", [])
+    target["setting"].extend(copy.deepcopy(setting_items))
+
+
 def _merge_global_options(
     target: dict[str, Any],
     global_options: Any,
@@ -391,17 +405,13 @@ def _seed_root_sections(
     _validate_preset_section(root_data.get("preset"), source_path)
 
     root_groups = root_data.pop("group", None)
+    root_settings = root_data.pop("setting", None)
     root_global_options = root_data.pop("global_option", None)
     root_pretasks = root_data.pop("pretask", None)
     _merge_groups(root_data, root_groups, source_path, state)
+    _merge_settings(root_data, root_settings, source_path)
     _merge_global_options(root_data, root_global_options, source_path, state)
     _merge_pretasks(root_data, root_pretasks, source_path, state)
-
-    if root_data.pop("setting", None) is not None:
-        logger.warning(
-            "MaaFW ProjectInterface setting 设置页声明暂不支持，已忽略；文件：%s",
-            source_path,
-        )
 
 
 def _merge_fragment_sections(
@@ -415,6 +425,7 @@ def _merge_fragment_sections(
     global_options = fragment.get("global_option")
     presets = fragment.get("preset")
     groups = fragment.get("group")
+    settings = fragment.get("setting")
     pretasks = fragment.get("pretask")
 
     _validate_tasks(tasks, source_path)
@@ -432,6 +443,7 @@ def _merge_fragment_sections(
         target.setdefault("preset", [])
         target["preset"].extend(copy.deepcopy(presets))
     _merge_groups(target, groups, source_path, state)
+    _merge_settings(target, settings, source_path)
     _merge_pretasks(target, pretasks, source_path, state)
 
 
@@ -602,18 +614,23 @@ def _validate_option_case_values(
             )
         return
 
-    if option.type == "input":
+    if option.type in {"input", "hotkey"}:
         if not isinstance(value, dict):
             raise MaaFWInterfaceLoadError(f"{location}.{option_name} 必须是对象")
-        input_names = {input_item.name for input_item in option.inputs or []}
-        for input_name, input_value in value.items():
-            if input_name not in input_names:
+        field_names = (
+            {input_item.name for input_item in option.inputs or []}
+            if option.type == "input"
+            else {hotkey_item.name for hotkey_item in option.hotkeys or []}
+        )
+        field_label = "输入项" if option.type == "input" else "快捷键字段"
+        for field_name, field_value in value.items():
+            if field_name not in field_names:
                 raise MaaFWInterfaceLoadError(
-                    f"{location}.{option_name} 引用了不存在的输入项: {input_name}"
+                    f"{location}.{option_name} 引用了不存在的{field_label}: {field_name}"
                 )
-            if not isinstance(input_value, str):
+            if not isinstance(field_value, str):
                 raise MaaFWInterfaceLoadError(
-                    f"{location}.{option_name}.{input_name} 必须是字符串"
+                    f"{location}.{option_name}.{field_name} 必须是字符串"
                 )
 
 
@@ -648,6 +665,13 @@ def _validate_option_references(interface_model: MaaFWInterface) -> None:
         option_map,
         location="global_option",
     )
+
+    for setting in interface_model.setting or []:
+        _validate_option_name_list(
+            setting.option,
+            option_map,
+            location=f"setting {setting.name}",
+        )
 
     for resource in interface_model.resource:
         _validate_option_name_list(

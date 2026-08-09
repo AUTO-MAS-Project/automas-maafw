@@ -3,6 +3,7 @@ from __future__ import annotations
 from app.plugins import ScriptAdapterDefinition, ScriptAdapterPlugin
 
 from .adapter import MaaFWAdapterHooks
+from .configuration_controller import MaaFWConfigurationReuseController
 from .registry import MaaFWRegistryService
 from .schema import SCRIPT_GROUPS, USER_GROUPS
 
@@ -23,11 +24,18 @@ schema = {
     },
 }
 
+API_SERVICE = "maafw.api.v1"
+
 
 class Plugin(ScriptAdapterPlugin):
     """MaaFW script adapter plugin."""
 
-    provides = ["maafw.registry.v1"]
+    provides = [
+        "maafw.registry.v1",
+        "maafw.configuration_reuse.v1",
+        "maafw.api.v1",
+    ]
+    needs = ["maafw.runtime_pool.v1"]
     wants = [
         "emulator",
         "maafw.interface.v1",
@@ -39,6 +47,15 @@ class Plugin(ScriptAdapterPlugin):
     def __init__(self, ctx):
         super().__init__(ctx)
         self.registry = MaaFWRegistryService()
+        self.configuration_reuse = MaaFWConfigurationReuseController(
+            ctx,
+            self.registry,
+        )
+        # Import the transport controller lazily.  This keeps schema/adapter
+        # discovery usable in lightweight tooling that does not mount the
+        # host plugin server, while the normal lifecycle always registers the
+        # routes through ``ctx.server``.
+        self.api = None
 
     def build_script_adapters(self):
         return [
@@ -69,9 +86,22 @@ class Plugin(ScriptAdapterPlugin):
         ]
 
     async def on_start(self) -> None:
-        self.ctx.set("maafw.registry.v1", self.registry)
+        from .api import MaaFWApiController
+
         await super().on_start()
+        self.ctx.set("maafw.registry.v1", self.registry)
+        self.ctx.set("maafw.configuration_reuse.v1", self.configuration_reuse)
+        self.api = MaaFWApiController(self.ctx)
+        self.ctx.set(API_SERVICE, self.api)
+        self.configuration_reuse.register_routes()
+        self.api.register_routes()
 
     async def on_stop(self, reason: str) -> None:
+        if self.api is not None:
+            await self.api.close()
+            self.api = None
+        self.configuration_reuse.clear()
+        self.ctx.set(API_SERVICE, None)
+        self.ctx.set("maafw.configuration_reuse.v1", None)
         self.ctx.set("maafw.registry.v1", None)
         await super().on_stop(reason)

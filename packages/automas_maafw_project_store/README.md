@@ -1,0 +1,118 @@
+# automas-maafw-project-store
+
+Versioned, resource-only MaaFW project storage for AUTO-MAS.
+
+The plugin instance exposes `Root` and `RunRoot` settings. Empty values keep the legacy
+`data/maafw_project_store` location under the AUTO-MAS working directory; a
+configured value is fixed for the lifetime of that plugin instance and takes
+effect after restart. The selected root contains a stable
+`.auto_mas_maafw_project_store.json` identity marker. Empty roots are initialized
+safely, while unknown non-empty directories, invalid markers, symlinks and
+Windows reparse-point chains are rejected. An existing markerless layout is
+adopted only at the legacy default location and no project content is moved.
+`storage_info()` exposes the resolved path, persistent `storeId`, default-root
+flag and JSON-friendly `rootIdentity`.
+
+`RunRoot` defaults to the separate `data/maafw_project_runs` tree. It carries a
+stable run-root identity and cannot equal, contain, or be contained by the Store
+root. `checkout_project(project_id, version, script_id)` atomically copies the
+immutable stripped payload into a script-isolated writable checkout. Matching
+checkouts are reused without replacing user output; invalid markers, conflicts,
+reparse points, and incomplete copies fail closed. Store private manifests are
+never copied and files are copied rather than hardlinked.
+
+The plugin provides the JSON-friendly `maafw.project_store.v1` service. It
+accepts either an unpacked release directory or a ZIP release. Each import
+creates an immutable project version, keeps the ProjectInterface,
+imported fragments, complete MaaFW resource paths and agent-side dependencies,
+and deliberately omits known UI shells, embedded runtimes, caches and updater
+payloads.
+
+ZIP files are extracted only into this store's private `.staging` directory.
+Absolute and parent paths, case-colliding entries, links, devices and other
+special files are rejected. Entry count, per-file size, total expanded size and
+compression ratio are bounded, and actual bytes are checked while extracting.
+Archives may contain the project at their root or inside one unambiguous direct
+wrapper directory.
+
+The `version` argument is optional when ProjectInterface declares `version`.
+When both are present they must match; a single leading `v` is treated as
+equivalent (for example, `1.2.3` and `v1.2.3`). Directory or archive names are
+never used to infer a version.
+
+Consumers resolve a project through `resolve_project(project_id, version)`.
+The returned `dataPath` always points at a directory containing
+`interface.json` or `interface.jsonc`; its private
+`.auto_mas_maafw_project.json` manifest exposes the runtime constraint without
+requiring host-specific models.
+
+When ProjectInterface and `requirements.txt` do not pin MaaFW, a bundled
+`MaaFramework.dll` containing exactly one static `vX.Y.Z` marker can supply the
+exact constraint without loading the DLL. Binaries retaining multiple version
+strings, temporary/update trees and pip `~*` uninstall residue are not treated
+as evidence. A caller-supplied constraint that excludes the uniquely inferred
+version, or conflicting unique bundled versions, fails closed.
+
+Manifest schema 3 is validated centrally before every resolve, list, checkout,
+binding, reference, lease, switch and garbage-collection path. Store identity,
+source and payload hash descriptors, the projected ProjectInterface path,
+runtime aliases, Python metadata, agent/ABI mirrors, binding shape and deletion
+guards fail closed when malformed; a corrupt manifest is never reduced to a
+partial inventory DTO.
+
+New source and payload tree hashes use distinct domains and frame the file
+count, every UTF-8 path length/path and every content length/content before the
+bytes themselves. Existing schema-2 Stores remain usable: on first load the
+legacy payload is verified with its original algorithm, then the private
+manifest is atomically upgraded to schema 3 with explicit legacy-framing
+metadata. Legacy hash values are deliberately preserved so existing checkout
+identities and per-script writable state are not stranded; only newly imported
+versions use the collision-resistant framing.
+
+Starting with Project Store 0.2.2, the private manifest persists a hard
+`runtime.python` object containing the
+CPython implementation, version constraint and evidence sources. It uses an
+explicit ProjectInterface declaration when present; otherwise a unique
+`python3XY._pth` beside a stripped bundled interpreter, or one unambiguous
+`python3XY.dll` beside it/at the Windows release root, supplies the minor family
+without executing project code. Conflicting declarations fail closed,
+and the Python metadata participates in the projected source identity so a
+CP312 and CP313 release cannot become the same immutable import accidentally.
+
+Project Store 0.2.3 allows `project_id` to be omitted for a local import. The immutable
+ID is resolved from the ProjectInterface's formal `projectId`/`project_id`, then an
+explicit caller ID as a compatibility alias, then `name`, and finally the source
+directory name. A caller alias that conflicts with a formal ProjectInterface ID is
+rejected.
+
+The same release accepts an optional, credential-free `remote_source` identity
+for Managed imports. GitHub repository/tag/asset selectors or MirrorChyan RID
+metadata are validated, merged with matching ProjectInterface declarations
+(the ProjectInterface wins and caller metadata only fills missing fields),
+stored in the immutable private manifest, and exposed through the compact summary. Re-importing the same project version with a
+different remote identity is rejected; credential-like or unknown fields are
+never accepted.
+
+Resolved records and list operations expose a compact `summary` containing
+ProjectInterface capabilities, remote source identity, agent routing, stripped
+shell families, source and projected sizes, ABI requirements and warning counts. If a bundled Python
+interpreter is stripped, the projected ProjectInterface routes that agent
+through `python` and the manifest records the `managed-python` route instead of
+leaving a broken path to the removed executable.
+
+The service also exposes `import_project`, `update_project`, `list_projects`,
+`list_versions`, `switch_version`, `delete_version`, `collect_garbage`,
+`bind_runtime`, `release_runtime`, `set_references`, `acquire_lease`, and
+`release_lease`. Its async `resource_lifecycle_transaction()` coordinates
+multi-call reference reconciliation, binding changes and destructive GC across
+HTTP actions and script hooks. Bindings are routing metadata; current pointers,
+pins, reconciled references, and unexpired project leases are the deletion
+guards.
+
+`resource_lifecycle_transaction()` is an in-process Python coordination surface,
+not a JSON-returning service action or a cross-process file lock. Calls using
+the same service instance and `asyncio.Task` may re-enter it; independent tasks
+wait, while a child task that inherited the owner's context is rejected instead
+of deadlocking. The transaction does not replace reference, pin or lease guards,
+and the store's internal `RLock` still protects only each synchronous method
+call.

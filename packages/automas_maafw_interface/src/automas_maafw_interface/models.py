@@ -31,7 +31,7 @@ MaaFWTaskOptionsByTask = dict[str, dict[str, MaaFWTaskOptionValue]]
 PRETASK_TASK_PREFIX = "__MXU_PRETASK__"
 PRETASK_TASK_ENTRY = "MXU_PRETASK"
 SUPPORTED_OPTION_TYPES = frozenset(
-    {"select", "checkbox", "input", "switch", "scan_select"}
+    {"select", "checkbox", "input", "hotkey", "switch", "scan_select"}
 )
 
 
@@ -162,6 +162,17 @@ class MaaFWGroup(BaseModel):
     default_expand: bool | None = True
 
 
+class MaaFWSetting(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    name: str
+    label: str | None = None
+    description: str | None = None
+    icon: str | None = None
+    option: list[str] | None = None
+    default_expand: bool | None = True
+
+
 class MaaFWOptionCase(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -195,6 +206,15 @@ class MaaFWInputCase(BaseModel):
         return self
 
 
+class MaaFWHotkeyCase(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    name: str
+    label: str | None = None
+    description: str | None = None
+    default: str | None = None
+
+
 class MaaFWOption(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -206,6 +226,7 @@ class MaaFWOption(BaseModel):
     resource: list[str] | None = None
     cases: list[MaaFWOptionCase] | None = None
     inputs: list[MaaFWInputCase] | None = None
+    hotkeys: list[MaaFWHotkeyCase] | None = None
     scan_dir: str | None = None
     scan_filter: str | None = None
     pipeline_override: MaaFWPipelineOverride | None = None
@@ -254,6 +275,7 @@ class MaaFWInterface(BaseModel):
     controller: list[MaaFWController] = Field(default_factory=list)
     resource: list[MaaFWResource] = Field(default_factory=list)
     group: list[MaaFWGroup] | None = None
+    setting: list[MaaFWSetting] | None = None
     pretask: MaaFWPretask | list[MaaFWPretask] | None = None
     agent: MaaFWAgent | list[MaaFWAgent] | None = None
     task: list[MaaFWTask] = Field(default_factory=list)

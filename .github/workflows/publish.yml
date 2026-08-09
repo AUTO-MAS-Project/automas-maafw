@@ -4,131 +4,260 @@ on:
   workflow_dispatch:
     inputs:
       package:
-        description: Package to publish
+        description: Ordinary MaaFW distribution to publish
         required: true
         type: choice
         options:
           - automas-maafw-interface
-          - automas-maafw-agent-env
+          - automas-maafw-runtime-pool
           - automas-maafw-controller-adb
           - automas-maafw-controller-win32
+          - automas-maafw-agent-env
           - automas-maafw-project-update
           - automas-maafw-runner
           - automas-script-maafw
+      ref:
+        description: Branch, tag, or commit to check out and release
+        required: true
+        type: string
+      version:
+        description: Exact version in the selected package pyproject.toml
+        required: true
+        type: string
 
 permissions:
   contents: read
-  id-token: write
+
+concurrency:
+  group: pypi-publish-${{ inputs.package }}
+  cancel-in-progress: false
 
 jobs:
-  publish-interface:
-    name: Publish automas-maafw-interface
-    if: inputs.package == 'automas-maafw-interface'
+  build:
+    name: Validate and build ${{ inputs.package }}
     runs-on: ubuntu-latest
-    environment: pypi-interface
+    outputs:
+      artifact_name: ${{ steps.prepare.outputs.artifact_name }}
+      environment: ${{ steps.resolve.outputs.environment }}
+      package: ${{ steps.resolve.outputs.package }}
+      version: ${{ steps.resolve.outputs.version }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-      - run: python -m pip install --upgrade build
-      - run: python -m build packages/automas_maafw_interface --outdir dist
-      - uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          packages-dir: dist
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          clean: true
+          persist-credentials: false
 
-  publish-agent-env:
-    name: Publish automas-maafw-agent-env
-    if: inputs.package == 'automas-maafw-agent-env'
-    runs-on: ubuntu-latest
-    environment: pypi-agent-env
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: python -m pip install --upgrade build
-      - run: python -m build packages/automas_maafw_agent_env --outdir dist
-      - uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          packages-dir: dist
+      - name: Verify target ref
+        env:
+          TARGET_REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          checked_out="$(git rev-parse HEAD)"
+          target="$(git rev-parse "${TARGET_REF}^{commit}")"
+          test "$checked_out" = "$target"
+          echo "Building $checked_out from $TARGET_REF"
 
-  publish-controller-adb:
-    name: Publish automas-maafw-controller-adb
-    if: inputs.package == 'automas-maafw-controller-adb'
-    runs-on: ubuntu-latest
-    environment: pypi-controller-adb
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.12"
-      - run: python -m pip install --upgrade build
-      - run: python -m build packages/automas_maafw_controller_adb --outdir dist
-      - uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          packages-dir: dist
+          enable-cache: true
 
-  publish-controller-win32:
-    name: Publish automas-maafw-controller-win32
-    if: inputs.package == 'automas-maafw-controller-win32'
-    runs-on: ubuntu-latest
-    environment: pypi-controller-win32
-    steps:
-      - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: python -m pip install --upgrade build
-      - run: python -m build packages/automas_maafw_controller_win32 --outdir dist
-      - uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          packages-dir: dist
 
-  publish-project-update:
-    name: Publish automas-maafw-project-update
-    if: inputs.package == 'automas-maafw-project-update'
-    runs-on: ubuntu-latest
-    environment: pypi-project-update
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: python -m pip install --upgrade build
-      - run: python -m build packages/automas_maafw_project_update --outdir dist
-      - uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          packages-dir: dist
+      - name: Resolve package and PyPI environment
+        id: resolve
+        env:
+          PACKAGE: ${{ inputs.package }}
+          EXPECTED_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          case "$PACKAGE" in
+            automas-maafw-interface)
+              package_dir=packages/automas_maafw_interface
+              environment=pypi-interface
+              ;;
+            automas-maafw-runtime-pool)
+              package_dir=packages/automas_maafw_runtime_pool
+              environment=pypi-runtime-pool
+              ;;
+            automas-maafw-controller-adb)
+              package_dir=packages/automas_maafw_controller_adb
+              environment=pypi-controller-adb
+              ;;
+            automas-maafw-controller-win32)
+              package_dir=packages/automas_maafw_controller_win32
+              environment=pypi-controller-win32
+              ;;
+            automas-maafw-agent-env)
+              package_dir=packages/automas_maafw_agent_env
+              environment=pypi-agent-env
+              ;;
+            automas-maafw-project-update)
+              package_dir=packages/automas_maafw_project_update
+              environment=pypi-project-update
+              ;;
+            automas-maafw-runner)
+              package_dir=packages/automas_maafw_runner
+              environment=pypi-runner
+              ;;
+            automas-script-maafw)
+              package_dir=packages/automas_script_maafw
+              environment=pypi-script-maafw
+              ;;
+            *)
+              echo "Unsupported or deferred package: $PACKAGE" >&2
+              exit 1
+              ;;
+          esac
+          test -f "$package_dir/pyproject.toml"
+          test -n "$EXPECTED_VERSION"
+          echo "package=$PACKAGE" >> "$GITHUB_OUTPUT"
+          echo "version=$EXPECTED_VERSION" >> "$GITHUB_OUTPUT"
+          echo "package_dir=$package_dir" >> "$GITHUB_OUTPUT"
+          echo "environment=$environment" >> "$GITHUB_OUTPUT"
 
-  publish-runner:
-    name: Publish automas-maafw-runner
-    if: inputs.package == 'automas-maafw-runner'
-    runs-on: ubuntu-latest
-    environment: pypi-runner
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: python -m pip install --upgrade build
-      - run: python -m build packages/automas_maafw_runner --outdir dist
-      - uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          packages-dir: dist
+      - name: Install workspace dependencies for validation
+        run: uv sync --all-packages --group dev
 
-  publish-script-maafw:
-    name: Publish automas-script-maafw
-    if: inputs.package == 'automas-script-maafw'
+      - name: Run repository tests
+        run: uv run python -m unittest discover -s tests -v
+
+      - name: Prepare fresh artifact directory
+        id: prepare
+        env:
+          PACKAGE: ${{ steps.resolve.outputs.package }}
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          release_dir="$RUNNER_TEMP/maafw-release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          if [[ -e "$release_dir" ]]; then
+            echo "Refusing to reuse artifact directory: $release_dir" >&2
+            exit 1
+          fi
+          mkdir "$release_dir"
+          echo "release_dir=$release_dir" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=${PACKAGE}-${VERSION}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+
+      - name: Build selected distribution from target ref
+        run: >-
+          uv run python -m build
+          "${{ steps.resolve.outputs.package_dir }}"
+          --outdir "${{ steps.prepare.outputs.release_dir }}"
+
+      - name: Verify source and artifact versions
+        env:
+          PACKAGE: ${{ steps.resolve.outputs.package }}
+          EXPECTED_VERSION: ${{ steps.resolve.outputs.version }}
+          PACKAGE_DIR: ${{ steps.resolve.outputs.package_dir }}
+          RELEASE_DIR: ${{ steps.prepare.outputs.release_dir }}
+        run: |
+          uv run python - <<'PY'
+          from __future__ import annotations
+
+          import os
+          import re
+          import tarfile
+          import tomllib
+          import zipfile
+          from email.parser import Parser
+          from pathlib import Path
+
+          package = os.environ["PACKAGE"]
+          expected_version = os.environ["EXPECTED_VERSION"]
+          package_dir = Path(os.environ["PACKAGE_DIR"])
+          release_dir = Path(os.environ["RELEASE_DIR"])
+
+          metadata = tomllib.loads(
+              (package_dir / "pyproject.toml").read_text(encoding="utf-8")
+          )["project"]
+          if metadata["name"] != package:
+              raise SystemExit(
+                  f"source package name {metadata['name']!r} != {package!r}"
+              )
+          if metadata["version"] != expected_version:
+              raise SystemExit(
+                  f"source version {metadata['version']!r} != {expected_version!r}"
+              )
+
+          artifacts = sorted(path for path in release_dir.iterdir() if path.is_file())
+          if len(artifacts) != 2:
+              raise SystemExit(f"expected exactly wheel and sdist, got {artifacts!r}")
+
+          normalized = re.sub(r"[-_.]+", "_", package)
+          wheel_prefix = f"{normalized}-{expected_version}-"
+          sdist_name = f"{normalized}-{expected_version}.tar.gz"
+          metadata_texts: list[str] = []
+          for artifact in artifacts:
+              if artifact.suffix == ".whl":
+                  if not artifact.name.startswith(wheel_prefix):
+                      raise SystemExit(f"wrong wheel version: {artifact.name}")
+                  with zipfile.ZipFile(artifact) as archive:
+                      names = [name for name in archive.namelist() if name.endswith(".dist-info/METADATA")]
+                      if len(names) != 1:
+                          raise SystemExit(f"wheel metadata is ambiguous: {artifact.name}")
+                      metadata_texts.append(archive.read(names[0]).decode("utf-8"))
+              elif artifact.name.endswith(".tar.gz"):
+                  if artifact.name != sdist_name:
+                      raise SystemExit(f"wrong sdist version: {artifact.name}")
+                  with tarfile.open(artifact, "r:gz") as archive:
+                      names = [member for member in archive.getmembers() if member.name.endswith("/PKG-INFO")]
+                      if len(names) != 1:
+                          raise SystemExit(f"sdist metadata is ambiguous: {artifact.name}")
+                      metadata_texts.append(archive.extractfile(names[0]).read().decode("utf-8"))
+              else:
+                  raise SystemExit(f"unexpected release artifact: {artifact.name}")
+
+          for text in metadata_texts:
+              artifact_metadata = Parser().parsestr(text)
+              if artifact_metadata.get("Name") != package:
+                  raise SystemExit(f"artifact name mismatch: {artifact_metadata.get('Name')!r}")
+              if artifact_metadata.get("Version") != expected_version:
+                  raise SystemExit(
+                      f"artifact version mismatch: {artifact_metadata.get('Version')!r}"
+                  )
+          PY
+
+      - name: Check distribution metadata with twine
+        run: >-
+          uv run --with twine twine check --strict
+          "${{ steps.prepare.outputs.release_dir }}"/*.whl
+          "${{ steps.prepare.outputs.release_dir }}"/*.tar.gz
+
+      - name: Resolve wheel dependencies against PyPI
+        run: |
+          set -euo pipefail
+          wheel="$(find "${{ steps.prepare.outputs.release_dir }}" -maxdepth 1 -type f -name '*.whl' -print -quit)"
+          test -n "$wheel"
+          python -m pip install --dry-run --ignore-installed --no-cache-dir \
+            --index-url https://pypi.org/simple "$wheel"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.prepare.outputs.artifact_name }}
+          path: ${{ steps.prepare.outputs.release_dir }}/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish ${{ needs.build.outputs.package }} ${{ needs.build.outputs.version }}
+    needs: build
     runs-on: ubuntu-latest
-    environment: pypi-script-maafw
+    environment: ${{ needs.build.outputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/download-artifact@v4
         with:
-          python-version: "3.12"
-      - run: python -m pip install --upgrade build
-      - run: python -m build packages/automas_script_maafw --outdir dist
-      - uses: pypa/gh-action-pypi-publish@release/v1
+          name: ${{ needs.build.outputs.artifact_name }}
+          path: release
+
+      - name: Publish only the validated artifact set
+        uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          packages-dir: dist
+          packages-dir: release
+          skip-existing: false

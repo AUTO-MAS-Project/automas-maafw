@@ -42,6 +42,7 @@ from .pipeline_override import MaaFWPipelineOverrideBuilder
 PI_INTERFACE_VERSION = "v2.8.1"
 PI_CLIENT_LANGUAGE = "zh_cn"
 PI_CLIENT_NAME = "AUTO-MAS"
+PROJECT_RUNTIME_MANIFEST_NAME = ".auto_mas_maafw_project.json"
 MAAFW_DIRECT_CONTROLLER_TYPES = {"Adb", "Win32"}
 SENSITIVE_CONFIG_KEYWORDS = (
     "account",
@@ -109,6 +110,7 @@ def build_maafw_run_plan(
         controller_names=controller_names,
         resource_name=resource.name,
     )
+    i18n_mapping = _load_i18n_mapping(resolved_base_dir, interface)
 
     runnable_tasks: list[MaaFWTaskRunPlan] = []
     skipped_tasks: list[MaaFWSkippedTaskPlan] = []
@@ -127,7 +129,7 @@ def build_maafw_run_plan(
             skipped_tasks.append(
                 MaaFWSkippedTaskPlan(
                     name=task.name,
-                    label=task.label,
+                    label=_resolve_i18n_label(task.label, task.name, i18n_mapping),
                     entry=task.entry,
                     reason=reason,
                 )
@@ -142,7 +144,7 @@ def build_maafw_run_plan(
         runnable_tasks.append(
             MaaFWTaskRunPlan(
                 name=task.name,
-                label=task.label,
+                label=_resolve_i18n_label(task.label, task.name, i18n_mapping),
                 entry=task.entry,
                 options=options,
                 pipelineOverride=pipeline_override,
@@ -162,6 +164,7 @@ def build_maafw_run_plan(
         controllerType=controller.type,
         resourceName=resource.name,
         resource=_build_resource_bundle_plan(resolved_base_dir, resource, controller),
+        nativePluginPaths=_build_native_plugin_paths(resolved_base_dir),
         agents=build_maafw_agent_command_plans(
             resolved_base_dir,
             interface.agent,
@@ -344,6 +347,7 @@ def _build_pretask_plans(
     task_options: MaaFWTaskOptionsByTask,
 ) -> list[MaaFWPretaskRunPlan]:
     plans: list[MaaFWPretaskRunPlan] = []
+    i18n_mapping = _load_i18n_mapping(base_dir, interface_model)
     for task_name in selected_names:
         pretask = find_pretask_by_task_name(interface_model, task_name)
         if pretask is None:
@@ -372,7 +376,11 @@ def _build_pretask_plans(
         plans.append(
             MaaFWPretaskRunPlan(
                 name=task_name,
-                label=pretask.label,
+                label=_resolve_i18n_label(
+                    pretask.label,
+                    pretask.name or pretask.exec,
+                    i18n_mapping,
+                ),
                 executable=_resolve_pretask_executable(base_dir, pretask.exec),
                 args=args,
                 options=serialized_options,
@@ -529,6 +537,39 @@ def _build_resource_bundle_plan(
     )
 
 
+def _build_native_plugin_paths(base_dir: Path) -> list[MaaFWResolvedPath]:
+    manifest_path = base_dir / PROJECT_RUNTIME_MANIFEST_NAME
+    declared_paths: list[str] | None = None
+    if manifest_path.is_file():
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise MaaFWRunPlanError(
+                f"解析 MaaFW project manifest 失败: {manifest_path}: {exc}"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise MaaFWRunPlanError(
+                f"MaaFW project manifest 必须是 JSON 对象: {manifest_path}"
+            )
+        raw_paths = payload.get("nativePluginPaths")
+        runtime_payload = payload.get("runtime")
+        if raw_paths is None and isinstance(runtime_payload, dict):
+            raw_paths = runtime_payload.get("nativePluginPaths")
+        if raw_paths is not None:
+            if not isinstance(raw_paths, list) or not all(
+                isinstance(item, str) and item.strip() for item in raw_paths
+            ):
+                raise MaaFWRunPlanError(
+                    "nativePluginPaths 必须是字符串数组，且每项不能为空"
+                )
+            declared_paths = list(dict.fromkeys(item.strip() for item in raw_paths))
+
+    if declared_paths is None:
+        default_path = base_dir / "plugins"
+        declared_paths = ["plugins"] if default_path.is_dir() else []
+    return [_resolve_project_path(base_dir, item) for item in declared_paths]
+
+
 def _resolve_project_path(base_dir: Path, raw_path: str) -> MaaFWResolvedPath:
     replaced = raw_path.replace("{PROJECT_DIR}", str(base_dir))
     candidate = Path(replaced)
@@ -630,6 +671,36 @@ def _resolve_i18n_value(value: Any, mapping: dict[str, Any]) -> Any:
         if translated is not None:
             return translated
     return value
+
+
+def _resolve_i18n_label(
+    value: Any,
+    fallback: str,
+    mapping: dict[str, Any],
+) -> str:
+    resolved = _resolve_i18n_value(value, mapping)
+    if (
+        isinstance(resolved, str)
+        and resolved.strip()
+        and not resolved.lstrip().startswith("$")
+    ):
+        return resolved
+
+    # MaaFW projects commonly keep task labels in a flat locale map while
+    # leaving ``interface.json`` task.label unset (for example,
+    # ``task.VisitFriends.label``).  Resolve that conventional key before
+    # falling back to the machine-facing task id, so overview/run logs do not
+    # expose raw IDs when a project already ships i18n data.
+    normalized_fallback = str(fallback or "").strip()
+    if normalized_fallback:
+        for prefix in ("task", "pretask"):
+            translated = _lookup_i18n_text(
+                f"{prefix}.{normalized_fallback}.label",
+                mapping,
+            )
+            if isinstance(translated, str) and translated.strip():
+                return translated
+    return fallback
 
 
 def _lookup_i18n_text(key: str, mapping: dict[str, Any]) -> str | None:

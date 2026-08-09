@@ -1,8 +1,15 @@
+import sys
 import unittest
+from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict
 
-from automas_maafw_controller_win32.service import (
+ROOT = Path(__file__).resolve().parents[1]
+PACKAGE_SRC = ROOT / "packages" / "automas_maafw_controller_win32" / "src"
+if str(PACKAGE_SRC) not in sys.path:
+    sys.path.insert(0, str(PACKAGE_SRC))
+
+from automas_maafw_controller_win32.service import (  # noqa: E402
     MaaFWWin32ControllerService,
     MaaFWWin32Window,
 )

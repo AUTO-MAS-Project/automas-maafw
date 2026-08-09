@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "automas-maafw-controller-win32"
-version = "0.1.1"
+version = "0.1.2"
 description = "Win32 controller provider for AUTO-MAS MaaFW plugins"
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.10"

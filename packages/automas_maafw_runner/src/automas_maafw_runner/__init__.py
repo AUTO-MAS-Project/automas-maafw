@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .environment import MaaFWRunnerEnvironment
+from .environment import MaaFWRunnerEnvironment, release_runner_environment
 from .models import (
     MaaFWDeviceConfig,
     MaaFWResolvedPath,
@@ -27,4 +27,5 @@ __all__ = [
     "MaaFWSkippedTaskPlan",
     "MaaFWTaskRunPlan",
     "build_maafw_run_plan",
+    "release_runner_environment",
 ]

@@ -6,8 +6,10 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
+import uuid
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Mapping
 
 from .models import MaaFWAgentCommandPlan, MaaFWAgentEnvPrepareResult
 from .planner import MaaFWAgentEnvError, venv_python_exe
@@ -16,8 +18,17 @@ from .planner import MaaFWAgentEnvError, venv_python_exe
 AGENT_BOOTSTRAP_PACKAGE = "json-with-comments"
 AGENT_ENV_MANIFEST_NAME = ".auto_mas_agent_env.json"
 AGENT_COMPAT_SHIM_DIR_NAME = ".auto_mas_shims"
+AUTO_MAS_UV_INDEX_URL_ENV = "AUTO_MAS_UV_INDEX_URL"
+OFFICIAL_PYPI_INDEX_URL = "https://pypi.org/simple"
 PIP_HEALTH_CHECK_TIMEOUT = 15
+PROJECT_PYTHON_HEALTH_TIMEOUT = 15
 PIP_INSTALL_TIMEOUT = 120
+VENV_PROBE_TIMEOUT = 30
+# uv 兜底可能需要下载 managed Python,给足余量
+UV_VENV_TIMEOUT = 300
+
+_ISOLATED_VENV_LOCKS_GUARD = threading.Lock()
+_ISOLATED_VENV_LOCKS: dict[str, threading.RLock] = {}
 
 
 def prepare_agent_envs(
@@ -27,6 +38,7 @@ def prepare_agent_envs(
     send_log: Callable[[str], None] | None = None,
     bootstrap_python: str | None = None,
     install_dependencies: bool = True,
+    progress: Callable[[dict[str, object]], None] | None = None,
 ) -> MaaFWAgentEnvPrepareResult:
     resolved_project_path = Path(project_path).resolve()
     messages: list[str] = []
@@ -42,34 +54,88 @@ def prepare_agent_envs(
         (resolved_project_path / path_name).mkdir(exist_ok=True)
 
     checked_python: set[str] = set()
-    for plan in plans:
+    total_plans = len(plans)
+    _report_agent_progress(
+        progress,
+        status="running",
+        message=f"准备 {total_plans} 个 MaaFW Agent 环境",
+        percent=0.0,
+        completed=0,
+        total=total_plans,
+    )
+
+    def report_plan_complete(index: int, plan: MaaFWAgentCommandPlan) -> None:
+        _report_agent_progress(
+            progress,
+            status="running",
+            message=f"Agent 环境准备完成: {plan.childExec}",
+            percent=((index + 1) * 100.0 / total_plans if total_plans else 100.0),
+            completed=index + 1,
+            total=total_plans,
+        )
+
+    for index, plan in enumerate(plans):
+        _report_agent_progress(
+            progress,
+            status="running",
+            message=f"正在准备 Agent: {plan.childExec}",
+            percent=(index * 100.0 / total_plans if total_plans else 100.0),
+            completed=index,
+            total=total_plans,
+        )
         python_exe = plan.command[0] if plan.command else plan.executable
         resolved_python = _safe_resolve_python(python_exe)
         if resolved_python in checked_python:
             log(f"[Python环境] 已检查过该 Python，跳过重复检查: {python_exe}")
+            report_plan_complete(index, plan)
             continue
 
         runtime_kind = plan.runtimeKind or "external"
         log(f"[Python环境] Agent {plan.childExec} 使用 {runtime_kind}: {python_exe}")
         if runtime_kind == "isolated_venv":
-            prepared_path = _prepare_isolated_venv_env(
-                plan,
-                resolved_project_path,
-                log,
-                bootstrap_python=bootstrap_python,
-                install_dependencies=install_dependencies,
-            )
+            with _isolated_venv_lock(Path(plan.isolatedVenvPath or python_exe)):
+                prepared_path = _prepare_isolated_venv_env(
+                    plan,
+                    resolved_project_path,
+                    log,
+                    bootstrap_python=bootstrap_python,
+                    install_dependencies=install_dependencies,
+                )
             prepared_venvs.append(str(prepared_path))
             checked_python.add(resolved_python)
+            report_plan_complete(index, plan)
             continue
 
         if runtime_kind == "project_python":
             _prepare_project_python_env(python_exe, resolved_project_path, log)
             checked_python.add(resolved_python)
+            report_plan_complete(index, plan)
+            continue
+
+        if runtime_kind == "shared_runtime":
+            if not Path(resolved_python).is_file():
+                raise MaaFWAgentEnvError(
+                    "共享 MaaFW runtime Python 不存在或不可用："
+                    f"{python_exe}"
+                )
+            checked_python.add(resolved_python)
+            log(f"[Python环境] 共享 MaaFW runtime Python 已就绪: {python_exe}")
+            report_plan_complete(index, plan)
             continue
 
         skipped.append(plan.childExec)
         log(f"[Python环境] 跳过外部或非 Python 环境检测: {python_exe}")
+
+        report_plan_complete(index, plan)
+
+    _report_agent_progress(
+        progress,
+        status="ready",
+        message="MaaFW Agent 环境准备完成",
+        percent=100.0,
+        completed=total_plans,
+        total=total_plans,
+    )
 
     return MaaFWAgentEnvPrepareResult(
         projectPath=str(resolved_project_path),
@@ -94,25 +160,37 @@ def build_agent_env_manifest(project_path: str | Path) -> dict[str, object]:
 def write_agent_compat_shims(venv_path: str | Path) -> Path:
     shim_dir = Path(venv_path) / AGENT_COMPAT_SHIM_DIR_NAME
     shim_dir.mkdir(parents=True, exist_ok=True)
-    (shim_dir / "sitecustomize.py").write_text(
-        "\n".join(
-            [
-                "def _patch_legacy_maafw_resource():",
-                "    try:",
-                "        import maa.resource as maa_resource_module",
-                "        if hasattr(maa_resource_module, 'resource'):",
-                "            return",
-                "        from maa.agent.agent_server import AgentServer",
-                "        maa_resource_module.resource = AgentServer",
-                "    except Exception:",
-                "        pass",
-                "",
-                "_patch_legacy_maafw_resource()",
-                "",
-            ]
-        ),
-        encoding="utf-8",
+    shim_path = shim_dir / "sitecustomize.py"
+    content = "\n".join(
+        [
+            "def _patch_legacy_maafw_resource():",
+            "    try:",
+            "        import maa.resource as maa_resource_module",
+            "        if hasattr(maa_resource_module, 'resource'):",
+            "            return",
+            "        from maa.agent.agent_server import AgentServer",
+            "        maa_resource_module.resource = AgentServer",
+            "    except Exception:",
+            "        pass",
+            "",
+            "_patch_legacy_maafw_resource()",
+            "",
+        ]
     )
+    try:
+        if shim_path.read_text(encoding="utf-8") == content:
+            return shim_dir
+    except (FileNotFoundError, OSError, UnicodeError):
+        pass
+
+    temporary_path = shim_path.with_name(
+        f"{shim_path.name}.tmp-{uuid.uuid4().hex}"
+    )
+    try:
+        temporary_path.write_text(content, encoding="utf-8")
+        temporary_path.replace(shim_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
     return shim_dir
 
 
@@ -123,17 +201,55 @@ def _prepare_project_python_env(
 ) -> None:
     log(f"[Python环境] 检测项目 Python: {python_exe}")
     test_env = _build_agent_env_for_pip(project_path)
-    if _check_pip_health(python_exe, cwd=str(project_path), env=test_env, log=log):
+    if _check_project_python_health(
+        python_exe,
+        cwd=str(project_path),
+        env=test_env,
+        log=log,
+    ):
         return
 
     raise MaaFWAgentEnvError(
-        "项目 Python 环境 pip 不可用，请手动修复后重试：\n"
+        "项目 Python 或 MaaFW Agent 模块不可用，请修复项目包后重试：\n"
         f"  Python 路径: {python_exe}\n"
         "  处理建议:\n"
         "    方法1: 重新下载并解压完整 MaaFW 项目包\n"
-        "    方法2: 在项目目录中手动修复该项目自带 Python 的 pip 环境\n"
-        "  AUTO-MAS 不会自动修改项目 release 目录。"
+        "    方法2: 检查项目自带 Python 是否能导入 maa.agent.agent_server\n"
+        "  项目 Python 属于 release 内容，AUTO-MAS 不要求其提供 pip，"
+        "也不会自动修改该目录。"
     )
+
+
+def _isolated_venv_lock(path: Path) -> threading.RLock:
+    key = os.path.normcase(str(path.resolve())).casefold()
+    with _ISOLATED_VENV_LOCKS_GUARD:
+        return _ISOLATED_VENV_LOCKS.setdefault(key, threading.RLock())
+
+
+def _report_agent_progress(
+    callback: Callable[[dict[str, object]], None] | None,
+    *,
+    status: str,
+    message: str,
+    percent: float,
+    completed: int,
+    total: int,
+) -> None:
+    if callback is None:
+        return
+    try:
+        callback(
+            {
+                "stage": "preparing_agents",
+                "status": status,
+                "message": message,
+                "percent": percent,
+                "completed": completed,
+                "total": total,
+            }
+        )
+    except Exception:
+        return
 
 
 def _prepare_isolated_venv_env(
@@ -200,30 +316,69 @@ def _ensure_isolated_venv(
         _reset_isolated_venv(venv_path, log)
 
     venv_path.parent.mkdir(parents=True, exist_ok=True)
-    python = bootstrap_python or _venv_bootstrap_python()
-    log(f"[Python环境] 创建隔离 venv: {venv_path} (引导 Python: {python})")
+    python = bootstrap_python if bootstrap_python else _venv_bootstrap_python()
+    if python is not None and bootstrap_python and not _python_supports_venv(python):
+        # 调用方指定的引导解释器（如便携 embeddable Python）缺 venv，回退到自动挑选
+        log(f"[Python环境] 指定引导 Python 缺少 venv 模块，改为自动挑选: {python}")
+        python = _venv_bootstrap_python()
+
+    if python is None:
+        _create_venv_with_uv(venv_path, log)
+    else:
+        log(f"[Python环境] 创建隔离 venv: {venv_path} (引导 Python: {python})")
+        try:
+            result = subprocess.run(
+                [python, "-m", "venv", str(venv_path)],
+                capture_output=True,
+                timeout=PIP_INSTALL_TIMEOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise MaaFWAgentEnvError(
+                f"创建隔离 venv 超时 ({PIP_INSTALL_TIMEOUT}s): {venv_path}"
+            ) from exc
+
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()
+            raise MaaFWAgentEnvError(
+                f"创建隔离 venv 失败 (exit={result.returncode}): {detail[:500]}"
+            )
+    if not _is_valid_venv_path(venv_path):
+        raise MaaFWAgentEnvError(f"创建隔离 venv 后结构不完整: {venv_path}")
+    log(f"[Python环境] 隔离 venv 创建成功: {venv_path}")
+
+
+def _create_venv_with_uv(venv_path: Path, log: Callable[[str], None]) -> None:
+    """所有候选解释器都缺 venv 时的兜底：用 uv 建环境（必要时自取 managed Python）。"""
+    uv_exe = _find_uv_executable()
+    if uv_exe is None:
+        raise MaaFWAgentEnvError(
+            "创建隔离 venv 失败：可用的 Python 均不含 venv 模块（便携版通常为 "
+            "embeddable 发行版），且未找到 uv 兜底。请安装完整 Python 或提供 uv。"
+        )
+
+    log(f"[Python环境] 引导 Python 均缺少 venv 模块，改用 uv 创建: {venv_path}")
     try:
         result = subprocess.run(
-            [python, "-m", "venv", str(venv_path)],
+            [uv_exe, "venv", "--seed", str(venv_path)],
             capture_output=True,
-            timeout=PIP_INSTALL_TIMEOUT,
+            timeout=UV_VENV_TIMEOUT,
             text=True,
             encoding="utf-8",
             errors="replace",
         )
     except subprocess.TimeoutExpired as exc:
         raise MaaFWAgentEnvError(
-            f"创建隔离 venv 超时 ({PIP_INSTALL_TIMEOUT}s): {venv_path}"
+            f"uv 创建隔离 venv 超时 ({UV_VENV_TIMEOUT}s): {venv_path}"
         ) from exc
 
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()
         raise MaaFWAgentEnvError(
-            f"创建隔离 venv 失败 (exit={result.returncode}): {detail[:500]}"
+            f"uv 创建隔离 venv 失败 (exit={result.returncode}): {detail[:500]}"
         )
-    if not _is_valid_venv_path(venv_path):
-        raise MaaFWAgentEnvError(f"创建隔离 venv 后结构不完整: {venv_path}")
-    log(f"[Python环境] 隔离 venv 创建成功: {venv_path}")
 
 
 def _should_rebuild_isolated_venv(
@@ -279,6 +434,22 @@ def _is_isolated_venv_manifest_current(venv_path: Path, project_path: Path) -> b
         and manifest.get("interfaceHash") == expected["interfaceHash"]
         and manifest.get("requirementsHash") == expected["requirementsHash"]
     )
+
+
+def is_isolated_venv_ready(
+    venv_path: str | Path,
+    project_path: str | Path,
+) -> bool:
+    """Return whether an isolated Agent venv has a current success marker."""
+
+    resolved_venv = Path(venv_path).expanduser().resolve(strict=False)
+    resolved_project = Path(project_path).expanduser().resolve(strict=False)
+    try:
+        return _is_valid_venv_path(
+            resolved_venv
+        ) and _is_isolated_venv_manifest_current(resolved_venv, resolved_project)
+    except (OSError, TypeError, ValueError):
+        return False
 
 
 def _write_isolated_venv_manifest(venv_path: Path, project_path: Path) -> None:
@@ -337,6 +508,57 @@ def _build_agent_env_for_pip(project_path: Path) -> dict[str, str]:
     return env
 
 
+def build_pip_install_index_args(
+    env: Mapping[str, str] | None = None,
+) -> list[str]:
+    """Translate the host/uv preferred index into pip command arguments.
+
+    Runtime Pool and plugin bootstrap use uv, while isolated Agent venvs use
+    the venv's bundled pip. pip does not understand ``UV_INDEX_URL`` or the
+    host's ``AUTO_MAS_UV_INDEX_URL`` preference, so without this bridge it can
+    silently fall back to an unrelated user-level ``pip.ini`` mirror.
+
+    An explicit ``PIP_INDEX_URL`` remains authoritative because pip already
+    consumes it directly. Otherwise preserve uv's precedence and finally use
+    the host-provided preferred index.
+    """
+
+    source = env if env is not None else os.environ
+    if str(source.get("PIP_INDEX_URL") or "").strip():
+        return []
+
+    for name in ("UV_INDEX_URL", "UV_DEFAULT_INDEX", AUTO_MAS_UV_INDEX_URL_ENV):
+        index_url = str(source.get(name) or "").strip()
+        if index_url:
+            return ["--index-url", index_url]
+    return []
+
+
+def build_pip_install_index_attempts(
+    env: Mapping[str, str] | None = None,
+) -> list[list[str]]:
+    """Return the authoritative/preferred pip index attempts in order."""
+
+    source = env if env is not None else os.environ
+    primary = build_pip_install_index_args(source)
+    attempts = [primary]
+
+    # Explicit pip/uv settings are authoritative. AUTO_MAS_UV_INDEX_URL is a
+    # host preference, so it may safely fall back to the official index when a
+    # mirror has not synchronized a project yet. With no explicit preference,
+    # try the user's normal pip configuration first and official PyPI second.
+    if any(
+        str(source.get(name) or "").strip()
+        for name in ("PIP_INDEX_URL", "UV_INDEX_URL", "UV_DEFAULT_INDEX")
+    ):
+        return attempts
+
+    official = ["--index-url", OFFICIAL_PYPI_INDEX_URL]
+    if primary != official:
+        attempts.append(official)
+    return attempts
+
+
 def _check_pip_health(
     python_exe: str,
     *,
@@ -392,6 +614,54 @@ def _check_pip_health(
         return False
 
 
+def _check_project_python_health(
+    python_exe: str,
+    *,
+    cwd: str | None,
+    env: dict[str, str],
+    log: Callable[[str], None],
+) -> bool:
+    """Probe a project-owned Agent runtime without requiring or invoking pip."""
+
+    probe = (
+        "import sys; "
+        "from maa.agent.agent_server import AgentServer; "
+        "print(f'Python {sys.version_info.major}.{sys.version_info.minor}; MaaFW Agent OK')"
+    )
+    try:
+        result = subprocess.run(
+            [python_exe, "-c", probe],
+            capture_output=True,
+            timeout=PROJECT_PYTHON_HEALTH_TIMEOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=cwd,
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        log(
+            "[Python环境] 项目 Python/Agent 健康检查超时 "
+            f"({PROJECT_PYTHON_HEALTH_TIMEOUT}s)"
+        )
+        return False
+    except Exception as exc:
+        log(f"[Python环境] 项目 Python/Agent 健康检查异常: {exc}")
+        return False
+
+    if result.returncode == 0:
+        detail = (result.stdout or "").strip()
+        log(f"[Python环境] 项目 Python/Agent 健康: {detail or python_exe}")
+        return True
+
+    detail = (result.stderr or result.stdout or "").strip()
+    log(
+        "[Python环境] 项目 Python/Agent 健康检查失败 "
+        f"(exit={result.returncode}): {detail[:500]}"
+    )
+    return False
+
+
 def _try_ensurepip(
     python_exe: str,
     *,
@@ -431,34 +701,96 @@ def _pip_install(
     env: dict[str, str],
     log: Callable[[str], None],
 ) -> bool:
-    try:
-        result = subprocess.run(
-            [python_exe, "-m", "pip", "install", "--quiet", *packages],
-            capture_output=True,
-            timeout=PIP_INSTALL_TIMEOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            cwd=cwd,
-            env=env,
-        )
-        if result.returncode == 0:
-            log(f"[Python环境] pip install 完成: {', '.join(packages)}")
-            return True
-        detail = (result.stderr or result.stdout or "").strip()
-        log(f"[Python环境] pip install 未成功: {detail[:300]}")
-    except subprocess.TimeoutExpired:
-        log(f"[Python环境] pip install 超时 ({PIP_INSTALL_TIMEOUT}s)")
-    except Exception as exc:
-        log(f"[Python环境] pip install 异常: {exc}")
+    attempts = build_pip_install_index_attempts(env)
+    for attempt, index_args in enumerate(attempts, start=1):
+        if index_args:
+            source = "宿主首选 Python 索引" if attempt == 1 else "PyPI 官方索引"
+            log(f"[Python环境] pip install 使用{source}")
+        try:
+            result = subprocess.run(
+                [
+                    python_exe,
+                    "-m",
+                    "pip",
+                    "install",
+                    "--quiet",
+                    *index_args,
+                    *packages,
+                ],
+                capture_output=True,
+                timeout=PIP_INSTALL_TIMEOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                cwd=cwd,
+                env=env,
+            )
+            if result.returncode == 0:
+                log(f"[Python环境] pip install 完成: {', '.join(packages)}")
+                return True
+            detail = (result.stderr or result.stdout or "").strip()
+            if attempt < len(attempts):
+                log(
+                    "[Python环境] pip install 首选索引未成功，"
+                    f"尝试 PyPI 官方索引: {detail[:300]}"
+                )
+            else:
+                log(f"[Python环境] pip install 未成功: {detail[:300]}")
+        except subprocess.TimeoutExpired:
+            if attempt < len(attempts):
+                log(
+                    f"[Python环境] pip install 超时 ({PIP_INSTALL_TIMEOUT}s)，"
+                    "尝试 PyPI 官方索引"
+                )
+            else:
+                log(f"[Python环境] pip install 超时 ({PIP_INSTALL_TIMEOUT}s)")
+        except Exception as exc:
+            if attempt < len(attempts):
+                log(f"[Python环境] pip install 异常，尝试 PyPI 官方索引: {exc}")
+            else:
+                log(f"[Python环境] pip install 异常: {exc}")
     return False
 
 
-def _venv_bootstrap_python() -> str:
+def _python_supports_venv(python: str) -> bool:
+    """探测解释器是否带 venv/ensurepip 标准库。
+
+    便携目录常见 embeddable 发行版（python3xx._pth），不带 venv 模块，
+    直接 `-m venv` 会报 "No module named venv"，必须先探测再用作引导。
+    """
+    try:
+        result = subprocess.run(
+            [python, "-c", "import venv, ensurepip"],
+            capture_output=True,
+            timeout=VENV_PROBE_TIMEOUT,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+def _find_uv_executable() -> str | None:
+    portable_uv = Path.cwd() / "environment" / "python" / "Scripts" / "uv.exe"
+    if portable_uv.is_file():
+        return str(portable_uv)
+    return shutil.which("uv")
+
+
+def _venv_bootstrap_python() -> str | None:
+    """返回第一个带 venv 模块的引导 Python；全部不可用时返回 None（改走 uv 兜底）。"""
+    candidates: list[str] = []
     portable_python = Path.cwd() / "environment" / "python" / "python.exe"
     if portable_python.is_file():
-        return str(portable_python)
-    return sys.executable
+        candidates.append(str(portable_python))
+    candidates.append(sys.executable)
+    path_python = shutil.which("python")
+    if path_python:
+        candidates.append(path_python)
+    for candidate in candidates:
+        if _python_supports_venv(candidate):
+            return candidate
+    return None
 
 
 def _safe_resolve_python(path: str) -> str:

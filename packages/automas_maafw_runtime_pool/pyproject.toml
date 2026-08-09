@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "automas-maafw-runtime-pool"
+version = "0.2.0"
+description = "Shared multi-version MaaFW runtime pool plugin for AUTO-MAS"
+readme = { file = "README.md", content-type = "text/markdown" }
+requires-python = ">=3.10"
+dependencies = [
+    "packaging>=23",
+    "pydantic>=2",
+]
+
+[project.entry-points."auto_mas.plugins"]
+automas_maafw_runtime_pool = "automas_maafw_runtime_pool.plugin:Plugin"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+automas_maafw_runtime_pool = ["py.typed"]

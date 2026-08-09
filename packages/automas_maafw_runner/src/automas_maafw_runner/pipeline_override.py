@@ -15,6 +15,8 @@ from automas_maafw_interface.models import (
     MaaFWTaskOptionValue,
 )
 
+from .hotkey import MaaFWHotkeyError, resolve_hotkey
+
 
 def deep_merge_pipeline_override(
     base: MaaFWPipelineOverride | None,
@@ -91,6 +93,16 @@ class MaaFWPipelineOverrideBuilder:
             for controller in self.interface_model.controller
             if controller.name in self.controller_names
         ]
+
+    def _get_active_controller_type(self) -> str:
+        controller_types = {
+            controller.type for controller in self._get_active_controller_definitions()
+        }
+        if len(controller_types) != 1:
+            raise MaaFWHotkeyError(
+                "hotkey 键码映射需要且只能选择一个 controller"
+            )
+        return next(iter(controller_types))
 
     def _is_option_active_for_context(self, option: MaaFWOption) -> bool:
         if option.controller and not self.controller_names.intersection(option.controller):
@@ -244,6 +256,73 @@ class MaaFWPipelineOverrideBuilder:
             ),
         )
 
+    def _build_hotkey_override(
+        self,
+        option_name: str,
+        option: MaaFWOption,
+        options: dict[str, MaaFWTaskOptionValue],
+    ) -> MaaFWPipelineOverride:
+        if not option.pipeline_override or not option.hotkeys:
+            return {}
+
+        template_strings = _collect_template_strings(option.pipeline_override)
+        raw_option_value = options.get(option_name)
+        typed_replacements: dict[str, object] = {}
+        controller_type = self._get_active_controller_type()
+
+        for hotkey_item in option.hotkeys:
+            placeholders = {
+                f"{{{hotkey_item.name}}}",
+                f"{{{hotkey_item.name}}}.primary",
+                f"{{{hotkey_item.name}}}.modifier1",
+                f"{{{hotkey_item.name}}}.modifier2",
+                f"{{{hotkey_item.name}.primary}}",
+                f"{{{hotkey_item.name}.modifier1}}",
+                f"{{{hotkey_item.name}.modifier2}}",
+            }
+            referenced_values = {
+                value
+                for value in template_strings
+                if any(placeholder in value for placeholder in placeholders)
+            }
+            if not referenced_values:
+                continue
+            invalid_templates = referenced_values - placeholders
+            if invalid_templates:
+                raise MaaFWHotkeyError(
+                    "hotkey 占位符必须作为完整值使用: "
+                    + ", ".join(sorted(invalid_templates))
+                )
+
+            raw_text = hotkey_item.default or ""
+            if isinstance(raw_option_value, dict):
+                field_value = raw_option_value.get(hotkey_item.name)
+                if isinstance(field_value, str):
+                    raw_text = field_value
+            if not raw_text.strip():
+                raise MaaFWHotkeyError(
+                    f"hotkey 字段 {option_name}.{hotkey_item.name} 未配置"
+                )
+
+            resolved = resolve_hotkey(raw_text, controller_type)
+            values = resolved.placeholder_values(hotkey_item.name)
+            missing_placeholders = referenced_values - set(values)
+            if missing_placeholders:
+                raise MaaFWHotkeyError(
+                    f"快捷键 {raw_text} 不包含所需修饰键: "
+                    + ", ".join(sorted(missing_placeholders))
+                )
+            typed_replacements.update(values)
+
+        return cast(
+            MaaFWPipelineOverride,
+            self._substitute_placeholders(
+                option.pipeline_override,
+                typed_replacements,
+                {},
+            ),
+        )
+
     def _build_scan_select_override(
         self,
         option_name: str,
@@ -284,6 +363,11 @@ class MaaFWPipelineOverrideBuilder:
             return deep_merge_pipeline_override(
                 merged,
                 self._build_input_override(option_name, option, options),
+            )
+        if option.type == "hotkey":
+            return deep_merge_pipeline_override(
+                merged,
+                self._build_hotkey_override(option_name, option, options),
             )
 
         if option.type == "scan_select":
@@ -333,3 +417,19 @@ class MaaFWPipelineOverrideBuilder:
                 self._build_option_override(option_name, options, lineage),
             )
         return merged
+
+
+def _collect_template_strings(value: Any) -> set[str]:
+    if isinstance(value, dict):
+        collected: set[str] = set()
+        for nested_value in value.values():
+            collected.update(_collect_template_strings(nested_value))
+        return collected
+    if isinstance(value, list):
+        collected = set()
+        for item in value:
+            collected.update(_collect_template_strings(item))
+        return collected
+    if isinstance(value, str):
+        return {value}
+    return set()

@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "automas-maafw-project-store"
+version = "0.2.3"
+description = "Versioned, resource-only MaaFW project store for AUTO-MAS"
+readme = { file = "README.md", content-type = "text/markdown" }
+requires-python = ">=3.10"
+dependencies = [
+    "json5>=0.9",
+    "packaging>=23",
+    "pydantic>=2",
+]
+
+[project.entry-points."auto_mas.plugins"]
+automas_maafw_project_store = "automas_maafw_project_store.plugin:Plugin"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+automas_maafw_project_store = ["py.typed"]

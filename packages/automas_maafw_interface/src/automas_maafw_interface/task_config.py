@@ -483,6 +483,14 @@ def _build_option_defaults(
                 input_defaults[input_case.name] = input_case.default or ""
             defaults[option_name] = input_defaults
             value_types[option_name] = "object"
+            continue
+
+        if option.type == "hotkey":
+            hotkey_defaults: dict[str, str] = {}
+            for hotkey_case in option.hotkeys or []:
+                hotkey_defaults[hotkey_case.name] = hotkey_case.default or ""
+            defaults[option_name] = hotkey_defaults
+            value_types[option_name] = "object"
 
     return defaults, value_types
 
@@ -542,10 +550,10 @@ def _normalize_options_for_task(
 
         if expected_type == "object" and isinstance(option_value, dict):
             option = option_map.get(option_key)
-            if option is None or option.type != "input":
+            if option is None or option.type not in {"input", "hotkey"}:
                 continue
             existing_value = normalized_options.get(option_key)
-            normalized_input = (
+            normalized_fields = (
                 {
                     key: item
                     for key, item in existing_value.items()
@@ -554,11 +562,16 @@ def _normalize_options_for_task(
                 if isinstance(existing_value, dict)
                 else {}
             )
-            for input_case in option.inputs or []:
-                input_value = option_value.get(input_case.name)
-                if isinstance(input_value, str):
-                    normalized_input[input_case.name] = input_value
-            normalized_options[option_key] = normalized_input
+            field_names = (
+                [input_case.name for input_case in option.inputs or []]
+                if option.type == "input"
+                else [hotkey_case.name for hotkey_case in option.hotkeys or []]
+            )
+            for field_name in field_names:
+                field_value = option_value.get(field_name)
+                if isinstance(field_value, str):
+                    normalized_fields[field_name] = field_value
+            normalized_options[option_key] = normalized_fields
 
     return normalized_options
 
@@ -585,11 +598,11 @@ def _apply_preset_option_value(
     if option is None:
         return
 
-    if option.type == "input":
+    if option.type in {"input", "hotkey"}:
         if not isinstance(value, dict):
             return
         existing_value = target_options.get(option_name)
-        normalized_input: dict[str, str] = (
+        normalized_fields: dict[str, str] = (
             {
                 key: item
                 for key, item in existing_value.items()
@@ -598,11 +611,16 @@ def _apply_preset_option_value(
             if isinstance(existing_value, dict)
             else {}
         )
-        for input_case in option.inputs or []:
-            input_value = value.get(input_case.name)
-            if isinstance(input_value, str):
-                normalized_input[input_case.name] = input_value
-        target_options[option_name] = normalized_input
+        field_names = (
+            [input_case.name for input_case in option.inputs or []]
+            if option.type == "input"
+            else [hotkey_case.name for hotkey_case in option.hotkeys or []]
+        )
+        for field_name in field_names:
+            field_value = value.get(field_name)
+            if isinstance(field_value, str):
+                normalized_fields[field_name] = field_value
+        target_options[option_name] = normalized_fields
         return
 
     if option.type == "checkbox":

@@ -40,6 +40,7 @@ class MaaFWAgentEnvService:
         send_log: Any = None,
         bootstrap_python: str | None = None,
         install_dependencies: bool = True,
+        progress: Any = None,
     ) -> MaaFWAgentEnvPrepareResult:
         plans = self.build_command_plans(
             project_path,
@@ -52,6 +53,7 @@ class MaaFWAgentEnvService:
             send_log=send_log,
             bootstrap_python=bootstrap_python,
             install_dependencies=install_dependencies,
+            progress=progress,
         )
 
     @staticmethod

@@ -59,11 +59,20 @@ class MaaFWRunPlan(BaseModel):
     controllerType: str
     resourceName: str
     resource: MaaFWResourceBundlePlan
+    nativePluginPaths: list[MaaFWResolvedPath] = Field(default_factory=list)
     agents: list[MaaFWAgentCommandPlan] = Field(default_factory=list)
     pretasks: list[MaaFWPretaskRunPlan] = Field(default_factory=list)
     piEnv: dict[str, str] = Field(default_factory=dict)
     tasks: list[MaaFWTaskRunPlan] = Field(default_factory=list)
     skippedTasks: list[MaaFWSkippedTaskPlan] = Field(default_factory=list)
+    # ``None`` keeps the ordinary/legacy project-manifest behaviour. Managed
+    # execution supplies an authoritative boolean from Project Store so a
+    # writable checkout cannot opt itself into the shared worker runtime.
+    managedSharedAgentDependenciesComplete: bool | None = None
+    # Store indexes whose bundled interpreter was intentionally stripped and
+    # projected to the managed ``python`` route. Only these external plans may
+    # be rebound to the exact shared runtime interpreter.
+    managedPythonAgentIndexes: list[int] | None = None
 
 
 class MaaFWDeviceConfig(BaseModel):

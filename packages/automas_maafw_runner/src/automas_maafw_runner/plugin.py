@@ -33,8 +33,16 @@ class Plugin:
         self.service = MaaFWRunnerService()
 
     async def on_start(self) -> None:
+        self.service.reopen_worker_registry()
         self.ctx.set("maafw.runner.v1", self.service)
         self.ctx.logger.info("maafw.runner.v1 ready")
 
     async def on_stop(self, reason: str) -> None:
-        self.ctx.logger.info(f"maafw.runner.v1 stopped, reason={reason}")
+        report = await self.service.shutdown_workers()
+        self.ctx.set("maafw.runner.v1", None)
+        suffix = f", shutdown_errors={len(report.errors)}" if report.errors else ""
+        self.ctx.logger.info(
+            "maafw.runner.v1 stopped, "
+            f"reason={reason}, workers={report.requested}, "
+            f"terminated={report.terminated}, killed={report.killed}{suffix}"
+        )

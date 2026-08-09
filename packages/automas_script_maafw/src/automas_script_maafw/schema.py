@@ -3,6 +3,13 @@ from __future__ import annotations
 from typing import Any
 
 from app.plugins.fields import PluginField
+from pydantic import BaseModel, ConfigDict
+
+
+class Config(BaseModel):
+    """Host-level plugin instance configuration."""
+
+    model_config = ConfigDict(extra="allow")
 
 
 schema = {
@@ -125,8 +132,8 @@ SCRIPT_GROUPS = (
             PluginField.select(
                 "Source",
                 "更新源",
-                "MirrorChyan",
-                ["MirrorChyan", "GitHub"],
+                "",
+                ["", "MirrorChyan", "GitHub"],
             ),
             PluginField.select("Channel", "更新渠道", "", ["", "stable", "beta"]),
             PluginField.string("MirrorChyanCDK", "Mirror 酱 CDK", "", sensitive=True),
@@ -217,9 +224,27 @@ def build_source_config(script_data: dict[str, Any]) -> dict[str, Any] | None:
             "channel": str(update.get("Channel") or "").strip(),
         }
     if source == "MirrorChyan":
-        return {
+        result = {
             "source": "mirrorchyan",
             "channel": str(update.get("Channel") or "").strip(),
-            "cdk": str(update.get("MirrorChyanCDK") or "").strip(),
         }
+        cdk = str(update.get("MirrorChyanCDK") or "").strip()
+        if cdk:
+            result["cdk"] = cdk
+        return result
+    if not source:
+        # Preserve a blank provider so the host can apply its global
+        # MirrorChyan/GitHub selection at check or run time.
+        result = {}
+        for config_key, update_key in (
+            ("cdk", "MirrorChyanCDK"),
+            ("channel", "Channel"),
+            ("repo", "GitHubRepo"),
+            ("tag", "GitHubTag"),
+            ("asset_pattern", "GitHubAssetPattern"),
+        ):
+            value = str(update.get(update_key) or "").strip()
+            if value:
+                result[config_key] = value
+        return result or None
     return None
