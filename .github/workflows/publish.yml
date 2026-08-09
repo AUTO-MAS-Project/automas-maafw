@@ -123,8 +123,8 @@ jobs:
       - name: Install workspace dependencies for validation
         run: uv sync --all-packages --group dev
 
-      # Full tests run in CI on windows-latest; release still validates and builds
-      # the exact selected artifact below on ubuntu-latest.
+      # The CI workflow's `test` job runs the full suite on windows-latest;
+      # release still validates and builds the exact artifact on ubuntu-latest.
       - name: Prepare fresh artifact directory
         id: prepare
         env:
