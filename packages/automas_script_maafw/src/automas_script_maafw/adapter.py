@@ -28,6 +28,52 @@ _RUNTIME_POOL_ROUTE_KEY = "maafw_runtime_pool_route"
 _MISSING_PROJECT_PATH = object()
 
 
+def _global_update_value(key: str) -> Any:
+    """Read a global update field from Config V2, then legacy Config.get."""
+
+    setting = getattr(Config, "setting", None)
+    updates = getattr(setting, "updates", None)
+    v2_name = {
+        "Source": "source",
+        "Channel": "channel",
+        "ProxyAddress": "proxy_address",
+        "MirrorChyanCDK": "mirror_chyan_cdk",
+    }.get(key)
+    if updates is not None and v2_name is not None:
+        value = getattr(updates, v2_name, None)
+        if value is not None:
+            return value
+
+    getter = getattr(Config, "get", None)
+    if not callable(getter):
+        return None
+    try:
+        return getter("Update", key)
+    except Exception:
+        return None
+
+
+def _global_proxy() -> Any:
+    try:
+        proxy = getattr(Config, "proxy", None)
+    except Exception:
+        proxy = None
+    if proxy is not None:
+        return proxy
+
+    raw_proxy = str(_global_update_value("ProxyAddress") or "").strip()
+    if not raw_proxy:
+        return None
+    if not raw_proxy.startswith(("http://", "https://", "socks5://", "socks4://")):
+        raw_proxy = f"http://{raw_proxy}"
+    try:
+        import httpx
+
+        return httpx.Proxy(raw_proxy)
+    except Exception:
+        return None
+
+
 def _load_project_interface(project_path: Path) -> Any:
     if not project_path.exists():
         return _MISSING_PROJECT_PATH
@@ -154,7 +200,14 @@ class MaaFWAdapterHooks(ScriptAdapterHooks):
             if runtime.user_config is not None and runtime.mode == "AutoProxy":
                 # 先取得宿主写事务，再解锁并整批写回。这样资源升级事务无法
                 # 插入 unlock 与多用户保存之间，也不会用旧运行快照覆盖升级结果。
-                async with runtime.storage.write_transaction():
+                write_transaction = getattr(runtime.storage, "write_transaction", None)
+                if callable(write_transaction):
+                    async with write_transaction():
+                        await runtime.storage.unlock()
+                        await runtime.storage.save_user_models(runtime.user_config)
+                else:
+                    # 较旧宿主的 ScriptConfigStore 没有事务上下文；保留
+                    # unlock-then-write 顺序，让插件在缺少可选能力时仍能收尾。
                     await runtime.storage.unlock()
                     await runtime.storage.save_user_models(runtime.user_config)
         finally:
@@ -213,9 +266,7 @@ class MaaFWAdapterHooks(ScriptAdapterHooks):
                 effective_source_config.get("source") or ""
             ).strip().casefold()
             if not configured_source:
-                global_source = str(
-                    Config.get("Update", "Source") or ""
-                ).strip().casefold()
+                global_source = str(_global_update_value("Source") or "").strip().casefold()
                 if global_source in {
                     "github",
                     "github_release",
@@ -232,12 +283,11 @@ class MaaFWAdapterHooks(ScriptAdapterHooks):
                 script_config.get("Update", "MirrorChyanCDK") or ""
             ).strip()
             global_mirror_cdk = str(
-                Config.get("Update", "MirrorChyanCDK") or ""
+                _global_update_value("MirrorChyanCDK") or ""
             ).strip()
             mirror_cdk = local_mirror_cdk or global_mirror_cdk
-            channel = script_config.get("Update", "Channel") or Config.get(
-                "Update",
-                "Channel",
+            channel = script_config.get("Update", "Channel") or _global_update_value(
+                "Channel"
             )
             try:
                 update_result = await MaaFWProjectUpdateService().update_if_needed(
@@ -245,7 +295,7 @@ class MaaFWAdapterHooks(ScriptAdapterHooks):
                     interface_model,
                     mirror_cdk=mirror_cdk,
                     channel=channel,
-                    proxy=Config.proxy,
+                    proxy=_global_proxy(),
                     send_log=lambda message: self._emit_log(runtime, message),
                     source_config=effective_source_config,
                 )

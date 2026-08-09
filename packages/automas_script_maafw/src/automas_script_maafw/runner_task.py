@@ -44,6 +44,24 @@ from .runtime_route import MaaFWManagedExecutionRoute, managed_execution_route
 logger = get_logger("MaaFW 插件自动代理")
 
 
+def _global_silence_enabled() -> bool:
+    """Read the global emulator-silence flag from Config V2 or legacy Config."""
+
+    setting = getattr(Config, "setting", None)
+    function = getattr(setting, "function", None)
+    value = getattr(function, "if_silence", None)
+    if value is not None:
+        return bool(value)
+
+    getter = getattr(Config, "get", None)
+    if not callable(getter):
+        return False
+    try:
+        return bool(getter("Function", "IfSilence"))
+    except Exception:
+        return False
+
+
 # MaaFW 的 ADB 截图/输入方法枚举（EmulatorExtras 硬件加速相关）在此镜像为整型常量，
 # 而非 `from maa.controller import MaaAdb*Enum`。本模块受导入边界约束
 # （tests/plugins/test_maafw_import_boundaries.py 禁止导入时把 maa 载入 sys.modules），
@@ -608,7 +626,7 @@ class MaaFWPluginAutoProxyTask(TaskExecuteBase):
         self._append_log(f"正在启动模拟器: {emulator_index}")
         self.opened_emulator = True
         device_info = await self.emulator_manager.open(emulator_index)
-        if Config.get("Function", "IfSilence"):
+        if _global_silence_enabled():
             with suppress(Exception):
                 await self.emulator_manager.setVisible(emulator_index, False)
         if not device_info.adb_address or device_info.adb_address == "Unknown":

@@ -214,7 +214,13 @@ class MaaFWConfigurationReuseController:
         lock = self._script_locks.setdefault(script_id, asyncio.Lock())
         async with lock:
             owner = f"maafw-config-reuse:{script_id}:{plan_id}"
-            async with Config.script_config_transaction(script_id, owner=owner):
+            script_config_transaction = getattr(Config, "script_config_transaction", None)
+            if callable(script_config_transaction):
+                async with script_config_transaction(script_id, owner=owner):
+                    result = await self._apply_in_transaction(script_id, plan)
+            else:
+                # 较旧宿主没有宿主级脚本事务；当前实例的 local lock 仍能
+                # 串行化配置复用请求，直接执行现有 apply 流程即可。
                 result = await self._apply_in_transaction(script_id, plan)
         if _strict_bool(result.get("scriptUpdated"), "scriptUpdated"):
             # Script-level changes can move the project path or alter update

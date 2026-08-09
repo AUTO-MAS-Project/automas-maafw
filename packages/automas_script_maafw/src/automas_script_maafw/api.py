@@ -844,7 +844,7 @@ class MaaFWApiController:
             if channel and not str(source_config.get("channel") or "").strip():
                 source_config["channel"] = channel
 
-            proxy = getattr(Config, "proxy", None)
+            proxy = _global_proxy()
             if not payload.apply:
                 append_log("开始检查 MaaFW 项目更新（尚不安装）")
                 publish(
@@ -1562,11 +1562,45 @@ class MaaFWApiController:
 
 
 def _global_config(key: str) -> Any:
+    setting = getattr(Config, "setting", None)
+    updates = getattr(setting, "updates", None)
+    v2_name = {
+        "Source": "source",
+        "Channel": "channel",
+        "ProxyAddress": "proxy_address",
+        "MirrorChyanCDK": "mirror_chyan_cdk",
+    }.get(key)
+    if updates is not None and v2_name is not None:
+        value = getattr(updates, v2_name, None)
+        if value is not None:
+            return value
+
     getter = getattr(Config, "get", None)
     if not callable(getter):
         return None
     try:
         return getter("Update", key)
+    except Exception:
+        return None
+
+
+def _global_proxy() -> Any:
+    try:
+        proxy = getattr(Config, "proxy", None)
+    except Exception:
+        proxy = None
+    if proxy is not None:
+        return proxy
+
+    raw_proxy = str(_global_config("ProxyAddress") or "").strip()
+    if not raw_proxy:
+        return None
+    if not raw_proxy.startswith(("http://", "https://", "socks5://", "socks4://")):
+        raw_proxy = f"http://{raw_proxy}"
+    try:
+        import httpx
+
+        return httpx.Proxy(raw_proxy)
     except Exception:
         return None
 
