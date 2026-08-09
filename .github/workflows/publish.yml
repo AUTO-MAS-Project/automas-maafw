@@ -203,9 +203,10 @@ jobs:
                   if artifact.name != sdist_name:
                       raise SystemExit(f"wrong sdist version: {artifact.name}")
                   with tarfile.open(artifact, "r:gz") as archive:
-                      names = [member for member in archive.getmembers() if member.name.endswith("/PKG-INFO")]
+                      root_info = f"{sdist_name.removesuffix('.tar.gz')}/PKG-INFO"
+                      names = [member for member in archive.getmembers() if member.name == root_info]
                       if len(names) != 1:
-                          raise SystemExit(f"sdist metadata is ambiguous: {artifact.name}")
+                          raise SystemExit(f"sdist root metadata is missing: {artifact.name}")
                       metadata_texts.append(archive.extractfile(names[0]).read().decode("utf-8"))
               else:
                   raise SystemExit(f"unexpected release artifact: {artifact.name}")
